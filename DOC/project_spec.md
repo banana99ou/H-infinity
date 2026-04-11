@@ -12,14 +12,24 @@ Two scope corrections are important:
 
 ## 2. Project Goal
 
-Integrate a professor-provided H-infinity controller into the AgileX LIMO ROS2 stack running on the Intel NUC mounted on the robot, while preserving the existing GNSS experiment pipeline so the same runs produce both controller-evaluation data and GPS / GPS-RTK / Ohcoach-cell NTRIP-associated datasets.
+Implement the professor-provided H-infinity path-following controller on the physical AgileX LIMO platform and evaluate how well the behavior demonstrated in simulation transfers to real hardware under actual sensing, actuation, safety, and environment constraints.
+
+The project is therefore not only a controller-integration task. It is also a sim-to-real evaluation task whose outputs should show:
+
+- whether the controller can be deployed safely in the existing ROS2 stack
+- how real-hardware behavior differs from the simulation study
+- whether the remaining gap can be handled by interface adaptation and conservative tuning, or indicates a deeper plant-model mismatch
+- whether the experiment pipeline preserves enough GNSS and run-traceability information for offline analysis and external dataset association
 
 ## 3. In Scope
 
 - Integrate the provided controller into the existing ROS2 control pipeline on the LIMO.
+- Adapt the simulation-oriented controller interface to the real robot without bypassing the existing safety path.
 - Reuse existing bring-up, safety, logging, and scenario infrastructure where practical.
 - Define a canonical interface between the controller and the existing stack.
 - Run repeatable experiments on the robot.
+- Evaluate sim-to-real transfer by comparing real-hardware behavior against the simulation-side expectations from the professor's work.
+- Identify major mismatch sources such as speed limits, saturation, odometry quality, timing, and vehicle-model error.
 - Record and analyze controller performance from rosbag data.
 - Preserve and collect GNSS datasets from the existing stack, including GPS and GPS-RTK outputs.
 - Associate each experiment run with externally collected Ohcoach-cell NTRIP-related data.
@@ -41,6 +51,8 @@ Integrate a professor-provided H-infinity controller into the AgileX LIMO ROS2 s
 - The relevant `agile_ws`-derived runtime files are already present in this repository.
 - Intended execution location on the robot: user stated `~/agiles_ws`.
 - Existing environment script currently sources `~/agilex_ws/install/setup.bash`.
+- The LIMO firmware imposes a global speed cap of `1.0 m/s`.
+- This cap also constrains turning behavior: if the commanded turn would require wheel speed beyond the firmware limit, the robot will widen the effective turning radius instead of realizing the nominal curvature command.
 
 This path mismatch must be resolved before implementation. The spec assumes the final deployed workspace path will be standardized during integration.
 
@@ -443,6 +455,7 @@ The project is considered successfully implemented when all of the following are
 - The controller receives required feedback and reference inputs.
 - The controller publishes `cmd_vel_raw`.
 - The safety node continues to arbitrate motion through `cmd_vel`.
+- The deployed controller is tested within a speed and curvature envelope consistent with the LIMO firmware `1.0 m/s` cap.
 
 ### 18.2 Safety Acceptance
 
@@ -462,6 +475,7 @@ The project is considered successfully implemented when all of the following are
 - At least one low-speed path-following scenario is completed repeatedly without unsafe behavior.
 - The same scenario is executed under the selected manual baseline.
 - The final analysis reports the agreed tracking metrics and explicitly states the baseline limitations.
+- The final analysis states how the observed real-hardware behavior compares with the simulation-side expectation and identifies the main sim-to-real mismatch sources.
 
 ## 19. Risks and Constraints
 
@@ -469,6 +483,8 @@ The project is considered successfully implemented when all of the following are
   - Mitigation: add a wrapper node rather than rewriting the surrounding ROS2 stack.
 - The workspace path naming is inconsistent (`agile_ws`, `agiles_ws`, `agilex_ws`).
   - Mitigation: standardize deployment paths before implementation.
+- The LIMO firmware applies a global `1.0 m/s` speed cap, which can enlarge the effective turning radius when curvature commands would otherwise demand higher wheel speed.
+  - Mitigation: design scenarios and interpret results using a coupled speed-curvature envelope rather than assuming the simulated path curvature is always physically realizable at the commanded speed.
 - `/wheel/odom` may drift and is not a high-accuracy ground truth source.
   - Mitigation: use RTK-quality GNSS as the preferred semi-ground-truth source whenever fix quality is sufficient.
 - The existing workspace contains GNSS-oriented evaluation logic.
@@ -495,3 +511,205 @@ The project is considered successfully implemented when all of the following are
 4. Extend the recorder topic list only where controller-specific topics are still missing.
 5. Define a run-identification or time-synchronization procedure for the external Ohcoach-cell NTRIP-related dataset.
 6. Define one low-speed reference path and complete an end-to-end trial.
+
+## 22. Workflow To Adapt `scalecar-vfg-h-infinite` To Real LIMO Hardware
+
+This workflow is reasonable if the professor-provided package is treated as a reusable controller and guidance library, not as a robot-ready deployment stack.
+
+The key engineering assumption that must be checked early is whether the real AgileX LIMO behaves closely enough to the scale-car-oriented model embedded in the simulation package. If the mismatch is modest, interface adaptation and parameter tuning may be sufficient. If the mismatch is large, controller re-synthesis may eventually be required outside this repository.
+
+### 22.1 Reuse Strategy
+
+The preferred reuse strategy is:
+
+- reuse `VectorFieldGuidance`
+- reuse `LPVHinfController`
+- reuse the ROS2 node structure in `scalecar-vfg-h-infinite/ros2_bridge/limo_path_follower/path_follower_node.py`
+- replace the demo-only path source, topic names, and deployment assumptions
+- preserve the existing LIMO safety path through `cmd_vel_raw` -> `estop_cli.py` -> `cmd_vel`
+
+The simulation package should therefore be treated as a controller runtime source, not as the final authority for robot I/O, safety, launch, or experiment logging.
+
+### 22.2 Main Gaps Between The Professor Code And The Current LIMO Stack
+
+The current professor-provided ROS2 bridge is close to the required shape, but it still has several hardware-integration gaps:
+
+- it subscribes to `/odom`, while the current LIMO stack uses `/wheel/odom`
+- it publishes directly to `/cmd_vel`, while this project requires publishing to `cmd_vel_raw`
+- it uses a hardcoded demonstration path rather than a runtime reference input
+- it assumes a wheelbase and steering limits derived from the simulation package defaults
+- it approximates steering feedback with the previous command rather than confirmed hardware steering telemetry
+- it does not yet publish the controller diagnostics needed for evaluation and logging
+
+### 22.3 High-Level Porting Workflow
+
+#### Stage A: Freeze The Interfaces
+
+Purpose:
+
+- prevent unnecessary controller rewrites
+- isolate robot-specific adaptations to a wrapper or bridge layer
+
+Required decisions:
+
+- confirm the professor package entry points to reuse
+- define the reference input type to be used on the robot
+- define the odometry topic and frame conventions
+- preserve the existing safety-chain topic contract
+
+Expected output:
+
+- a written interface definition for controller inputs, outputs, and diagnostics
+
+#### Stage B: Create The Robot Adapter Node
+
+Purpose:
+
+- make the simulation-side controller executable inside the real ROS2 stack
+
+Required work:
+
+- import the professor package into the ROS2 runtime environment on the NUC
+- adapt the existing `path_follower_node.py` pattern into a controller wrapper node
+- subscribe to `/wheel/odom` or add a small adapter if another odometry source is preferred
+- publish `cmd_vel_raw` instead of `/cmd_vel`
+- add safe zero-command behavior for missing odometry, missing reference, and shutdown
+
+Expected output:
+
+- a controller node that runs on the NUC and produces bounded raw commands without bypassing the safety layer
+
+#### Stage C: Replace The Demo Path With A Real Reference Source
+
+Purpose:
+
+- make the controller follow experiment-defined paths rather than a hardcoded simulation path
+
+Required work:
+
+- choose whether the reference source will be `nav_msgs/msg/Path`, a waypoint file, or a scenario-to-path adapter
+- convert the existing scenario representation if needed
+- ensure the controller and reference use the same coordinate frame
+- define how path completion, restart, and invalid-reference cases behave
+
+Expected output:
+
+- a repeatable runtime reference path pipeline suitable for both testing and logging
+
+#### Stage D: Validate Vehicle-Level Assumptions
+
+Purpose:
+
+- check whether the simulation assumptions are close enough to the real robot
+
+Required checks:
+
+- wheelbase value
+- steering saturation
+- practical speed range
+- the coupled speed-curvature envelope imposed by the LIMO firmware `1.0 m/s` global speed cap
+- effective controller sample period
+- whether `cmd_vel` on the LIMO base behaves consistently with the bicycle-model conversion from steering angle to yaw rate
+- whether steering-angle telemetry exists or must be approximated
+
+Expected output:
+
+- a first-pass hardware parameter set and a list of known model mismatches
+
+#### Stage E: Integrate Logging And Experiment Control
+
+Purpose:
+
+- make hardware tests analyzable and repeatable
+
+Required work:
+
+- extend `Data_Logger.py` topic coverage for controller diagnostics
+- ensure scenario status and event topics remain recorded
+- decide when RTK gating is required and when it should be disabled
+- define how external Ohcoach-cell data is associated with each run
+
+Expected output:
+
+- an end-to-end experiment pipeline that records both controller and GNSS-related data
+
+#### Stage F: Run Staged Hardware Testing
+
+Purpose:
+
+- reduce risk before attempting more aggressive operation
+
+Recommended order:
+
+1. static safety test with zero or bounded outputs
+2. low-speed straight-path tracking
+3. low-speed constant-curvature tracking
+4. gentle path transitions such as lane-change or slalom
+5. repeated runs for baseline comparison
+6. only then moderate speed increases if prior stages remain stable
+
+Expected output:
+
+- evidence that the controller is integrated safely and can complete low-speed path-following runs on the real robot
+
+#### Stage G: Tune Or Escalate
+
+Purpose:
+
+- determine whether integration-level tuning is sufficient
+
+Recommended tuning order:
+
+1. control rate and wheelbase consistency
+2. output saturation
+3. `output_gain`
+4. `K_ff`
+5. `rho_scale`
+
+Decision rule:
+
+- if the robot behaves qualitatively like the simulation but needs margin and smoothness adjustments, continue tuning
+- if the robot shows persistent structural mismatch, such as qualitatively wrong transient behavior under correct interfaces and conservative speeds, treat that as evidence that the bundled controller may not match the real plant closely enough
+
+### 22.4 Practical Execution Sequence On The Robot
+
+The expected practical execution sequence is:
+
+1. source the robot environment and launch the LIMO stack
+2. confirm odometry and safety topics are alive
+3. start `estop_cli.py`
+4. start the H-infinity wrapper node adapted from `scalecar-vfg-h-infinite`
+5. start the reference-path publisher or scenario adapter
+6. start rosbag recording
+7. run the low-speed experiment
+8. stop the run and verify logs before the next attempt
+
+### 22.5 Acceptance View For This Workflow
+
+This workflow should be considered successful when:
+
+- the professor-provided controller code runs as part of the robot ROS2 stack
+- the controller receives live robot feedback and a real runtime reference
+- the controller publishes only `cmd_vel_raw`
+- the safety path remains in authority
+- the resulting runs are logged well enough to compare robot behavior against simulation expectations and baseline runs
+
+## 23. Action Item List
+
+1. Identify the exact Python entry points in `scalecar-vfg-h-infinite` that will be reused in the robot wrapper node.
+2. Create a hardware-facing wrapper node based on `ros2_bridge/limo_path_follower/path_follower_node.py`.
+3. Change the wrapper output from `/cmd_vel` to `cmd_vel_raw`.
+4. Change the wrapper input from `/odom` to `/wheel/odom`, or add a deliberate adapter if another odometry source is selected.
+5. Replace the hardcoded demo path with a runtime reference input.
+6. Decide the reference format: `nav_msgs/msg/Path`, waypoint file, or scenario-to-path adapter.
+7. Verify frame conventions so odometry and reference are expressed consistently.
+8. Measure or confirm the real LIMO wheelbase, steering limit, and safe low-speed test envelope.
+9. Check whether steering-angle telemetry exists; if not, document that steering feedback is being approximated.
+10. Set an initial conservative `dt_ctrl`, `delta_max`, `output_gain`, `K_ff`, and `rho_scale` configuration for hardware tests.
+11. Extend `Data_Logger.py` to record controller status, tracking error, reference, and debug-command topics.
+12. Decide when RTK gating is required for controller experiments and when it should be disabled.
+13. Define a run-ID or timestamp procedure to associate each ROS run with the external Ohcoach-cell dataset.
+14. Execute a static safety validation before any motion tests.
+15. Execute a straight-line low-speed tracking test and inspect the resulting bag before continuing.
+16. Execute low-speed curved-path tests only after the straight-path test is stable.
+17. Compare robot logs against simulation expectations to determine whether tuning is sufficient or controller re-synthesis must be considered.

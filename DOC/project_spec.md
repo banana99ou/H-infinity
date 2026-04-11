@@ -7,11 +7,12 @@ This project is technically reasonable if it is treated as an integration and ev
 Two scope corrections are important:
 
 - The H-infinity controller itself is assumed to be provided by the professor. Controller derivation, gain design, and proof of stability are out of scope for this project unless additional materials are later supplied.
-- The reusable ROS2 workspace in `../agile_ws` already provides robot bring-up, safety filtering, scenario orchestration, and rosbag recording, but it does not already contain an H-infinity control stack. It should be reused as infrastructure, not described as if the controller is already implemented there.
+- The relevant `agile_ws` runtime and support files are already present in this repository. The remaining work is therefore controller integration and stack unification, not re-importing the GNSS/experiment infrastructure.
+- The existing ROS2/GNSS stack does not already contain an H-infinity control stack. It should be reused as infrastructure, not described as if the controller is already implemented.
 
 ## 2. Project Goal
 
-Integrate a professor-provided H-infinity controller into the AgileX LIMO ROS2 stack running on the Intel NUC mounted on the robot, then evaluate the controller's path-following performance against a practical manual baseline under repeatable test scenarios.
+Integrate a professor-provided H-infinity controller into the AgileX LIMO ROS2 stack running on the Intel NUC mounted on the robot, while preserving the existing GNSS experiment pipeline so the same runs produce both controller-evaluation data and GPS / GPS-RTK / Ohcoach-cell NTRIP-associated datasets.
 
 ## 3. In Scope
 
@@ -20,6 +21,9 @@ Integrate a professor-provided H-infinity controller into the AgileX LIMO ROS2 s
 - Define a canonical interface between the controller and the existing stack.
 - Run repeatable experiments on the robot.
 - Record and analyze controller performance from rosbag data.
+- Preserve and collect GNSS datasets from the existing stack, including GPS and GPS-RTK outputs.
+- Associate each experiment run with externally collected Ohcoach-cell NTRIP-related data.
+- Use RTK-quality GNSS data as semi-ground truth for controller evaluation when fix quality is sufficient.
 - Compare controller behavior against a manual or existing non-H-infinity operating workflow.
 
 ## 4. Out of Scope
@@ -28,12 +32,13 @@ Integrate a professor-provided H-infinity controller into the AgileX LIMO ROS2 s
 - Claims of scientific superiority over PID, MPC, or other advanced controllers unless those controllers are also implemented and tested in the same ROS2 stack.
 - Full localization redesign.
 - Major changes to the LIMO base driver unless required for compatibility.
+- Direct code-level interaction with the Ohcoach-cell NTRIP hardware, which operates independently from the ROS2 stack.
 
 ## 5. Deployment Context
 
 - Target platform: Intel NUC mounted on the AgileX LIMO.
 - Runtime environment: ROS2 on the robot-side computer.
-- Reusable workspace source: `../agile_ws`.
+- The relevant `agile_ws`-derived runtime files are already present in this repository.
 - Intended execution location on the robot: user stated `~/agiles_ws`.
 - Existing environment script currently sources `~/agilex_ws/install/setup.bash`.
 
@@ -41,13 +46,13 @@ This path mismatch must be resolved before implementation. The spec assumes the 
 
 ## 6. Existing Assets To Reuse
 
-The following assets already exist in `../agile_ws` and should be treated as the base infrastructure for this project.
+The following assets are already present in this repository, copied from the existing `agile_ws` runtime stack, and should be treated as the base infrastructure for this project.
 
 ### 6.1 Bring-up and Platform Access
 
-- `../agile_ws/start_ROS.sh`
+- `start_ROS.sh`
   - Runs the environment setup and launches the robot stack.
-- `../agile_ws/env_sanitizer.sh`
+- `env_sanitizer.sh`
   - Sources ROS2.
   - Sources the installed robot workspace.
   - Sets `ROS_DOMAIN_ID=0`.
@@ -55,7 +60,7 @@ The following assets already exist in `../agile_ws` and should be treated as the
 
 ### 6.2 Robot Stack Launch
 
-- `../agile_ws/src/limo_ros2/limo_base/launch/LIMO+MAVROS+RTK_Node_Launcher.launch.py`
+- `src/limo_ros2/limo_base/launch/LIMO+MAVROS+RTK_Node_Launcher.launch.py`
   - Launches `limo_base`.
   - Remaps `odom` to `/wheel/odom`.
   - Launches `mavros` in namespace `pixhawk`.
@@ -63,7 +68,7 @@ The following assets already exist in `../agile_ws` and should be treated as the
 
 ### 6.3 Safety Path
 
-- `../agile_ws/estop_cli.py`
+- `estop_cli.py`
   - Subscribes to `cmd_vel_raw`.
   - Publishes filtered `cmd_vel`.
   - Publishes `/estop`.
@@ -73,18 +78,18 @@ This existing topic contract is central to the project and should be preserved u
 
 ### 6.4 Experiment Orchestration
 
-- `../agile_ws/run_scenarios_from_files.py`
+- `run_scenarios_from_files.py`
   - Loads scenario definitions from INI files.
   - Performs preflight checks for topics, publishers, subscribers, and message flow.
   - Can gate execution on RTK status in the existing GNSS workflow.
   - Publishes `/scenario_runner/status` and `/scenario_runner/event`.
   - Starts and stops the bag recorder.
 
-For H-infinity controller evaluation, the existing RTK gating should be treated as optional and reused only if the experiment design actually depends on GNSS or outdoor positioning context.
+For the combined GNSS + controller dataset objective, RTK gating should generally remain available and be enabled whenever a run is intended to produce RTK-based semi-ground-truth intervals.
 
 ### 6.5 Data Logging
 
-- `../agile_ws/Data_Logger.py`
+- `Data_Logger.py`
   - Wraps `ros2 bag record`.
   - Publishes `/data_logger/recording` and `/data_logger/health`.
   - Already records the current baseline topics:
@@ -102,10 +107,17 @@ For H-infinity controller evaluation, the existing RTK gating should be treated 
 
 ### 6.6 Existing Motion Baseline
 
-- `../agile_ws/limo_scenario_motion.py`
+- `limo_scenario_motion.py`
   - Publishes `cmd_vel_raw`.
   - Uses `/wheel/odom` for simple heading-hold and motion stopping logic.
   - Represents the current non-H-infinity motion behavior that can be used as a practical baseline reference.
+
+### 6.7 Existing GNSS Dataset Support
+
+- `GPS-RTK_ROS2_pub_node.py`
+  - Publishes GNSS fix, NMEA, and RTK status topics for the F9P-based RTK pipeline.
+- The current stack already supports collection of GPS and GPS-RTK-related ROS data.
+- The Ohcoach-cell NTRIP-related dataset is collected independently by external hardware and does not require new ROS2 code-level interaction.
 
 ## 7. System Architecture
 
@@ -162,6 +174,14 @@ If the professor-supplied controller expects a different interface, an adapter l
 ### 9.3 Evaluation Topic Extensions
 
 The current logger is GNSS-oriented. Controller evaluation requires additional topics to be recorded.
+
+### 9.4 GNSS Dataset Preservation
+
+The controller integration must not break the existing GNSS data collection path. The target system should allow a single experiment run to support:
+
+- GNSS performance evaluation across GPS and GPS-RTK outputs
+- association with the independently collected Ohcoach-cell NTRIP-related dataset
+- H-infinity controller evaluation using RTK-quality GNSS as semi-ground truth when available
 
 ## 10. Canonical Controller Interface Contract
 
@@ -288,7 +308,7 @@ Candidate checks:
 
 ## 14. Performance Metrics
 
-The project shall evaluate controller performance using controller-relevant metrics rather than GNSS-fix metrics.
+The project shall evaluate controller performance using controller-relevant metrics while also preserving the existing GNSS dataset objective.
 
 ### 14.1 Primary Metrics
 
@@ -323,11 +343,20 @@ The project shall evaluate controller performance using controller-relevant metr
 - time inside a tolerance band
 - energy or battery impact if instrumentation is available
 
+### 14.4 GNSS Dataset Metrics
+
+In addition to controller metrics, each run should preserve the GNSS-analysis value of the dataset. Relevant GNSS-side quantities include:
+
+- fix class or quality over time
+- time spent in RTK FIXED, RTK FLOAT, and lower-quality states
+- fix loss and re-fix events
+- correction-availability context when it can be associated from the external Ohcoach-cell dataset
+
 ## 15. Logging Requirements
 
-The rosbag recorder should keep the current topics and add controller-evaluation topics.
+The rosbag recorder should preserve the current GNSS topics and add controller-evaluation topics.
 
-### 15.1 Minimum Required Topics For Controller Evaluation
+### 15.1 Minimum Required ROS Topics
 
 - `/cmd_vel`
 - `/cmd_vel_raw`
@@ -336,23 +365,45 @@ The rosbag recorder should keep the current topics and add controller-evaluation
 - `/estop`
 - `/scenario_runner/event`
 - `/scenario_runner/status`
+- `/gps_rtk_f9p_helical/gps/fix`
+- `/gps_rtk_f9p_helical/gps/nmea`
+- `/gps_rtk_f9p_helical/gps/rtk_status`
+- `/pixhawk/global_position/raw/fix`
+- `/pixhawk/global_position/raw/satellites`
+- `/pixhawk/gpsstatus/gps1/raw`
 - controller reference topic
 - controller status topic
 - controller error topic or equivalent diagnostics
 
-### 15.2 Recommended Additional Topics
+### 15.2 External NTRIP-Associated Dataset
+
+In this project, "NTRIP data" refers to data collected by the independently operating Ohcoach-cell hardware that receives RTK correction data from an NTRIP service via hotspot.
+
+- No new ROS2 code-level interaction is assumed for this hardware.
+- The dataset should be associated with each experiment run by time, run ID, or operator log.
+- If reliable synchronization metadata is not available, this limitation must be documented in the analysis.
+
+### 15.3 Recommended Additional ROS Topics
 
 - `/data_logger/recording`
 - `/data_logger/health`
-- GNSS topics if outdoor repeatability or location context is useful
+- steering-angle or Ackermann telemetry if available at runtime
+- any fused pose topic used for offline evaluation
 
-### 15.3 Data Quality Rule
+### 15.4 Semi-Ground-Truth Policy
+
+- RTK-quality GNSS should be used as semi-ground truth for path-relative error when the fix quality is sufficient, ideally RTK FIXED.
+- Wheel-encoder odometry should be treated primarily as onboard control feedback and as a fallback analysis source, not as the preferred path-error truth source.
+- If RTK quality drops below the accepted threshold, the corresponding intervals should be marked accordingly during analysis.
+
+### 15.5 Data Quality Rule
 
 A run should not be treated as valid for analysis unless:
 
 - the bag starts before motion begins
 - the bag ends after motion finishes or aborts
 - all required evaluation topics are present
+- all required GNSS topics for the run objective are present
 - message flow is continuous enough for analysis
 - the reason for abort, if any, is recorded
 
@@ -401,9 +452,10 @@ The project is considered successfully implemented when all of the following are
 
 ### 18.3 Data Acceptance
 
-- Rosbags contain all required motion, controller, and event topics.
+- Rosbags contain all required motion, controller, event, and GNSS topics.
 - Runs can be replayed offline for metric extraction.
 - Scenario identity and run outcome are traceable from recorded data.
+- External Ohcoach-cell NTRIP-related data can be associated with the run, or the absence of such association is explicitly documented.
 
 ### 18.4 Evaluation Acceptance
 
@@ -418,9 +470,11 @@ The project is considered successfully implemented when all of the following are
 - The workspace path naming is inconsistent (`agile_ws`, `agiles_ws`, `agilex_ws`).
   - Mitigation: standardize deployment paths before implementation.
 - `/wheel/odom` may drift and is not a high-accuracy ground truth source.
-  - Mitigation: treat it as onboard feedback and relative evaluation data, not as absolute truth.
+  - Mitigation: use RTK-quality GNSS as the preferred semi-ground-truth source whenever fix quality is sufficient.
 - The existing workspace contains GNSS-oriented evaluation logic.
-  - Mitigation: reuse infrastructure only, and define new controller-specific metrics.
+  - Mitigation: preserve that GNSS value and add controller-specific metrics rather than replacing the existing dataset objective.
+- The Ohcoach-cell NTRIP-related dataset is external to the ROS stack.
+  - Mitigation: define a clear run-to-dataset association procedure based on timestamps or operator logs.
 - A manual baseline is less rigorous than controller-to-controller comparison.
   - Mitigation: present results as an engineering evaluation unless stronger baselines are later implemented.
 
@@ -428,14 +482,16 @@ The project is considered successfully implemented when all of the following are
 
 - H-infinity controller integration into the existing LIMO ROS2 stack
 - repeatable launch and execution procedure on the Intel NUC
-- rosbag dataset for controller evaluation
+- synchronized rosbag dataset supporting both controller evaluation and GNSS evaluation
+- associated Ohcoach-cell NTRIP-related dataset for runs where it is collected
 - offline analysis outputs for tracking metrics
-- brief evaluation report summarizing controller behavior and comparison against the practical baseline
+- brief evaluation report summarizing controller behavior, GNSS dataset quality, and comparison against the practical baseline
 
 ## 21. Immediate Next Implementation Targets
 
 1. Confirm the professor-provided controller runtime interface.
 2. Standardize the robot workspace path and environment sourcing.
 3. Create the controller wrapper node if message types or topic names do not match the canonical contract.
-4. Extend the recorder topic list for controller evaluation.
-5. Define one low-speed reference path and complete an end-to-end trial.
+4. Extend the recorder topic list only where controller-specific topics are still missing.
+5. Define a run-identification or time-synchronization procedure for the external Ohcoach-cell NTRIP-related dataset.
+6. Define one low-speed reference path and complete an end-to-end trial.

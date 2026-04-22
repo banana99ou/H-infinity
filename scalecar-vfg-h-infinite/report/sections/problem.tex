@@ -1,0 +1,65 @@
+% Author: Suwon Lee, Kookmin University
+\section{경로추종 문제 정의}
+\label{sec:problem}
+
+\subsection{경로(Path)란?}
+
+경로추종(path following)에서 \textbf{경로}란 로봇이 따라가야 할 2차원 기하학적 곡선이다.
+시간에 대한 정보는 포함하지 않으며, 호 길이(arc-length) $s$로 매개변수화한다:
+\begin{equation}
+    \vect{P}(s) = \begin{bmatrix} x(s) \\ y(s) \end{bmatrix}, \quad s \in [0, L]
+\end{equation}
+여기서 $L$은 경로의 전체 길이이다.
+
+경로 위의 각 점에서 다음 기하 정보를 정의할 수 있다:
+\begin{itemize}[nosep]
+    \item \textbf{접선 벡터} $\vect{t}(s)$: 경로 진행 방향의 단위 벡터
+    \item \textbf{법선 벡터} $\vect{n}(s)$: 접선에 수직, 왼쪽 방향 (반시계)
+    \item \textbf{곡률} $\kappa(s)$: 경로의 ``휘어진 정도''. $\kappa = 1/R$ (원호의 경우 반지름의 역수)
+    \item \textbf{경로 방향각} $\psi_\text{path}(s) = \atantwo(y'(s), x'(s))$
+\end{itemize}
+
+\subsection{추종 오차}
+
+로봇 위치 $\vect{q} = (X, Y)$에서 경로 위 가장 가까운 점 $\vect{P}(s^*)$를 찾으면,
+두 가지 오차를 정의할 수 있다:
+
+\begin{itemize}[nosep]
+    \item \textbf{횡방향 오차} (cross-track error): $e_d = (\vect{q} - \vect{P}(s^*)) \cdot \vect{n}(s^*)$
+    \item \textbf{방향 오차} (heading error): $e_\psi = \psi_\text{des} - \psi$
+\end{itemize}
+
+$e_d > 0$이면 로봇이 경로 왼쪽에, $e_d < 0$이면 오른쪽에 있다.
+$e_\psi > 0$이면 로봇이 원하는 방향보다 시계 방향으로 벗어나 있다.
+
+경로추종의 목표는 두 오차를 모두 0으로 수렴시키는 것이다:
+\begin{equation}
+    e_d \to 0, \quad e_\psi \to 0
+\end{equation}
+
+\subsection{자전거 모델 (Bicycle Model)}
+
+LIMO 로봇은 Ackermann 조향 구조를 갖는 1:10 스케일카이다.
+저속에서는 운동학적 자전거 모델(kinematic bicycle model)로 충분히 근사할 수 있다.
+
+\begin{equation}
+\begin{aligned}
+    \dot{X} &= v \cos(\psi + \beta) \\
+    \dot{Y} &= v \sin(\psi + \beta) \\
+    \dot{\psi} &= \frac{v}{L} \cos\beta \cdot \tan\delta \\
+    \dot{\delta} &= \frac{\delta_\text{cmd} - \delta}{\tau_\delta}
+\end{aligned}
+\label{eq:bicycle}
+\end{equation}
+여기서 $v$: 종방향 속도, $\psi$: 방향각, $\delta$: 조향각,
+$L = 0.2$\,m: 축거, $\tau_\delta = 0.07$\,s: 조향 시정수, $\beta$: 슬립각이다.
+
+핵심 매개변수:
+\begin{itemize}[nosep]
+    \item 축거 $L = 0.2$\,m --- 앞바퀴와 뒷바퀴 축 사이 거리
+    \item 조향 시정수 $\tau_\delta = 0.07$\,s --- 조향 명령이 실제 조향각에 반영되는 지연
+    \item 최대 조향각 $\delta_\text{max} = 0.5$\,rad ($\approx 28.6°$)
+\end{itemize}
+
+조향 명령 $\delta_\text{cmd}$를 입력하면, 1차 지연을 거쳐 실제 조향각 $\delta$에 반영된다.
+이 조향각이 차량의 방향을 변화시키고, 결과적으로 경로추종 오차를 줄인다.

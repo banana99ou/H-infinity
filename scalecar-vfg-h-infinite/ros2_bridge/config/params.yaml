@@ -1,0 +1,9 @@
+path_follower_node:
+  ros__parameters:
+    controller_type: "lpv-hinf"
+    v_const: 1.0
+    k_e: 3.0
+    dt_ctrl: 0.05
+    wheelbase: 0.2
+    K_P: 2.0
+    K_D: 0.3

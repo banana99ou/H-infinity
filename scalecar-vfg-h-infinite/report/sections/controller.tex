@@ -1,0 +1,96 @@
+% Author: Suwon Lee, Kookmin University
+\section{제어기 개념}
+\label{sec:controller}
+
+\subsection{PID + 곡률 피드포워드 (PID-FF)}
+
+가장 직관적인 제어기이다.
+방향 오차 $e_\psi = \psi_\text{des} - \psi$에 비례-미분 제어를 적용하고,
+경로 곡률에 대한 피드포워드 항을 추가한다:
+
+\begin{equation}
+    \delta_\text{cmd} = \underbrace{K_P \cdot e_\psi + K_D \cdot \dot{e}_\psi}_{\text{PID 피드백}}
+    + \underbrace{\arctan(L \cdot \kappa)}_{\text{곡률 피드포워드}}
+    \label{eq:pid}
+\end{equation}
+
+\begin{itemize}[nosep]
+    \item $K_P = 2.0$: 비례 이득. 오차에 비례하여 조향
+    \item $K_D = 0.3$: 미분 이득. 오차 변화율에 반응하여 진동 억제
+    \item 피드포워드: 경로가 휘어져 있으면 그에 맞는 조향을 미리 적용
+\end{itemize}
+
+PID-FF는 구현이 간단하고 직관적이지만, 속도와 곡률이 변하는 상황에서
+이득이 고정되어 있어 최적 성능을 보장하지 못한다.
+
+\subsection{LPV $\mathcal{H}_\infty$ 제어기 (블랙박스 관점)}
+
+\subsubsection{$\mathcal{H}_\infty$ 제어란?}
+
+$\mathcal{H}_\infty$ 제어는 ``최악의 경우에도 성능을 보장''하는 강인 제어 기법이다.
+일상적인 비유: \textbf{강인한 자동조종 장치}.
+
+\begin{itemize}[nosep]
+    \item 센서 잡음이 있어도 안정적으로 동작
+    \item 모델과 실제 로봇 사이 차이가 있어도 강인
+    \item 주파수 영역에서 성능/강인성 트레이드오프를 명시적으로 설계
+\end{itemize}
+
+$\mathcal{H}_\infty$ 합성의 수학적 세부 사항은 이 보고서의 범위를 벗어난다.
+학생은 사전 계산된 제어기(JSON 파일)를 그대로 사용하면 된다.
+
+\subsubsection{LPV 스케줄링}
+
+LPV(Linear Parameter-Varying)는 ``상황에 따라 이득이 자동으로 변하는''
+제어기이다.
+
+스케줄링 매개변수 $\rho$를 다음과 같이 정의한다:
+\begin{equation}
+    \rho = |\kappa| \cdot v
+\end{equation}
+
+$\rho$의 물리적 의미:
+\begin{itemize}[nosep]
+    \item $\rho = 0$: 직선 구간 또는 정지 → 제어기가 보수적으로 동작
+    \item $\rho$ 큼: 고속 + 고곡률 → 제어기가 적극적으로 반응
+\end{itemize}
+
+6개의 꼭짓점(vertex) 제어기 ($\rho = 0, 1, 2, 3, 4, 5$)가 사전 설계되어 있으며,
+실시간에서 현재 $\rho$ 값에 따라 인접 꼭짓점 사이를 선형 보간한다.
+
+\subsubsection{입출력 구조}
+
+학생이 알아야 할 것은 입출력 관계뿐이다:
+
+\begin{itemize}[nosep]
+    \item \textbf{입력}: 방향 오차 $e_\psi$, 측정 조향각 $\delta_\text{meas}$, 스케줄링 변수 $\rho$
+    \item \textbf{출력}: 조향 명령 $\delta_\text{cmd}$
+    \item \textbf{내부 상태}: 6차 상태공간 모델 (자동 관리)
+\end{itemize}
+
+부호 규칙: 학생은 $e_\psi = \psi_\text{des} - \psi$를 그대로 넘기면 된다.
+내부적으로 MATLAB 관례에 맞게 부호가 자동 변환된다.
+
+\subsection{두 제어기의 비교}
+
+\begin{table}[h]
+    \centering
+    \caption{PID-FF와 LPV $\mathcal{H}_\infty$ 비교}
+    \begin{tabular}{lcc}
+        \toprule
+        항목 & PID-FF & LPV $\mathcal{H}_\infty$ \\
+        \midrule
+        구현 난이도 & 쉬움 & 블랙박스 (JSON 로드) \\
+        이득 조정 & 수동 ($K_P, K_D$) & 자동 ($\rho$ 기반) \\
+        잡음 강인성 & 보통 & 높음 (설계에 반영) \\
+        고속 성능 & 고정 이득 한계 & $\rho$ 스케줄링으로 적응 \\
+        저속 직선 & 우수 & 유사 \\
+        파라미터 수 & 2 ($K_P, K_D$) & 0 (사전 설계) \\
+        \bottomrule
+    \end{tabular}
+    \label{tab:comparison}
+\end{table}
+
+핵심 메시지: 저속 직선 구간에서는 PID로 충분하지만,
+고속이나 급곡선에서는 LPV $\mathcal{H}_\infty$가 체계적인 이점을 보인다.
+다음 장의 시뮬레이션 결과에서 이를 정량적으로 확인한다.

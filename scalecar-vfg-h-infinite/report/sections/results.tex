@@ -1,0 +1,74 @@
+% Author: Suwon Lee, Kookmin University
+\section{시뮬레이션 결과 비교}
+\label{sec:results}
+
+\subsection{실험 설정}
+
+시뮬레이션은 \texttt{vfg\_pathfollowing} 패키지를 사용하여 수행한다.
+동일한 VFG 유도 모듈($k_e = 3.0$) 위에서 PID-FF와 LPV $\mathcal{H}_\infty$를 비교한다.
+
+경로: 직선 $\to$ 원호(R=0.5\,m, $\theta = 90°$) $\to$ 직선 (step curvature path)
+
+이 경로는 갑작스러운 곡률 변화를 포함하여, 제어기의 과도 응답 성능을 평가하기에 적합하다.
+
+\subsection{속도별 성능}
+
+표~\ref{tab:results}에 속도별 RMS 방향 오차와 최대 방향 오차를 정리하였다.
+
+\begin{table}[h]
+    \centering
+    \caption{속도별 방향 오차 비교 (Step curvature path, R=0.5\,m)}
+    \begin{tabular}{ccccc}
+        \toprule
+        & \multicolumn{2}{c}{RMS $e_\psi$ [deg]} & \multicolumn{2}{c}{Max $e_\psi$ [deg]} \\
+        \cmidrule(lr){2-3} \cmidrule(lr){4-5}
+        $v$ [m/s] & PID-FF & LPV $\mathcal{H}_\infty$ & PID-FF & LPV $\mathcal{H}_\infty$ \\
+        \midrule
+        1.0 & 4.17 & 2.83 & 15.8 & 14.2 \\
+        1.5 & 3.77 & 2.34 & 18.1 & 11.5 \\
+        2.0 & 3.40 & 2.16 & 19.4 & 8.7 \\
+        2.5 & 3.39 & 2.14 & 20.2 & 7.3 \\
+        \bottomrule
+    \end{tabular}
+    \label{tab:results}
+    \vspace{0.5em}
+    \small{※ 200회 Monte Carlo 시뮬레이션 (센서 잡음 포함) 평균값}
+\end{table}
+
+\subsection{주요 관찰}
+
+\begin{enumerate}[nosep]
+    \item \textbf{저속 ($v = 1.0$\,m/s)}: 두 제어기 모두 양호한 성능. PID와 LPV의 차이가 작다.
+    이 영역에서 $\rho = |\kappa| \cdot v$가 작아 LPV 스케줄링의 이점이 제한적이다.
+
+    \item \textbf{중속 ($v = 1.5$\,m/s)}: LPV가 RMS에서 38\% 우위를 보이기 시작한다.
+    곡률 구간 진입 시 $\rho$가 증가하면서 제어기 대역폭이 자동으로 확대된다.
+
+    \item \textbf{고속 ($v \geq 2.0$\,m/s)}: LPV의 우위가 뚜렷하다.
+    특히 \textbf{최대 오차}에서 큰 차이가 난다 --- $v = 2.0$에서 PID 19.4° vs LPV 8.7° (55\% 감소).
+    PID는 고정 이득이므로 속도가 증가해도 동일한 이득을 사용하지만,
+    LPV는 $\rho$ 증가에 따라 대역폭을 자동으로 높여 더 빠르게 반응한다.
+
+    \item \textbf{센서 잡음 영향}: 두 제어기 모두 잡음($\sigma_\psi = 0.03$\,rad) 하에서 안정적이다.
+    LPV는 $\mathcal{H}_\infty$ 설계 시 잡음 모델이 포함되어 있어 추가적인 강인성을 보인다.
+\end{enumerate}
+
+\subsection{시뮬레이션 실행 방법}
+
+노트북 \texttt{02\_pid\_vs\_lpvhinf.ipynb}에서 위 결과를 직접 재현할 수 있다:
+
+\begin{verbatim}
+from vfg_pathfollowing import Simulator, StepCurvaturePath
+
+path = StepCurvaturePath(R=0.5, theta_arc=1.57)
+sim = Simulator(path, speed=2.0)
+results = sim.compare(T=15.0)
+Simulator.plot_comparison(results, path=path)
+\end{verbatim}
+
+\subsection{정리}
+
+VFG 유도 + LPV $\mathcal{H}_\infty$ 제어 조합은 PID-FF 대비 고속/고곡률 구간에서
+체계적인 성능 향상을 보인다.
+이는 $\rho$-스케줄링을 통해 주행 조건에 맞게 제어기 대역폭을 자동 조절하기 때문이다.
+학생은 노트북을 통해 다양한 속도, 경로, 파라미터에서 이 차이를 직접 확인할 수 있다.

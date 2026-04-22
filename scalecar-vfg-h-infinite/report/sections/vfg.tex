@@ -1,0 +1,72 @@
+% Author: Suwon Lee, Kookmin University
+\section{VFG 유도 원리}
+\label{sec:vfg}
+
+\subsection{Vector Field Guidance란?}
+
+VFG(Vector Field Guidance)는 경로 주변에 ``흐름의 장''을 형성하여
+로봇이 자연스럽게 경로로 수렴하고 경로를 따라가도록 유도하는 기법이다.
+
+직관적으로, 강물의 흐름을 상상하면 된다:
+\begin{itemize}[nosep]
+    \item 경로에서 멀리 있으면 → 강하게 경로 쪽으로 당기는 흐름 (수렴)
+    \item 경로 위에 있으면 → 경로 방향으로 흘러가는 흐름 (추종)
+\end{itemize}
+
+이 두 성분의 자연스러운 전환이 VFG의 핵심이다.
+
+\subsection{수렴/추종 벡터 분해}
+
+경로 위 가장 가까운 점 $\vect{P}(s^*)$에서 두 방향 벡터를 정의한다:
+\begin{itemize}[nosep]
+    \item \textbf{추종 벡터} $\vect{v}_\text{trav} = \vect{t}(s^*)$: 경로 접선 방향
+    \item \textbf{수렴 벡터} $\vect{v}_\text{conv} = -\sgn(e_d) \cdot \vect{n}(s^*)$: 경로를 향하는 방향
+\end{itemize}
+
+이 두 벡터를 거리에 따라 가중 합산한다:
+\begin{equation}
+    \vect{v}_\text{des} = k_\text{conv}(d) \cdot \vect{v}_\text{conv} + k_\text{trav}(d) \cdot \vect{v}_\text{trav}
+    \label{eq:vfg}
+\end{equation}
+여기서 $d = |e_d|$는 경로까지의 거리이다.
+
+\subsection{tanh 가중 함수}
+
+가중 계수는 $\tanh$ 함수로 정의한다:
+\begin{equation}
+    k_\text{conv}(d) = \tanh(k_e \cdot d), \quad
+    k_\text{trav}(d) = \sqrt{1 - k_\text{conv}^2(d)}
+    \label{eq:weights}
+\end{equation}
+
+$k_e$는 \textbf{수렴 이득}(convergence gain)으로, 경로로 수렴하는 강도를 결정한다.
+
+\begin{itemize}[nosep]
+    \item $d \gg 0$: $\tanh(k_e d) \approx 1$ → 수렴 우세 (경로 쪽으로 이동)
+    \item $d \approx 0$: $\tanh(k_e d) \approx 0$ → 추종 우세 (경로를 따라 이동)
+    \item $k_e$ 증가: 더 빠르게 수렴, 그러나 너무 크면 오버슈트 발생
+\end{itemize}
+
+기본값 $k_e = 3.0$은 대부분의 상황에서 적절한 수렴 성능을 보인다.
+
+\subsection{원하는 방향각}
+
+VFG의 출력은 원하는 방향각(desired heading)이다:
+\begin{equation}
+    \psi_\text{des} = \atantwo\!\left(v_{\text{des},y},\; v_{\text{des},x}\right)
+\end{equation}
+
+이 $\psi_\text{des}$와 실제 로봇 방향각 $\psi$의 차이가 방향 오차 $e_\psi$이며,
+제어기가 이 오차를 줄이도록 조향 명령을 생성한다.
+
+\subsection{VFG의 역할 구분}
+
+VFG는 ``어디로 향해야 하는가''를 결정하고 (유도, guidance),
+제어기는 ``조향을 얼마나 할 것인가''를 결정한다 (제어, control).
+
+이 분리 구조 덕분에:
+\begin{itemize}[nosep]
+    \item VFG는 경로 기하에만 의존 → 제어기 교체 시에도 유도 모듈 재사용 가능
+    \item 제어기는 방향 오차만 처리 → 다양한 제어 기법 적용 가능
+    \item 공정한 비교: 같은 VFG 위에서 PID와 LPV $\mathcal{H}_\infty$를 직접 비교할 수 있음
+\end{itemize}

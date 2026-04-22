@@ -3,9 +3,10 @@
 
 Author: Suwon Lee, Kookmin University
 Created: 2026-03-01
-Description: Subscribes to /odom, computes VFG + LPV-Hinf (or PID-FF)
-    steering, and publishes /cmd_vel.  Converts front-wheel steering
-    angle to yaw-rate: omega = v * tan(delta) / L.
+Description: Subscribes to /wheel/odom, computes VFG + LPV-Hinf (or PID-FF)
+    steering, and publishes cmd_vel_raw (routed through estop_cli.py to
+    /cmd_vel).  Converts front-wheel steering angle to yaw-rate:
+    omega = v * tan(delta) / L.
 
     A hardcoded StepCurvaturePath is used for demonstration.
     Replace it with your own path source for real experiments.
@@ -37,8 +38,9 @@ def _yaw_from_quaternion(q):
 class PathFollowerNode(Node):
     """VFG path follower node.
 
-    Subscribes to /odom for vehicle state, runs guidance + controller,
-    and publishes /cmd_vel at a fixed rate (default 20 Hz).
+    Subscribes to /wheel/odom for vehicle state, runs guidance + controller,
+    and publishes cmd_vel_raw at a fixed rate (default 20 Hz). The E-stop
+    node (estop_cli.py) filters cmd_vel_raw and re-publishes /cmd_vel.
     """
 
     def __init__(self):
@@ -96,9 +98,9 @@ class PathFollowerNode(Node):
 
         # -- ROS2 interfaces --------------------------------------------
         self.sub_odom = self.create_subscription(
-            Odometry, '/odom', self._odom_cb, 10)
+            Odometry, '/wheel/odom', self._odom_cb, 10)
 
-        self.pub_cmd = self.create_publisher(Twist, '/cmd_vel', 10)
+        self.pub_cmd = self.create_publisher(Twist, 'cmd_vel_raw', 10)
 
         timer_period = self.dt_ctrl  # seconds
         self.timer = self.create_timer(timer_period, self._control_cb)

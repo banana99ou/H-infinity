@@ -8,8 +8,13 @@ Description: Subscribes to /wheel/odom, computes VFG + LPV-Hinf (or PID-FF)
     /cmd_vel).  Converts front-wheel steering angle to yaw-rate:
     omega = v * tan(delta) / L.
 
-    A hardcoded StepCurvaturePath is used for demonstration.
-    Replace it with your own path source for real experiments.
+    The reference path is taken at runtime from a nav_msgs/msg/Path
+    subscription (default topic ``/reference_path``). The topic uses a
+    transient-local QoS so a one-shot publisher is sufficient: the most
+    recent message is replayed to late subscribers.
+
+    For smoke tests the original hardcoded ``StepCurvaturePath`` demo can
+    be re-enabled by setting the ``use_demo_path`` parameter to True.
 """
 
 import math
@@ -17,10 +22,12 @@ import numpy as np
 
 import rclpy
 from rclpy.node import Node
-from nav_msgs.msg import Odometry
+from rclpy.qos import QoSProfile, QoSDurabilityPolicy, QoSReliabilityPolicy, QoSHistoryPolicy
+from nav_msgs.msg import Odometry, Path
 from geometry_msgs.msg import Twist
 
 from vfg_pathfollowing import (
+    BezierPath,
     StepCurvaturePath,
     VectorFieldGuidance,
     LPVHinfController,
@@ -54,21 +61,32 @@ class PathFollowerNode(Node):
         self.declare_parameter('wheelbase', 0.2)
         self.declare_parameter('K_P', 2.0)
         self.declare_parameter('K_D', 0.3)
+        self.declare_parameter('reference_path_topic', '/reference_path')
+        self.declare_parameter('odom_frame', 'odom')
+        self.declare_parameter('use_demo_path', False)
 
         # -- Read parameters --------------------------------------------
         ctrl_type = self.get_parameter('controller_type').value
         self.v_const = min(self.get_parameter('v_const').value, 3.0)  # LIMO max ~3 m/s
-        k_e = self.get_parameter('k_e').value
+        self._k_e = self.get_parameter('k_e').value
         self.dt_ctrl = self.get_parameter('dt_ctrl').value
         self.wheelbase = self.get_parameter('wheelbase').value
         K_P = self.get_parameter('K_P').value
         K_D = self.get_parameter('K_D').value
+        ref_topic = self.get_parameter('reference_path_topic').value
+        self._odom_frame = self.get_parameter('odom_frame').value
+        use_demo = bool(self.get_parameter('use_demo_path').value)
 
-        # -- Path (hardcoded demo -- replace for real experiments) ------
-        self.path = StepCurvaturePath(L1=5.0, R=0.5, theta_arc=np.pi / 2, L2=25.0)
-
-        # -- Guidance ---------------------------------------------------
-        self.guidance = VectorFieldGuidance(self.path, k_e=k_e)
+        # -- Path (runtime; demo only when explicitly requested) --------
+        if use_demo:
+            self.path = StepCurvaturePath(L1=5.0, R=0.5, theta_arc=np.pi / 2, L2=25.0)
+            self.guidance = VectorFieldGuidance(self.path, k_e=self._k_e)
+            self.get_logger().warn(
+                'use_demo_path=true: using hardcoded StepCurvaturePath. '
+                'Publish to %s to override.' % ref_topic)
+        else:
+            self.path = None
+            self.guidance = None
 
         # -- Controller -------------------------------------------------
         ctrl_key = ctrl_type.lower().strip()
@@ -85,7 +103,7 @@ class PathFollowerNode(Node):
 
         self.get_logger().info(
             f'Controller: {self._ctrl_type}, v={self.v_const:.2f} m/s, '
-            f'k_e={k_e:.1f}, dt={self.dt_ctrl:.3f} s, L={self.wheelbase:.3f} m'
+            f'k_e={self._k_e:.1f}, dt={self.dt_ctrl:.3f} s, L={self.wheelbase:.3f} m'
         )
 
         # -- State from odometry ----------------------------------------
@@ -100,12 +118,25 @@ class PathFollowerNode(Node):
         self.sub_odom = self.create_subscription(
             Odometry, '/wheel/odom', self._odom_cb, 10)
 
+        latched_qos = QoSProfile(
+            depth=1,
+            history=QoSHistoryPolicy.KEEP_LAST,
+            reliability=QoSReliabilityPolicy.RELIABLE,
+            durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
+        )
+        self.sub_path = self.create_subscription(
+            Path, ref_topic, self._path_cb, latched_qos)
+
         self.pub_cmd = self.create_publisher(Twist, 'cmd_vel_raw', 10)
 
         timer_period = self.dt_ctrl  # seconds
         self.timer = self.create_timer(timer_period, self._control_cb)
 
-        self.get_logger().info('Path follower node started.')
+        if self.path is None:
+            self.get_logger().info(
+                f'Path follower node started. Waiting for reference path on {ref_topic}.')
+        else:
+            self.get_logger().info('Path follower node started.')
 
     # -----------------------------------------------------------------
     # Callbacks
@@ -122,9 +153,46 @@ class PathFollowerNode(Node):
         )
         self._odom_stamp = self.get_clock().now()
 
+    def _path_cb(self, msg: Path):
+        """Build a BezierPath from a runtime nav_msgs/Path reference."""
+        # Frame consistency check: VFG works in odom (or whatever frame the
+        # /wheel/odom poses live in). A mismatch will not be auto-corrected.
+        if msg.header.frame_id and msg.header.frame_id != self._odom_frame:
+            self.get_logger().warn(
+                f"Reference path frame_id='{msg.header.frame_id}' does not match "
+                f"odom_frame='{self._odom_frame}'. No transform is applied; "
+                "tracking will be wrong unless they match.")
+
+        waypoints = [(p.pose.position.x, p.pose.position.y) for p in msg.poses]
+        if len(waypoints) < 2:
+            self.get_logger().warn(
+                f'Reference path has {len(waypoints)} waypoint(s); need >= 2. Ignoring.')
+            return
+
+        try:
+            new_path = BezierPath(waypoints)
+        except Exception as exc:
+            self.get_logger().error(f'Failed to build BezierPath from reference: {exc}')
+            return
+
+        # Atomic swap: rclpy default executor is single-threaded so _control_cb
+        # cannot interleave between these two assignments.
+        self.path = new_path
+        self.guidance = VectorFieldGuidance(new_path, k_e=self._k_e)
+        self._delta_prev = 0.0
+
+        self.get_logger().info(
+            f'Loaded reference path: {len(waypoints)} waypoints, '
+            f'total length {new_path.total_length:.2f} m.')
+
     def _control_cb(self):
         """Timer callback: compute and publish control command."""
         cmd = Twist()
+
+        # Safety: no reference path yet -> zero velocity
+        if self.path is None or self.guidance is None:
+            self.pub_cmd.publish(cmd)
+            return
 
         # Safety: check odom timeout (0.5 s)
         if self._odom_stamp is None:

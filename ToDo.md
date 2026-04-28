@@ -19,26 +19,64 @@ tested yet.
 
 ## Next Thing To Implement
 
-- [ ] Reconcile `~/agiles_ws` (typo) vs `~/agilex_ws` across the repo.
+- [x] Reconcile `~/agiles_ws` (typo) vs `~/agilex_ws` across the repo.
   - NUC confirmed source of truth: `~/agilex_ws`.
-  - Files to edit: `env_sanitizer.sh`, `start_ROS.sh`.
-  - Trivially unblocks the "standardize workspace path" Critical Blocker below.
+  - `env_sanitizer.sh` and `start_ROS.sh` already use `~/agilex_ws` — no
+    edits required. Remaining `agile_ws` / `agiles_ws` mentions live only
+    in `DOC/project_spec.md`, which is owned by the user.
 
-After that, the first substantive task is:
+The first substantive task is done:
 
-- [ ] Replace the hardcoded `StepCurvaturePath` demo path in
+- [x] Replace the hardcoded `StepCurvaturePath` demo path in
   `scalecar-vfg-h-infinite/ros2_bridge/limo_path_follower/path_follower_node.py`
-  with a runtime reference input. Candidates: `nav_msgs/msg/Path` subscription,
-  a waypoint file loader, or a scenario-to-path adapter.
+  with a runtime reference input.
+  - Implemented: `nav_msgs/msg/Path` subscription on `/reference_path`
+    (parameter `reference_path_topic`), latched QoS (transient_local +
+    reliable + keep_last 1) so a one-shot publisher works.
+  - Waypoints converted to `BezierPath`; guidance is rebuilt on each new
+    message. `_delta_prev` is reset on swap.
+  - Frame-id of incoming path is checked against the `odom_frame`
+    parameter (default `odom`); mismatch logs a warn (no transform
+    applied — see frame-consistency task below).
+  - Demo path retained behind `use_demo_path:=true` for smoke tests.
+  - Verified on NUC: zero cmd while no path, zero cmd while path-but-no-odom
+    (odom-timeout branch), non-zero cmd with both (correct sign for an
+    offset-left pose vs. straight x-axis path).
 
 ## Critical Blockers
+
+- [ ] **Set the LIMO to Ackermann steering mode before any wheels-on-floor test.**
+  - Why it matters: the controller does the bicycle-model conversion
+    `omega = v * tan(delta) / L` on the assumption the LIMO is in Ackermann
+    mode. In differential / 4WD mode, `cmd_vel.angular.z` is interpreted
+    as a wheel-speed-difference command and the kinematics no longer match
+    what the controller is solving for.
+  - Where in code the assumption lives: `path_follower_node.py:179`
+    (`omega = v * math.tan(delta_cmd) / self.wheelbase`).
+  - **How to set it (confirmed):** mode is set on the LIMO chassis itself
+    (physical wheel configuration + mode switch on the robot). The
+    `limo_base` driver auto-detects whatever mode the chassis reports
+    over CAN — there is no ROS service or parameter that changes it.
+    Source: `limo_ros2/limo_base/src/limo_driver.cpp:271` reads
+    `motion_mode_ = frame.data[6]` from the CAN status frame; mode
+    constants in `limo_protocol.h` (`MODE_ACKERMANN = 0x01`).
+  - **How to verify at runtime** (after `start_ROS.sh` is up):
+    ```
+    ros2 topic echo /limo_status --once
+    ```
+    Look for `motion_mode: 1`. Anything else (4 = MCNAMU/Mecanum, etc.)
+    means the chassis is not in Ackermann — fix it on the robot before
+    enabling autonomous control.
+  - Add this check to the wheels-on-floor preflight.
+
 
 - [x] Confirm the professor package is fully present and installable.
   - Done. Package vendored at `scalecar-vfg-h-infinite/`. Installable on the
     NUC with the prerequisites captured under "NUC deployment caveats" below.
-- [ ] Standardize the robot workspace path and environment sourcing.
-  - Answer is `~/agilex_ws`. Still need to fix `env_sanitizer.sh`,
-    `start_ROS.sh`, and any other callers.
+- [x] Standardize the robot workspace path and environment sourcing.
+  - Answer is `~/agilex_ws`. `env_sanitizer.sh` and `start_ROS.sh` are
+    already correct. Remaining stale references are doc-only in
+    `DOC/project_spec.md` (user-owned).
 - [ ] Freeze the runtime interface before larger edits.
   - Decide: odometry topic (answered: `/wheel/odom`), reference input type
     (still open), diagnostic topics (still open), whether steering telemetry
@@ -51,15 +89,28 @@ After that, the first substantive task is:
   - `/odom` -> `/wheel/odom`
   - `/cmd_vel` -> `cmd_vel_raw`
   - Robot remains the plant; no sim physics ported into ROS.
+  - 2026-04-28: verified live against the real robot. `path_follower_node`
+    subscribes to `/wheel/odom` from `limo_base_node` (49.9 Hz),
+    publishes to `/cmd_vel_raw`. Zero command without path; non-zero
+    command with path + real odom. `/limo_status.motion_mode = 1`
+    (Ackermann). `estop_cli.py` was intentionally absent so no command
+    reached the wheels.
+  - 2026-04-28: full H-inf pipeline run end-to-end with wheels OFF the
+    ground. estop_cli bypassed via runtime remap
+    (`--ros-args --remap cmd_vel_raw:=/cmd_vel`); no code change.
+    Real odom -> LPV-Hinf -> /cmd_vel -> limo_base_node. Commands
+    saturated at `omega = v*tan(delta_max)/L = 2.73 rad/s` because the
+    hardcoded test path (0,0)->(4,0) didn't match the robot's actual
+    odom pose (x=0.27, y=-2.08, yaw=-0.72). Numbers are physically
+    correct for that geometry; controller is responding to real
+    odometry, math checks out.
 - [x] Keep the safety path in the loop for every autonomous test.
   - Topic wiring verified: `cmd_vel_raw` -> `estop_cli.py` -> `/cmd_vel`.
   - Full chain not yet exercised with wheels on the floor.
 
-- [ ] Decide the minimum reference strategy for first bring-up.
-  - Bare minimum smoke test: a temporary simple path is acceptable.
-  - For anything repeatable: replace the hardcoded demo path with a real
-    runtime reference.
-  - Start in: `scalecar-vfg-h-infinite/ros2_bridge/limo_path_follower/path_follower_node.py`.
+- [x] Decide the minimum reference strategy for first bring-up.
+  - Decided: runtime `nav_msgs/msg/Path` on `/reference_path`, latched QoS.
+    Demo `StepCurvaturePath` retained behind `use_demo_path:=true`.
 
 - [ ] Confirm frame consistency between odometry and reference.
   - Why: path following will look broken if frames are mismatched even when
@@ -89,10 +140,16 @@ After that, the first substantive task is:
 
 ## Before Repeatable Experiments
 
-- [ ] Replace the hardcoded demo path with a runtime reference input.
+- [x] Replace the hardcoded demo path with a runtime reference input.
+  (See "first substantive task" above.)
 - [ ] Extend bag recording with controller-specific topics (controller
   status, tracking error, active reference, optional debug command). Start
   in: `Data_Logger.py`.
+- [ ] **Log GNSS data alongside controller runs** (professor's request,
+  for his other project). `GPS-RTK_ROS2_pub_node.py` exists in the repo;
+  confirm what topic it publishes and add it to `Data_Logger.py`'s bag
+  list. Decide whether GNSS is required (block run) or best-effort
+  (warn but continue) for controller experiments.
 - [ ] Decide RTK gating policy for controller experiments. Start in:
   `run_scenarios_from_files.py`.
 - [ ] Extend preflight topic checks for controller runs. Start in:

@@ -183,9 +183,9 @@ The H-infinity controller needs a reference to follow. The spec assumes one of t
 
 If the professor-supplied controller expects a different interface, an adapter layer shall be used rather than rewriting the existing safety pipeline.
 
-### 9.3 Evaluation Topic Extensions
+### 9.3 Minimum Evaluation Data Streams
 
-The current logger is GNSS-oriented. Controller evaluation requires additional topics to be recorded.
+The current logger topic inventory does not by itself define the project dataset. The minimum evaluation dataset shall be defined by the data streams needed to reconstruct the commanded reference, the realized control path, the safety state, the RTK-backed evaluation intervals, and the association between each ROS run and the external Ohcoach-cell dataset.
 
 ### 9.4 GNSS Dataset Preservation
 
@@ -366,41 +366,47 @@ In addition to controller metrics, each run should preserve the GNSS-analysis va
 
 ## 15. Logging Requirements
 
-The rosbag recorder should preserve the current GNSS topics and add controller-evaluation topics.
+The recording plan shall be minimal but sufficient to reconstruct the commanded experiment, the realized control path, the safety state, and the RTK-backed evaluation intervals. The minimum required dataset is therefore defined by analysis need, not by the current `Data_Logger.py` topic inventory.
 
-### 15.1 Minimum Required ROS Topics
+### 15.1 Minimum Required Runtime Data Streams
 
-- `/cmd_vel`
-- `/cmd_vel_raw`
+- controller reference stream, or an immutable reference file linked to the run metadata
 - `/wheel/odom`
-- `/imu`
+- `/cmd_vel_raw`
+- `/cmd_vel`
 - `/estop`
-- `/scenario_runner/event`
-- `/scenario_runner/status`
+- `/scenario_runner/event`, or one equivalent run-event stream
 - `/gps_rtk_f9p_helical/gps/fix`
-- `/gps_rtk_f9p_helical/gps/nmea`
 - `/gps_rtk_f9p_helical/gps/rtk_status`
-- `/pixhawk/global_position/raw/fix`
-- `/pixhawk/global_position/raw/satellites`
-- `/pixhawk/gpsstatus/gps1/raw`
-- controller reference topic
-- controller status topic
-- controller error topic or equivalent diagnostics
+- run ID
+- scenario identity or reference-file identity
+- UTC start and stop times
+- run outcome and abort reason
+- controller type and parameter snapshot for the run
+
+Notes:
+
+- `/scenario_runner/status` is useful but not required if the event stream already records run lifecycle transitions.
+- `/imu`, NMEA, satellite-count, and Pixhawk raw-GPS topics are not part of the minimum dataset unless a separate GNSS-diagnostics objective is added.
+- A plain-GPS fix topic may be added if the study explicitly compares GPS and GPS-RTK behavior within the same run.
 
 ### 15.2 External NTRIP-Associated Dataset
 
 In this project, "NTRIP data" refers to data collected by the independently operating Ohcoach-cell hardware that receives RTK correction data from an NTRIP service via hotspot.
 
 - No new ROS2 code-level interaction is assumed for this hardware.
-- The dataset should be associated with each experiment run by time, run ID, or operator log.
+- The external dataset should be associated with each experiment run by time, run ID, or operator log.
+- The recorded dataset shall include enough time-alignment metadata to link the ROS run to the external Ohcoach-cell data.
 - If reliable synchronization metadata is not available, this limitation must be documented in the analysis.
 
-### 15.3 Recommended Additional ROS Topics
+### 15.3 Optional Additional Data Streams
 
 - `/data_logger/recording`
 - `/data_logger/health`
+- `/scenario_runner/status`
 - steering-angle or Ackermann telemetry if available at runtime
 - any fused pose topic used for offline evaluation
+- plain-GPS diagnostic topics if GPS-versus-RTK comparison is part of the experiment objective
 
 ### 15.4 Semi-Ground-Truth Policy
 
@@ -414,9 +420,9 @@ A run should not be treated as valid for analysis unless:
 
 - the bag starts before motion begins
 - the bag ends after motion finishes or aborts
-- all required evaluation topics are present
-- all required GNSS topics for the run objective are present
+- all minimum required runtime data streams are present
 - message flow is continuous enough for analysis
+- RTK quality intervals are identifiable from the recorded data
 - the reason for abort, if any, is recorded
 
 ## 16. Scenario Specification Requirement
@@ -465,7 +471,7 @@ The project is considered successfully implemented when all of the following are
 
 ### 18.3 Data Acceptance
 
-- Rosbags contain all required motion, controller, event, and GNSS topics.
+- The recorded dataset contains all required control-path, event, GNSS, and run-metadata streams.
 - Runs can be replayed offline for metric extraction.
 - Scenario identity and run outcome are traceable from recorded data.
 - External Ohcoach-cell NTRIP-related data can be associated with the run, or the absence of such association is explicitly documented.
@@ -508,7 +514,7 @@ The project is considered successfully implemented when all of the following are
 1. Confirm the professor-provided controller runtime interface.
 2. Standardize the robot workspace path and environment sourcing.
 3. Create the controller wrapper node if message types or topic names do not match the canonical contract.
-4. Extend the recorder topic list only where controller-specific topics are still missing.
+4. Define the minimum recording set and add only the required missing streams.
 5. Define a run-identification or time-synchronization procedure for the external Ohcoach-cell NTRIP-related dataset.
 6. Define one low-speed reference path and complete an end-to-end trial.
 
@@ -624,8 +630,7 @@ Purpose:
 
 Required work:
 
-- extend `Data_Logger.py` topic coverage for controller diagnostics
-- ensure scenario status and event topics remain recorded
+- ensure the minimum recording set covers the reference, realized control path, safety state, run events, RTK fix, RTK status, and run-to-external-dataset association data
 - decide when RTK gating is required and when it should be disabled
 - define how external Ohcoach-cell data is associated with each run
 
@@ -706,7 +711,7 @@ This workflow should be considered successful when:
 8. Measure or confirm the real LIMO wheelbase, steering limit, and safe low-speed test envelope.
 9. Check whether steering-angle telemetry exists; if not, document that steering feedback is being approximated.
 10. Set an initial conservative `dt_ctrl`, `delta_max`, `output_gain`, `K_ff`, and `rho_scale` configuration for hardware tests.
-11. Extend `Data_Logger.py` to record controller status, tracking error, reference, and debug-command topics.
+11. Implement the minimum recording set: reference stream or immutable reference file, `/wheel/odom`, `/cmd_vel_raw`, `/cmd_vel`, `/estop`, one run-event stream, `/gps_rtk_f9p_helical/gps/fix`, `/gps_rtk_f9p_helical/gps/rtk_status`, and run-ID or time-alignment metadata for the external Ohcoach-cell dataset.
 12. Decide when RTK gating is required for controller experiments and when it should be disabled.
 13. Define a run-ID or timestamp procedure to associate each ROS run with the external Ohcoach-cell dataset.
 14. Execute a static safety validation before any motion tests.

@@ -1,3 +1,4 @@
 .DS_Store
 .specstory
-.vscode.tmp/
+.vscode
+.tmp/

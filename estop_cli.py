@@ -17,6 +17,7 @@ Keys (in the terminal where this script runs):
   q or Ctrl+C: Quit (leaves E-stop ACTIVE as a conservative default)
 """
 
+import os
 import sys
 import select
 import termios
@@ -36,21 +37,22 @@ from std_msgs.msg import Bool # pyright: ignore[reportMissingImports]
 
 
 class EstopCliNode(Node):
-    def __init__(self, debug=False):
+    def __init__(self, debug=False, ping_hosts=None, ping_enabled=True):
         super().__init__("limo_estop_cli")
 
         self.debug = debug
         self.estop_active = False
-        self.ping_targets = ["10.42.0.175"]
+        self.ping_enabled = ping_enabled
+        self.ping_targets = list(ping_hosts) if ping_hosts else ["macbook-air-m1"]
         # Track last known connectivity per host so we only log on state changes
         self.connectivity_status = {host: True for host in self.ping_targets}
         self.failure_counts = {host: 0 for host in self.ping_targets}
         self.total_misses = {host: 0 for host in self.ping_targets}
-        
+
         # SENSITIVITY SETTINGS
         self.ping_interval  = 0.5  # seconds
-        self.ping_timeout   = 1.0   # seconds
-        self.ping_threshold = 5    # consecutive failures before tripping
+        self.ping_timeout   = 3.0   # seconds
+        self.ping_threshold = 10    # consecutive failures before tripping
 
         # Setup debug recording if enabled
         self.debug_file = None
@@ -69,19 +71,30 @@ class EstopCliNode(Node):
         self.cmd_vel_raw_sub = self.create_subscription(
             Twist, "cmd_vel_raw", self.cmd_vel_raw_callback, 10
         )
+        # Remote E-stop trigger: True -> activate (latched), False -> clear.
+        # Used by the battle-station HTML over rosbridge.
+        self.estop_trigger_sub = self.create_subscription(
+            Bool, "/estop_trigger", self.estop_trigger_callback, 10
+        )
 
         # Create background thread for periodic ping checks
-        self.ping_thread = threading.Thread(target=self._ping_loop, daemon=True)
-        self.ping_thread.start()
+        if self.ping_enabled:
+            self.ping_thread = threading.Thread(target=self._ping_loop, daemon=True)
+            self.ping_thread.start()
+        else:
+            self.ping_thread = None
 
         self.get_logger().info(
             "LIMO E-stop CLI initialized. "
             "Keys: [s/SPACE]=STOP, [c]=CLEAR, [q/Ctrl+C]=quit."
         )
-        self.get_logger().info(
-            f"Ping monitoring: {', '.join(self.ping_targets)} "
-            f"(interval: {self.ping_interval}s)"
-        )
+        if self.ping_enabled:
+            self.get_logger().info(
+                f"Ping monitoring: {', '.join(self.ping_targets)} "
+                f"(interval: {self.ping_interval}s)"
+            )
+        else:
+            self.get_logger().info("Ping monitoring DISABLED (--no-ping)")
 
     # ---- ROS helpers ----
 
@@ -92,6 +105,16 @@ class EstopCliNode(Node):
 
     def publish_zero_cmd(self):
         self.cmd_vel_pub.publish(Twist())
+
+    def estop_trigger_callback(self, msg: Bool):
+        if msg.data:
+            print("\r")
+            self.get_logger().warn("E-STOP requested via /estop_trigger (remote)")
+            self.activate_estop()
+        else:
+            print("\r")
+            self.get_logger().info("E-STOP clear requested via /estop_trigger (remote)")
+            self.clear_estop()
 
     def cmd_vel_raw_callback(self, msg: Twist):
         """Filter raw velocity commands based on current E-stop state."""
@@ -211,7 +234,13 @@ def print_status_line(node):
     # ANSI escape: \033[K clears the line from cursor to end
     # \r moves to start of line
     state_str = "\033[1;31m!!! E-STOP ACTIVE !!!\033[0m" if node.estop_active else "\033[1;32m[ OK: Motion Allowed ]\033[0m"
-    
+
+    if not node.ping_enabled:
+        status = f"\r[STATUS] {state_str} | Pings: \033[33mDISABLED\033[0m \033[K"
+        sys.stdout.write(status)
+        sys.stdout.flush()
+        return
+
     ping_parts = []
     for host in node.ping_targets:
         ok = node.connectivity_status[host]
@@ -219,16 +248,16 @@ def print_status_line(node):
         total = node.total_misses[host]
         color = "\033[32m" if ok else "\033[31m"
         status_text = "OK" if ok else "FAIL"
-        
+
         # Show misses if any (e.g. "FAIL (2/3 misses)")
         miss_text = f" ({count}/{node.ping_threshold} misses)" if count > 0 else ""
-        
+
         # In debug mode, show total misses as well
         if node.debug:
             miss_text += f" [Total: {total}]"
-            
+
         ping_parts.append(f"{host}: {color}{status_text}{miss_text}\033[0m")
-    
+
     status = f"\r[STATUS] {state_str} | Pings: {' | '.join(ping_parts)} \033[K"
     sys.stdout.write(status)
     sys.stdout.flush()
@@ -238,38 +267,65 @@ def main(args=None):
     # Parse custom arguments before ROS init
     parser = argparse.ArgumentParser(description="LIMO E-stop CLI")
     parser.add_argument("--debug", action="store_true", help="Enable debug mode (logging and extra status)")
+    parser.add_argument(
+        "--no-ping",
+        action="store_true",
+        help="Disable connectivity monitor entirely (no auto-trip on link loss).",
+    )
+    parser.add_argument(
+        "--ping-host",
+        action="append",
+        default=None,
+        metavar="HOST",
+        help="Override ping target. Repeatable. Defaults to macbook-air-m1 (Tailscale).",
+    )
     parsed_args, ros_args = parser.parse_known_args(args)
 
     rclpy.init(args=ros_args)
-    node = EstopCliNode(debug=parsed_args.debug)
+    node = EstopCliNode(
+        debug=parsed_args.debug,
+        ping_hosts=parsed_args.ping_host,
+        ping_enabled=not parsed_args.no_ping,
+    )
 
     # Spin ROS2 in a background thread so terminal UI/input doesn't throttle message frequency
     ros_thread = threading.Thread(target=rclpy.spin, args=(node,), daemon=True)
     ros_thread.start()
 
-    settings = save_terminal_settings()
-    # setcbreak is better for CLIs than setraw as it handles some output mapping
-    tty.setcbreak(sys.stdin.fileno())
+    have_tty = sys.stdin.isatty()
 
-    print_help(debug_enabled=parsed_args.debug)
+    settings = None
+    if have_tty:
+        settings = save_terminal_settings()
+        # setcbreak is better for CLIs than setraw as it handles some output mapping
+        tty.setcbreak(sys.stdin.fileno())
+        print_help(debug_enabled=parsed_args.debug)
+    else:
+        node.get_logger().info(
+            "stdin is not a TTY (running under systemd or non-interactive shell). "
+            "Keyboard input disabled; control via /estop_trigger only."
+        )
 
     try:
-        last_ui_update = 0
         while rclpy.ok():
-            # Update status line frequently
-            print_status_line(node)
+            if have_tty:
+                # Update status line frequently
+                print_status_line(node)
 
-            # Check if a key is available
-            rlist, _, _ = select.select([sys.stdin], [], [], 0.05)
-            if rlist:
-                ch = sys.stdin.read(1)
+                # Check if a key is available
+                rlist, _, _ = select.select([sys.stdin], [], [], 0.05)
+                if rlist:
+                    ch = sys.stdin.read(1)
 
-                if ch in ("s", "S", " "):
-                    node.activate_estop()
-                elif ch in ("c", "C"):
-                    node.clear_estop()
-                elif ch in ("q", "Q", "\x03"):  # q or Ctrl+C
-                    break
+                    if ch in ("s", "S", " "):
+                        node.activate_estop()
+                    elif ch in ("c", "C"):
+                        node.clear_estop()
+                    elif ch in ("q", "Q", "\x03"):  # q or Ctrl+C
+                        break
+            else:
+                # No keyboard — just sleep so the spin thread does the work.
+                time.sleep(0.1)
 
     except KeyboardInterrupt:
         pass
@@ -278,14 +334,15 @@ def main(args=None):
         node.estop_active = True
         node.publish_estop_state()
         node.publish_zero_cmd()
-        
-        # Move past the status line and restore terminal
-        print("\r\n\n[Exiting E-STOP CLI] - E-stop remains ACTIVE for safety.\r\n")
-        
+
+        if have_tty:
+            print("\r\n\n[Exiting E-STOP CLI] - E-stop remains ACTIVE for safety.\r\n")
+
         if node.debug_file:
             node.debug_file.close()
-            
-        restore_terminal_settings(settings)
+
+        if settings is not None:
+            restore_terminal_settings(settings)
         node.destroy_node()
         rclpy.shutdown()
 

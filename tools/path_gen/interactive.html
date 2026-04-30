@@ -1,0 +1,979 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>LIMO Battle Station</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+<style>
+  html, body { margin: 0; padding: 0; height: 100vh; width: 100vw; overflow: hidden;
+                font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+  #app { display: flex; flex-direction: row; height: 100vh; width: 100vw; }
+  #map { flex: 1 1 auto; height: 100vh; min-height: 400px; background: #ddd; }
+  #panel {
+    flex: 0 0 380px; width: 380px; height: 100vh;
+    padding: 10px 14px; overflow-y: auto; box-sizing: border-box;
+    background: #1e1e22; color: #e8e8ea; box-shadow: -2px 0 6px rgba(0,0,0,0.3);
+  }
+  #errbar { position: fixed; bottom: 0; left: 0; right: 380px; padding: 6px 10px;
+            background: #602; color: #fff; font: 12px monospace; display: none; z-index: 10000; }
+  h2 { margin: 0 0 6px 0; font-size: 16px; }
+  h3 { margin: 12px 0 4px 0; font-size: 12px; color: #9fd; text-transform: uppercase; letter-spacing: 0.5px;
+       border-bottom: 1px solid #333; padding-bottom: 2px; }
+  label { display: block; font-size: 12px; margin-top: 6px; }
+  input[type="number"], input[type="text"], select {
+    width: 100%; padding: 4px 6px; box-sizing: border-box;
+    background: #2a2a30; color: #e8e8ea; border: 1px solid #444; border-radius: 3px;
+    font-family: monospace;
+  }
+  input[type="range"] { width: 100%; }
+  .row { display: flex; gap: 6px; }
+  .row > * { flex: 1; }
+  button {
+    background: #345; color: #fff; border: 1px solid #567;
+    padding: 6px 10px; border-radius: 3px; cursor: pointer;
+    font-size: 13px;
+  }
+  button:hover { background: #456; }
+  button:disabled { background: #2a2a30; color: #777; cursor: not-allowed; border-color: #333; }
+  button.primary { background: #285; border-color: #4a8; }
+  button.primary:hover { background: #3a6; }
+  button.estop {
+    background: #c11; border-color: #f44; font-size: 22px; font-weight: 800;
+    padding: 14px; width: 100%; letter-spacing: 2px;
+  }
+  button.estop:hover { background: #e22; }
+  button.estop.armed { background: #4a0; border-color: #6f0; }
+  .pill { display: inline-block; padding: 1px 6px; background: #345; border-radius: 8px; font-size: 11px; }
+  .stat { font-family: monospace; font-size: 12px; color: #aaffcc; line-height: 1.5; }
+  .warn { color: #ffaa66; }
+  .err { color: #ff6666; }
+  .ok { color: #88ffaa; }
+  .small { font-size: 11px; color: #888; margin-top: 4px; }
+  .dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 4px;
+         vertical-align: middle; background: #555; }
+  .dot.ok { background: #4f6; box-shadow: 0 0 6px #4f6; }
+  .dot.bad { background: #f44; box-shadow: 0 0 6px #f44; }
+  .dot.warn { background: #fa3; }
+  textarea { width: 100%; height: 80px; box-sizing: border-box;
+             background: #2a2a30; color: #e8e8ea; border: 1px solid #444;
+             font-family: monospace; font-size: 11px; }
+  .progress { width: 100%; height: 14px; background: #222; border: 1px solid #444; border-radius: 3px; overflow: hidden; }
+  .progress > div { height: 100%; background: linear-gradient(90deg, #4a8, #8d6); transition: width 0.2s; }
+  details { margin-top: 6px; }
+  summary { cursor: pointer; font-size: 12px; color: #9fd; }
+</style>
+</head>
+<body>
+<div id="errbar"></div>
+<div id="app">
+  <div id="map"></div>
+  <div id="panel">
+    <h2>LIMO Battle Station</h2>
+
+    <button id="estop-btn" class="estop">E-STOP</button>
+    <div class="small" id="estop-state">state: unknown (not connected)</div>
+
+    <h3>Connection</h3>
+    <label>rosbridge ws URL
+      <input type="text" id="ws-url" value="ws://agilex-nuc12wski7:9090">
+    </label>
+    <div class="row" style="margin-top:6px;">
+      <button id="btn-connect" class="primary">Connect</button>
+      <button id="btn-disconnect" disabled>Disconnect</button>
+    </div>
+    <div class="stat" style="margin-top:6px;">
+      <span class="dot" id="conn-dot"></span><span id="conn-state">disconnected</span><br>
+      <span class="dot" id="odom-dot"></span>odom: <span id="odom-rate">--</span><br>
+      <span class="dot" id="status-dot"></span>follower: <span id="status-rate">--</span>
+    </div>
+
+    <h3>Stack</h3>
+    <div class="stat" id="stack-panel">(connect first)</div>
+
+    <h3>Run control</h3>
+    <div class="row">
+      <button id="btn-push" class="primary">Push &amp; Run</button>
+      <button id="btn-pause">Pause</button>
+      <button id="btn-resume">Resume</button>
+    </div>
+    <div class="row" style="margin-top:6px;">
+      <button id="btn-stop">Stop scenario</button>
+      <button id="btn-recenter">Recenter map on robot</button>
+    </div>
+    <div class="small" id="push-state">no path pushed</div>
+
+    <label style="margin-top:10px;">target speed (m/s)
+      <span class="pill" id="vspeed-val">0.30</span>
+      <input type="range" id="vspeed" min="0.0" max="2.0" step="0.05" value="0.30">
+    </label>
+    <div class="small" id="vspeed-state">(set after connect)</div>
+
+    <h3>Telemetry</h3>
+    <div class="stat" id="telemetry">(waiting for /path_follower/status)</div>
+    <div class="progress" style="margin-top:6px;"><div id="prog-bar" style="width:0%"></div></div>
+
+    <details>
+      <summary>Anchor &amp; track geometry</summary>
+      <label>lat <input type="number" id="lat" step="0.000001" value="37.61174497"></label>
+      <label>lon <input type="number" id="lon" step="0.000001" value="126.99429177"></label>
+      <label>bearing (deg E of N) <span class="pill" id="bearing_val">42.0</span>
+        <input type="range" id="bearing" min="0" max="360" step="0.5" value="42">
+      </label>
+      <label>track long (m) <input type="number" id="L_long" step="0.1" value="42"></label>
+      <label>track short (m) <input type="number" id="L_short" step="0.1" value="10"></label>
+    </details>
+
+    <h3>Path family</h3>
+    <select id="family">
+      <option value="indoor_s" selected>indoor S-curve (3x1.2 m)</option>
+      <option value="indoor_loop">indoor straight (2 m)</option>
+      <option value="oval">oval (rooftop lap)</option>
+      <option value="line">line</option>
+      <option value="slalom">slalom</option>
+      <option value="sinusoid">sinusoid</option>
+      <option value="step">step curvature</option>
+    </select>
+    <div id="params"></div>
+
+    <h3>Stats</h3>
+    <div class="stat" id="stats"></div>
+
+    <h3>Export</h3>
+    <div class="row">
+      <button id="btn-geojson">GeoJSON</button>
+      <button id="btn-rospath">ROS JSON</button>
+      <button id="btn-copy">Copy x,y</button>
+    </div>
+    <textarea id="export_text" placeholder="exported text appears here" readonly></textarea>
+
+    <h3>Basemap</h3>
+    <select id="basemap">
+      <option value="osm" selected>OpenStreetMap</option>
+      <option value="google">Google Satellite</option>
+      <option value="google_hybrid">Google Hybrid</option>
+      <option value="esri">Esri World Imagery</option>
+    </select>
+
+    <div class="small" style="margin-top: 12px;">
+      Local frame: origin at right-bottom, +x along long axis (bearing), +y left of +x.<br>
+      Controller envelope: R_min &gt; 0.5 m, |kappa|*v &le; 5, open path.
+    </div>
+  </div>
+</div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/roslib@1.4.1/build/roslib.min.js"></script>
+<script>
+// Fallback CDNs if jsdelivr fails (older roslibjs is on robotwebtools, sometimes flaky).
+if (typeof ROSLIB === 'undefined') {
+  document.write('<script src="https://unpkg.com/roslib@1.4.1/build/roslib.min.js"><\/script>');
+}
+</script>
+<script>
+if (typeof ROSLIB === 'undefined') {
+  document.write('<script src="https://static.robotwebtools.org/roslibjs/current/roslib.min.js"><\/script>');
+}
+</script>
+<script>
+window.addEventListener('error', (e) => {
+  const bar = document.getElementById('errbar');
+  bar.style.display = 'block';
+  bar.textContent = 'JS error: ' + e.message + ' @ ' + (e.filename || '') + ':' + (e.lineno || '');
+});
+if (typeof L === 'undefined') {
+  document.getElementById('errbar').style.display = 'block';
+  document.getElementById('errbar').textContent = 'Leaflet failed to load (check internet/CDN).';
+}
+if (typeof ROSLIB === 'undefined') {
+  const bar = document.getElementById('errbar');
+  bar.style.display = 'block';
+  bar.textContent = 'roslibjs failed to load from all CDNs (jsdelivr, unpkg, robotwebtools). Check internet/firewall.';
+}
+const EARTH_R = 6378137.0;
+
+// ---------------- Path families ----------------
+const PARAM_DEFS = {
+  indoor_s: [
+    { name: 'L',   label: 'length (m)',     def: 3.0, min: 1.0, max: 6.0, step: 0.1 },
+    { name: 'A',   label: 'lateral amp (m)',def: 0.4, min: 0.0, max: 1.5, step: 0.05 },
+    { name: 'y0',  label: 'y center (m)',   def: 0.6, min: 0.0, max: 5.0, step: 0.1 },
+    { name: 'x0',  label: 'start x (m)',    def: 0.5, min: 0.0, max: 5.0, step: 0.1 },
+    { name: 'n',   label: '# samples',      def: 80,  min: 20,  max: 300, step: 5  },
+  ],
+  indoor_loop: [
+    { name: 'L',  label: 'length (m)',  def: 2.0, min: 0.5, max: 4.0, step: 0.1 },
+    { name: 'y',  label: 'y (m)',       def: 0.6, min: 0.0, max: 5.0, step: 0.1 },
+    { name: 'x0', label: 'start x (m)', def: 0.5, min: 0.0, max: 4.0, step: 0.1 },
+  ],
+  oval: [
+    { name: 'R',        label: 'arc radius (m)',           def: 3.0,  min: 0.5, max: 5.0,  step: 0.1 },
+    { name: 'margin',   label: 'edge margin (m)',          def: 1.0,  min: 0.0, max: 4.0,  step: 0.1 },
+    { name: 'overshoot',label: 'end overshoot (m)',        def: 1.0,  min: 0.0, max: 5.0,  step: 0.1 },
+    { name: 'n_arc',    label: 'pts per half-arc',         def: 24,   min: 6,   max: 60,   step: 1   },
+  ],
+  line: [
+    { name: 'L',  label: 'length (m)', def: 30.0, min: 1.0, max: 50.0, step: 0.5 },
+    { name: 'y',  label: 'lateral y (m)', def: 5.0, min: 0.0, max: 10.0, step: 0.1 },
+    { name: 'x0', label: 'start x (m)', def: 1.0, min: 0.0, max: 40.0, step: 0.5 },
+  ],
+  slalom: [
+    { name: 'R',        label: 'arc radius (m)',  def: 1.5,  min: 0.5, max: 4.0,  step: 0.1 },
+    { name: 'n_arcs',   label: '# arcs',          def: 4,    min: 1,   max: 12,   step: 1   },
+    { name: 'L1',       label: 'lead-in (m)',     def: 4.0,  min: 0.0, max: 20.0, step: 0.5 },
+    { name: 'L_mid',    label: 'between (m)',     def: 2.0,  min: 0.0, max: 10.0, step: 0.5 },
+    { name: 'L_end',    label: 'lead-out (m)',    def: 4.0,  min: 0.0, max: 20.0, step: 0.5 },
+    { name: 'y',        label: 'centerline y (m)',def: 5.0,  min: 0.0, max: 10.0, step: 0.1 },
+    { name: 'n_per_arc',label: 'pts per arc',     def: 16,   min: 6,   max: 60,   step: 1   },
+  ],
+  sinusoid: [
+    { name: 'L',       label: 'length (m)',  def: 30.0, min: 5.0, max: 50.0, step: 0.5 },
+    { name: 'A',       label: 'amplitude (m)',def: 1.5,  min: 0.0, max: 4.0,  step: 0.1 },
+    { name: 'n_waves', label: '# waves',     def: 2.0,  min: 0.5, max: 6.0,  step: 0.1 },
+    { name: 'y0',      label: 'y center (m)',def: 5.0,  min: 0.0, max: 10.0, step: 0.1 },
+    { name: 'x0',      label: 'start x (m)', def: 1.0,  min: 0.0, max: 40.0, step: 0.5 },
+    { name: 'n',       label: '# samples',   def: 200,  min: 20,  max: 800,  step: 10  },
+  ],
+  step: [
+    { name: 'L1',         label: 'pre-straight (m)',  def: 8.0,  min: 0.0, max: 30.0, step: 0.5 },
+    { name: 'R',          label: 'arc radius (m)',    def: 2.0,  min: 0.5, max: 5.0,  step: 0.1 },
+    { name: 'theta_deg',  label: 'arc angle (deg)',   def: 90.0, min: 5.0, max: 180.0,step: 1.0 },
+    { name: 'L2',         label: 'post-straight (m)', def: 10.0, min: 0.0, max: 40.0, step: 0.5 },
+    { name: 'y',          label: 'start y (m)',       def: 1.5,  min: 0.0, max: 10.0, step: 0.1 },
+    { name: 'direction',  label: 'turn dir (1/-1)',   def: 1,    min: -1,  max: 1,    step: 2   },
+    { name: 'n_arc',      label: 'pts on arc',        def: 24,   min: 6,   max: 60,   step: 1   },
+  ],
+};
+
+function genPath(family, p, L_long, L_short) {
+  switch (family) {
+    case 'indoor_s':    return pathIndoorS(p);
+    case 'indoor_loop': return pathIndoorLoop(p);
+    case 'oval':        return pathOval(p, L_long, L_short);
+    case 'line':        return pathLine(p);
+    case 'slalom':      return pathSlalom(p);
+    case 'sinusoid':    return pathSinusoid(p);
+    case 'step':        return pathStep(p);
+  }
+  return [];
+}
+
+// One full sine period across L. With L=3, A=0.4 -> R_min ~= L^2 / (4*pi^2*A) ~= 0.57 m.
+function pathIndoorS(p) {
+  const N = Math.max(2, Math.round(p.n));
+  const pts = [];
+  for (let i = 0; i < N; i++) {
+    const x = p.x0 + p.L * (i/(N-1));
+    const y = p.y0 + p.A * Math.sin(2*Math.PI*(x - p.x0)/p.L);
+    pts.push([x, y]);
+  }
+  return pts;
+}
+
+function pathIndoorLoop(p) {
+  return [[p.x0, p.y], [p.x0 + p.L, p.y]];
+}
+
+function pathOval(p, L_long, L_short) {
+  let R = p.R, m = p.margin;
+  let long_in = L_long - 2*m, short_in = L_short - 2*m;
+  if (R > short_in/2) R = short_in/2;
+  let L_str = long_in - 2*R;
+  if (L_str < 0) return [];
+  const cx_lo = m + R, cx_hi = m + R + L_str;
+  const cy_low = m + R, cy_high = L_short - m - R;
+  const cy_mid = (cy_high + cy_low) / 2;
+  const arc_r = (cy_high - cy_low) / 2;
+  const N = Math.max(6, Math.round(p.n_arc));
+
+  const pts = [[cx_lo, cy_low], [cx_hi, cy_low]];
+  for (let i = 1; i < N; i++) {
+    const t = -Math.PI/2 + Math.PI * (i/(N-1));
+    pts.push([cx_hi + arc_r*Math.cos(t), cy_mid + arc_r*Math.sin(t)]);
+  }
+  pts.push([cx_lo, cy_high]);
+  for (let i = 1; i < N; i++) {
+    const t = Math.PI/2 + Math.PI * (i/(N-1));
+    pts.push([cx_lo + arc_r*Math.cos(t), cy_mid + arc_r*Math.sin(t)]);
+  }
+  pts.push([cx_lo + p.overshoot, cy_low]);
+  return pts;
+}
+
+function pathLine(p) {
+  return [[p.x0, p.y], [p.x0 + p.L, p.y]];
+}
+
+function pathSlalom(p) {
+  const pts = [[1.0, p.y]];
+  let x = 1.0 + p.L1;
+  pts.push([x, p.y]);
+  let sign = +1;
+  const N = Math.max(4, Math.round(p.n_per_arc));
+  for (let k = 0; k < p.n_arcs; k++) {
+    const cx = x;
+    const cy = p.y + sign * p.R;
+    const t0 = sign > 0 ? -Math.PI/2 : Math.PI/2;
+    const t1 = sign > 0 ?  Math.PI/2 : 3*Math.PI/2;
+    for (let i = 1; i < N; i++) {
+      const t = t0 + (t1 - t0) * (i/(N-1));
+      pts.push([cx + p.R*Math.cos(t), cy + p.R*Math.sin(t)]);
+    }
+    x = pts[pts.length-1][0];
+    sign *= -1;
+    if (k < p.n_arcs - 1) { x += p.L_mid; pts.push([x, p.y]); }
+  }
+  pts.push([x + p.L_end, p.y]);
+  return pts;
+}
+
+function pathSinusoid(p) {
+  const N = Math.max(2, Math.round(p.n));
+  const pts = [];
+  for (let i = 0; i < N; i++) {
+    const x = p.x0 + p.L * (i/(N-1));
+    const y = p.y0 + p.A * Math.sin(2*Math.PI*p.n_waves*(x - p.x0)/p.L);
+    pts.push([x, y]);
+  }
+  return pts;
+}
+
+function pathStep(p) {
+  const theta = p.theta_deg * Math.PI/180;
+  const dir = p.direction >= 0 ? 1 : -1;
+  const pts = [[1.0, p.y], [1.0 + p.L1, p.y]];
+  const cx = 1.0 + p.L1, cy = p.y + dir*p.R;
+  const t0 = dir > 0 ? -Math.PI/2 : Math.PI/2;
+  const t1 = t0 + dir*theta;
+  const N = Math.max(4, Math.round(p.n_arc));
+  for (let i = 1; i < N; i++) {
+    const t = t0 + (t1 - t0) * (i/(N-1));
+    pts.push([cx + p.R*Math.cos(t), cy + p.R*Math.sin(t)]);
+  }
+  const psi_end = dir*theta;
+  const last = pts[pts.length-1];
+  pts.push([last[0] + p.L2*Math.cos(psi_end), last[1] + p.L2*Math.sin(psi_end)]);
+  return pts;
+}
+
+// ---------------- Curvature analysis (3-pt circle) ----------------
+function analyze(pts) {
+  if (pts.length < 2) return { length: 0, kmax: 0, rmin: Infinity };
+  let total = 0;
+  for (let i = 1; i < pts.length; i++) {
+    const dx = pts[i][0] - pts[i-1][0], dy = pts[i][1] - pts[i-1][1];
+    total += Math.hypot(dx, dy);
+  }
+  let kmax = 0;
+  for (let i = 1; i < pts.length-1; i++) {
+    const a = pts[i-1], b = pts[i], c = pts[i+1];
+    const ab = Math.hypot(b[0]-a[0], b[1]-a[1]);
+    const bc = Math.hypot(c[0]-b[0], c[1]-b[1]);
+    const ca = Math.hypot(a[0]-c[0], a[1]-c[1]);
+    const cross = Math.abs((b[0]-a[0])*(c[1]-a[1]) - (b[1]-a[1])*(c[0]-a[0]));
+    const denom = ab*bc*ca;
+    if (denom > 1e-9) {
+      const k = 2*cross/denom;
+      if (k > kmax) kmax = k;
+    }
+  }
+  return { length: total, kmax, rmin: kmax > 0 ? 1/kmax : Infinity };
+}
+
+// ---------------- Local <-> Lat/Lon ----------------
+function localToLatLon(xy, lat0, lon0, bearingDeg) {
+  const b = bearingDeg * Math.PI/180;
+  const east  = xy[0]*Math.sin(b) + xy[1]*(-Math.cos(b));
+  const north = xy[0]*Math.cos(b) + xy[1]*( Math.sin(b));
+  const dlat = (north / EARTH_R) * (180/Math.PI);
+  const dlon = (east  / (EARTH_R * Math.cos(lat0*Math.PI/180))) * (180/Math.PI);
+  return [lat0 + dlat, lon0 + dlon];
+}
+
+// ---------------- UI ----------------
+const $ = (id) => document.getElementById(id);
+const paramsDiv = $('params');
+let currentParams = {};
+
+function buildParamUI(family) {
+  paramsDiv.innerHTML = '';
+  currentParams = {};
+  const defs = PARAM_DEFS[family];
+  defs.forEach(d => {
+    currentParams[d.name] = d.def;
+    const lbl = document.createElement('label');
+    lbl.innerHTML = `${d.label} <span class="pill" id="pv_${d.name}">${d.def}</span>`;
+    const inp = document.createElement('input');
+    inp.type = 'range'; inp.min = d.min; inp.max = d.max;
+    inp.step = d.step; inp.value = d.def; inp.id = `p_${d.name}`;
+    inp.oninput = () => {
+      currentParams[d.name] = parseFloat(inp.value);
+      $(`pv_${d.name}`).textContent = inp.value;
+      redraw();
+    };
+    lbl.appendChild(inp);
+    paramsDiv.appendChild(lbl);
+  });
+}
+
+// ---------------- Map ----------------
+// Leaflet upscales tiles past maxNativeZoom so we can keep zooming for fine path tweaks.
+const MAP_MAX_ZOOM = 26;
+const tileLayers = {
+  google: L.tileLayer('https://mt0.google.com/vt/lyrs=s&hl=en&x={x}&y={y}&z={z}', {
+    maxNativeZoom: 21, maxZoom: MAP_MAX_ZOOM, attribution: 'Google'
+  }),
+  google_hybrid: L.tileLayer('https://mt0.google.com/vt/lyrs=y&hl=en&x={x}&y={y}&z={z}', {
+    maxNativeZoom: 21, maxZoom: MAP_MAX_ZOOM, attribution: 'Google'
+  }),
+  esri: L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', {
+    maxNativeZoom: 19, maxZoom: MAP_MAX_ZOOM, attribution: 'Esri'
+  }),
+  osm: L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    maxNativeZoom: 19, maxZoom: MAP_MAX_ZOOM, attribution: 'OpenStreetMap contributors'
+  }),
+};
+
+const map = L.map('map', { zoomControl: true, preferCanvas: false, maxZoom: MAP_MAX_ZOOM })
+              .setView([37.61190, 126.99437], 19);
+let activeBase = tileLayers.osm.addTo(map);
+setTimeout(() => map.invalidateSize(true), 50);
+setTimeout(() => map.invalidateSize(true), 300);
+window.addEventListener('resize', () => map.invalidateSize(true));
+
+$('basemap').onchange = (e) => {
+  map.removeLayer(activeBase);
+  activeBase = tileLayers[e.target.value].addTo(map);
+};
+
+let pathLayer = null, trackPoly = null, anchorMarker = null, oppMarker = null;
+let startMarker = null, endMarker = null, robotMarker = null, robotHeadingLine = null;
+
+function redraw() {
+  const lat0 = parseFloat($('lat').value);
+  const lon0 = parseFloat($('lon').value);
+  const bearing = parseFloat($('bearing').value);
+  const Llong = parseFloat($('L_long').value);
+  const Lshort = parseFloat($('L_short').value);
+  $('bearing_val').textContent = bearing.toFixed(1);
+
+  const family = $('family').value;
+  const pts = genPath(family, currentParams, Llong, Lshort);
+  const trackCorners = [[0,0],[Llong,0],[Llong,Lshort],[0,Lshort],[0,0]];
+
+  const pathLL = pts.map(p => localToLatLon(p, lat0, lon0, bearing));
+  const trackLL = trackCorners.map(p => localToLatLon(p, lat0, lon0, bearing));
+
+  if (pathLayer) map.removeLayer(pathLayer);
+  if (trackPoly) map.removeLayer(trackPoly);
+  trackPoly = L.polygon(trackLL, { color: 'yellow', weight: 2, fill: false, dashArray: '4 4' }).addTo(map);
+  pathLayer = L.polyline(pathLL, { color: 'red', weight: 3 }).addTo(map);
+
+  if (pts.length > 0) {
+    const startLL = pathLL[0], endLL = pathLL[pathLL.length-1];
+    if (!startMarker) {
+      startMarker = L.circleMarker(startLL, { radius: 7, color: 'black', fillColor: 'lime', fillOpacity: 1 }).addTo(map);
+      endMarker   = L.circleMarker(endLL,   { radius: 7, color: 'black', fillColor: 'red',  fillOpacity: 1 }).addTo(map);
+    } else {
+      startMarker.setLatLng(startLL);
+      endMarker.setLatLng(endLL);
+    }
+  }
+
+  // Stats
+  const a = analyze(pts);
+  const v_assume = 1.0;
+  const rho_max = a.kmax * v_assume;
+  let warn = '';
+  if (a.rmin < 0.5) warn += `<span class="err">R_min=${a.rmin.toFixed(2)} m &lt; 0.5 m mech limit</span><br>`;
+  else if (a.rmin < 0.8) warn += `<span class="warn">R_min=${a.rmin.toFixed(2)} m close to limit</span><br>`;
+  if (rho_max > 5) warn += `<span class="err">rho_max=${rho_max.toFixed(2)} &gt; 5 (LPV out of design)</span><br>`;
+
+  $('stats').innerHTML =
+    `family: ${family}<br>` +
+    `waypoints: ${pts.length}<br>` +
+    `length: ${a.length.toFixed(2)} m<br>` +
+    `R_min: ${a.rmin === Infinity ? '&infin;' : a.rmin.toFixed(2)} m<br>` +
+    `|kappa|_max: ${a.kmax.toFixed(3)} 1/m<br>` +
+    `rho_max @v=1: ${rho_max.toFixed(2)}<br>` +
+    warn;
+
+  const oppLL = localToLatLon([Llong, Lshort], lat0, lon0, bearing);
+  if (!anchorMarker) {
+    // Small draggable hollow ring at the anchor; doesn't obstruct path lines.
+    anchorMarker = L.circleMarker([lat0, lon0], {
+      radius: 6, color: '#0f0', weight: 2, fillOpacity: 0,
+      draggable: true, interactive: true, pane: 'markerPane',
+      title: 'right-bottom anchor (drag)'
+    }).addTo(map);
+    // circleMarker doesn't support draggable directly — emulate with mousedown→map move.
+    anchorMarker.on('mousedown', () => {
+      map.dragging.disable();
+      const move = (e) => {
+        anchorMarker.setLatLng(e.latlng);
+        $('lat').value = e.latlng.lat.toFixed(8);
+        $('lon').value = e.latlng.lng.toFixed(8);
+        redraw();
+      };
+      const up = () => {
+        map.off('mousemove', move); map.off('mouseup', up);
+        map.dragging.enable();
+      };
+      map.on('mousemove', move); map.on('mouseup', up);
+    });
+    oppMarker = L.circleMarker(oppLL, {
+      radius: 4, color: '#fa3', weight: 1, fillOpacity: 0,
+      title: 'top-left (derived)'
+    }).addTo(map);
+  } else {
+    anchorMarker.setLatLng([lat0, lon0]);
+    oppMarker.setLatLng(oppLL);
+  }
+
+  window._state = { family, params: { ...currentParams }, lat0, lon0, bearing, Llong, Lshort, pts, pathLL, trackLL };
+}
+
+// ---------------- Export ----------------
+function exportGeoJSON() {
+  const s = window._state;
+  const fc = {
+    type: 'FeatureCollection',
+    features: [
+      {
+        type: 'Feature',
+        properties: { name: 'rooftop_track' },
+        geometry: { type: 'Polygon', coordinates: [s.trackLL.map(ll => [ll[1], ll[0]])] },
+      },
+      {
+        type: 'Feature',
+        properties: { name: `path_${s.family}`, family: s.family, params: s.params,
+                      anchor: { lat: s.lat0, lon: s.lon0, bearing_deg: s.bearing },
+                      track: { long_m: s.Llong, short_m: s.Lshort } },
+        geometry: { type: 'LineString', coordinates: s.pathLL.map(ll => [ll[1], ll[0]]) },
+      },
+    ],
+  };
+  download(`path_${s.family}.geojson`, JSON.stringify(fc, null, 2));
+  $('export_text').value = JSON.stringify(fc, null, 2);
+}
+
+function exportRosPath() {
+  const s = window._state;
+  const obj = {
+    header: { frame_id: 'odom' },
+    poses: s.pts.map(([x, y]) => ({
+      header: { frame_id: 'odom' },
+      pose: { position: { x, y, z: 0.0 },
+              orientation: { x: 0, y: 0, z: 0, w: 1 } },
+    })),
+    _meta: { family: s.family, params: s.params,
+             anchor: { lat: s.lat0, lon: s.lon0, bearing_deg: s.bearing } },
+  };
+  const txt = JSON.stringify(obj, null, 2);
+  download(`path_${s.family}_ros.json`, txt);
+  $('export_text').value = txt;
+}
+
+function copyLocal() {
+  const s = window._state;
+  const txt = s.pts.map(p => p.map(v => v.toFixed(4)).join(',')).join('\n');
+  $('export_text').value = txt;
+  navigator.clipboard?.writeText(txt);
+}
+
+function download(filename, text) {
+  const a = document.createElement('a');
+  a.href = 'data:application/json;charset=utf-8,' + encodeURIComponent(text);
+  a.download = filename;
+  document.body.appendChild(a); a.click(); document.body.removeChild(a);
+}
+
+// ---------------- ROS connection ----------------
+let ros = null;
+let topicEstop = null, topicEstopState = null, topicRefPath = null, topicReset = null;
+let topicOdom = null, topicStatus = null;
+let topicOrchStart = null, topicOrchKill = null, topicOrchStatus = null;
+let setParamsService = null;
+let lastOdomTime = 0, lastStatusTime = 0, odomCount = 0, statusCount = 0;
+let odomRateTimer = null;
+let estopActive = null;
+
+function setDot(id, cls) {
+  const el = $(id);
+  el.classList.remove('ok','bad','warn');
+  if (cls) el.classList.add(cls);
+}
+
+function setConnUI(connected) {
+  $('btn-connect').disabled = connected;
+  $('btn-disconnect').disabled = !connected;
+  $('conn-state').textContent = connected ? 'connected' : 'disconnected';
+  setDot('conn-dot', connected ? 'ok' : 'bad');
+  if (!connected) {
+    setDot('odom-dot', null);
+    setDot('status-dot', null);
+    $('odom-rate').textContent = '--';
+    $('status-rate').textContent = '--';
+    $('estop-state').textContent = 'state: unknown (not connected)';
+    $('stack-panel').innerHTML = '(connect first)';
+    $('vspeed-state').textContent = '(set after connect)';
+  } else {
+    $('vspeed-state').textContent = 'will set on first slider move';
+  }
+}
+
+function connect() {
+  if (typeof ROSLIB === 'undefined') { alert('roslibjs not loaded'); return; }
+  const url = $('ws-url').value.trim();
+  ros = new ROSLIB.Ros({ url });
+
+  ros.on('connection', () => {
+    setConnUI(true);
+    subscribeAll();
+  });
+  ros.on('error', (e) => {
+    console.error('rosbridge error', e);
+    $('conn-state').textContent = 'error';
+    setDot('conn-dot', 'bad');
+  });
+  ros.on('close', () => setConnUI(false));
+}
+
+function disconnect() {
+  if (ros) { try { ros.close(); } catch (e) {} ros = null; }
+  setConnUI(false);
+}
+
+function subscribeAll() {
+  topicEstop = new ROSLIB.Topic({
+    ros, name: '/estop_trigger', messageType: 'std_msgs/Bool'
+  });
+  topicEstopState = new ROSLIB.Topic({
+    ros, name: '/estop', messageType: 'std_msgs/Bool'
+  });
+  topicEstopState.subscribe((msg) => {
+    estopActive = !!msg.data;
+    const btn = $('estop-btn');
+    if (estopActive) {
+      btn.textContent = 'CLEAR E-STOP';
+      btn.classList.add('armed');
+      $('estop-state').textContent = 'state: STOPPED (latched)';
+    } else {
+      btn.textContent = 'E-STOP';
+      btn.classList.remove('armed');
+      $('estop-state').textContent = 'state: motion allowed';
+    }
+  });
+
+  topicRefPath = new ROSLIB.Topic({
+    ros, name: '/reference_path', messageType: 'nav_msgs/Path',
+    queue_length: 1, latch: true
+  });
+
+  topicReset = new ROSLIB.Topic({
+    ros, name: '/path_follower/reset', messageType: 'std_msgs/Bool'
+  });
+
+  topicOdom = new ROSLIB.Topic({
+    ros, name: '/wheel/odom', messageType: 'nav_msgs/Odometry'
+  });
+  topicOdom.subscribe(onOdom);
+
+  topicStatus = new ROSLIB.Topic({
+    ros, name: '/path_follower/status', messageType: 'std_msgs/Float32MultiArray'
+  });
+  topicStatus.subscribe(onStatus);
+
+  // Orchestrator wiring
+  topicOrchStart = new ROSLIB.Topic({
+    ros, name: '/orchestrator/start', messageType: 'std_msgs/String'
+  });
+  topicOrchKill = new ROSLIB.Topic({
+    ros, name: '/orchestrator/kill', messageType: 'std_msgs/String'
+  });
+  topicOrchStatus = new ROSLIB.Topic({
+    ros, name: '/orchestrator/status', messageType: 'std_msgs/String'
+  });
+  topicOrchStatus.subscribe(onOrchStatus);
+
+  // Path-follower v_const setter
+  setParamsService = new ROSLIB.Service({
+    ros, name: '/path_follower_node/set_parameters',
+    serviceType: 'rcl_interfaces/srv/SetParameters'
+  });
+
+  if (odomRateTimer) clearInterval(odomRateTimer);
+  odomRateTimer = setInterval(updateRates, 1000);
+}
+
+const STACK_LABELS = {
+  base_vanilla: 'limo_base (vanilla)',
+  base_gnss:    'limo_base + GNSS',
+  estop:        'estop_cli',
+  follower:     'path_follower_node',
+};
+function onOrchStatus(msg) {
+  let state;
+  try { state = JSON.parse(msg.data); } catch (e) { return; }
+  const rows = Object.keys(STACK_LABELS).map(name => {
+    const alive = !!state[name];
+    const dot = alive ? '<span class="dot ok"></span>' : '<span class="dot bad"></span>';
+    return `<div style="display:flex;align-items:center;gap:6px;margin:3px 0;">
+      ${dot}<span style="flex:1">${STACK_LABELS[name]}</span>
+      <button data-orch-start="${name}" style="padding:2px 6px;font-size:11px;">start</button>
+      <button data-orch-kill="${name}" style="padding:2px 6px;font-size:11px;">kill</button>
+    </div>`;
+  });
+  $('stack-panel').innerHTML = rows.join('');
+  $('stack-panel').querySelectorAll('[data-orch-start]').forEach(b => {
+    b.onclick = () => {
+      if (!topicOrchStart) return;
+      topicOrchStart.publish(new ROSLIB.Message({ data: b.dataset.orchStart }));
+    };
+  });
+  $('stack-panel').querySelectorAll('[data-orch-kill]').forEach(b => {
+    b.onclick = () => {
+      if (!topicOrchKill) return;
+      topicOrchKill.publish(new ROSLIB.Message({ data: b.dataset.orchKill }));
+    };
+  });
+}
+
+function updateRates() {
+  const now = Date.now();
+  $('odom-rate').textContent = `${odomCount} Hz`;
+  $('status-rate').textContent = `${statusCount} Hz`;
+  setDot('odom-dot',   (now - lastOdomTime)   < 1500 ? 'ok' : 'bad');
+  setDot('status-dot', (now - lastStatusTime) < 1500 ? 'ok' : 'bad');
+  odomCount = 0; statusCount = 0;
+}
+
+function onOdom(msg) {
+  lastOdomTime = Date.now(); odomCount++;
+  const x = msg.pose.pose.position.x;
+  const y = msg.pose.pose.position.y;
+  const q = msg.pose.pose.orientation;
+  const yaw = Math.atan2(2*(q.w*q.z + q.x*q.y), 1 - 2*(q.y*q.y + q.z*q.z));
+  drawRobot(x, y, yaw);
+}
+
+function onStatus(msg) {
+  lastStatusTime = Date.now(); statusCount++;
+  const d = msg.data || [];
+  if (d.length < 11) return;
+  const [x, y, yaw, v, s_star, total_length, kappa, rho, e_psi, delta_cmd, has_path] = d;
+
+  const pct = total_length > 0 ? Math.min(100, Math.max(0, 100*s_star/total_length)) : 0;
+  $('prog-bar').style.width = pct.toFixed(1) + '%';
+
+  const rho_class = rho > 5 ? 'err' : (rho > 4 ? 'warn' : 'ok');
+  const has_path_str = has_path > 0.5 ? '<span class="ok">loaded</span>' : '<span class="warn">none</span>';
+
+  $('telemetry').innerHTML =
+    `pose: x=${x.toFixed(2)}, y=${y.toFixed(2)}, yaw=${(yaw*180/Math.PI).toFixed(1)}&deg;<br>` +
+    `v: ${v.toFixed(2)} m/s &nbsp; ref-path: ${has_path_str}<br>` +
+    `s*: ${s_star.toFixed(2)} / ${total_length.toFixed(2)} m (${pct.toFixed(0)}%)<br>` +
+    `&kappa;: ${kappa.toFixed(3)} 1/m &nbsp; <span class="${rho_class}">&rho;: ${rho.toFixed(2)}</span><br>` +
+    `e&psi;: ${(e_psi*180/Math.PI).toFixed(1)}&deg; &nbsp; &delta;: ${(delta_cmd*180/Math.PI).toFixed(1)}&deg;`;
+
+  // Also feed odom-derived robot marker if /wheel/odom is silent.
+  if (Date.now() - lastOdomTime > 2000) drawRobot(x, y, yaw);
+}
+
+function drawRobot(x, y, yaw) {
+  const s = window._state; if (!s) return;
+  const ll = localToLatLon([x, y], s.lat0, s.lon0, s.bearing);
+  const head = localToLatLon([x + 0.5*Math.cos(yaw), y + 0.5*Math.sin(yaw)], s.lat0, s.lon0, s.bearing);
+  if (!robotMarker) {
+    robotMarker = L.circleMarker(ll, {
+      radius: 8, color: '#000', fillColor: '#39f', fillOpacity: 1, weight: 2
+    }).addTo(map);
+    robotHeadingLine = L.polyline([ll, head], { color: '#39f', weight: 3 }).addTo(map);
+  } else {
+    robotMarker.setLatLng(ll);
+    robotHeadingLine.setLatLngs([ll, head]);
+  }
+}
+
+function publishPath() {
+  if (!ros || !topicRefPath) { alert('not connected'); return false; }
+  const s = window._state;
+  if (!s.pts || s.pts.length < 2) { alert('path needs >= 2 waypoints'); return false; }
+  const now = Date.now();
+  const stamp = { sec: Math.floor(now/1000), nanosec: (now % 1000) * 1e6 };
+  const msg = new ROSLIB.Message({
+    header: { stamp, frame_id: 'odom' },
+    poses: s.pts.map(([x, y]) => ({
+      header: { stamp, frame_id: 'odom' },
+      pose: {
+        position: { x, y, z: 0.0 },
+        orientation: { x: 0, y: 0, z: 0, w: 1 },
+      },
+    })),
+  });
+  topicRefPath.publish(msg);
+  $('push-state').innerHTML =
+    `<span class="ok">pushed ${s.pts.length} waypoints (${s.family}) @ ${new Date().toLocaleTimeString()}</span>`;
+  return true;
+}
+
+function pushAndRun() {
+  if (!publishPath()) return;
+  // Auto-clear E-stop so the robot moves immediately.
+  if (topicEstop) topicEstop.publish(new ROSLIB.Message({ data: false }));
+}
+
+function pause()  { if (topicEstop) topicEstop.publish(new ROSLIB.Message({ data: true  })); }
+function resume() { if (topicEstop) topicEstop.publish(new ROSLIB.Message({ data: false })); }
+
+function stopScenario() {
+  // Latch E-stop for safety, then reset the follower's loaded path.
+  if (topicEstop) topicEstop.publish(new ROSLIB.Message({ data: true }));
+  if (topicReset) topicReset.publish(new ROSLIB.Message({ data: true }));
+  $('push-state').textContent = 'scenario stopped';
+}
+
+function recenterOnRobot() {
+  if (!robotMarker) { alert('no robot pose yet'); return; }
+  map.setView(robotMarker.getLatLng(), Math.max(map.getZoom(), 22));
+}
+
+function toggleEstop() {
+  if (!ros || !topicEstop) { alert('not connected'); return; }
+  const want = !(estopActive === true); // if currently active, send false to clear; else true to stop
+  const msg = new ROSLIB.Message({ data: want });
+  topicEstop.publish(msg);
+}
+
+function setVConst(v) {
+  $('vspeed-val').textContent = v.toFixed(2);
+  if (!setParamsService) {
+    $('vspeed-state').textContent = '(not connected — slider value cached locally)';
+    return;
+  }
+  const req = new ROSLIB.ServiceRequest({
+    parameters: [{
+      name: 'v_const',
+      value: { type: 3, double_value: v }
+    }]
+  });
+  setParamsService.callService(req, (resp) => {
+    const ok = resp && resp.results && resp.results[0] && resp.results[0].successful;
+    $('vspeed-state').innerHTML = ok
+      ? `<span class="ok">v_const = ${v.toFixed(2)} m/s set</span>`
+      : `<span class="err">set failed</span>`;
+  }, (err) => {
+    $('vspeed-state').innerHTML = `<span class="err">service error: ${err}</span>`;
+  });
+}
+
+// ---------------- localStorage persistence ----------------
+const LS_KEY = 'limo_battle_last_curve';
+function persistCurve() {
+  try {
+    const s = window._state; if (!s) return;
+    localStorage.setItem(LS_KEY, JSON.stringify({
+      family: s.family, params: s.params,
+      lat: s.lat0, lon: s.lon0, bearing: s.bearing,
+      Llong: s.Llong, Lshort: s.Lshort,
+      vspeed: parseFloat($('vspeed').value),
+    }));
+  } catch (e) {}
+}
+function restoreCurve() {
+  try {
+    const raw = localStorage.getItem(LS_KEY);
+    if (!raw) return;
+    const c = JSON.parse(raw);
+    if (c.family) $('family').value = c.family;
+    if (c.lat != null)     $('lat').value = c.lat;
+    if (c.lon != null)     $('lon').value = c.lon;
+    if (c.bearing != null) $('bearing').value = c.bearing;
+    if (c.Llong != null)   $('L_long').value = c.Llong;
+    if (c.Lshort != null)  $('L_short').value = c.Lshort;
+    if (c.vspeed != null) {
+      $('vspeed').value = c.vspeed;
+      $('vspeed-val').textContent = parseFloat(c.vspeed).toFixed(2);
+    }
+    buildParamUI($('family').value);
+    if (c.params) {
+      Object.keys(c.params).forEach(k => {
+        if (currentParams[k] !== undefined) {
+          currentParams[k] = c.params[k];
+          const inp = document.getElementById('p_' + k);
+          const pv  = document.getElementById('pv_' + k);
+          if (inp) inp.value = c.params[k];
+          if (pv)  pv.textContent = c.params[k];
+        }
+      });
+    }
+  } catch (e) { console.warn('restore failed', e); }
+}
+
+// Hotkey: spacebar -> E-stop
+window.addEventListener('keydown', (e) => {
+  if (e.code === 'Space' && document.activeElement.tagName !== 'INPUT'
+      && document.activeElement.tagName !== 'TEXTAREA') {
+    e.preventDefault();
+    toggleEstop();
+  }
+});
+
+// ---------------- Wire-up ----------------
+['lat','lon','bearing','L_long','L_short','family'].forEach(id => {
+  $(id).addEventListener('input', () => {
+    if (id === 'family') buildParamUI($('family').value);
+    redraw();
+    persistCurve();
+  });
+});
+$('btn-geojson').onclick = exportGeoJSON;
+$('btn-rospath').onclick = exportRosPath;
+$('btn-copy').onclick = copyLocal;
+$('btn-connect').onclick = connect;
+$('btn-disconnect').onclick = disconnect;
+$('btn-push').onclick = pushAndRun;
+$('btn-pause').onclick = pause;
+$('btn-resume').onclick = resume;
+$('btn-stop').onclick = stopScenario;
+$('btn-recenter').onclick = recenterOnRobot;
+$('estop-btn').onclick = toggleEstop;
+$('vspeed').oninput = (e) => {
+  const v = parseFloat(e.target.value);
+  setVConst(v);
+  persistCurve();
+};
+
+// Default to indoor speed cap on first load
+$('vspeed-val').textContent = parseFloat($('vspeed').value).toFixed(2);
+
+buildParamUI($('family').value);
+restoreCurve();          // overrides defaults if a prior session was saved
+redraw();
+persistCurve();          // ensures storage has at least the current state
+setConnUI(false);
+
+// Persist whenever a parameter slider changes (the param sliders call redraw,
+// so we hook the global change here):
+const _paramObserver = new MutationObserver(() => {
+  paramsDiv.querySelectorAll('input[type=range]').forEach(inp => {
+    if (!inp._persistBound) {
+      inp._persistBound = true;
+      inp.addEventListener('input', persistCurve);
+    }
+  });
+});
+_paramObserver.observe(paramsDiv, { childList: true, subtree: true });
+// Initial bind (since observer only fires on subsequent mutations).
+paramsDiv.querySelectorAll('input[type=range]').forEach(inp => {
+  inp._persistBound = true;
+  inp.addEventListener('input', persistCurve);
+});
+
+// fit map to track on first paint
+setTimeout(() => {
+  if (trackPoly) map.fitBounds(trackPoly.getBounds().pad(0.5));
+}, 200);
+</script>
+</body>
+</html>

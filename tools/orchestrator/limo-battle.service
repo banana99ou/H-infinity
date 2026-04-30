@@ -1,0 +1,24 @@
+[Unit]
+Description=LIMO Battle Station (rosbridge_websocket + limo_orchestrator)
+Documentation=file:///home/agilex/H-infinity/tools/orchestrator/start_battle.sh
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=agilex
+Group=agilex
+WorkingDirectory=/home/agilex
+Environment=HOME=/home/agilex
+Environment=USER=agilex
+# start_battle.sh sources /opt/ros/humble + the colcon overlay itself.
+ExecStart=/bin/bash /home/agilex/H-infinity/tools/orchestrator/start_battle.sh
+Restart=on-failure
+RestartSec=5
+# Children of the orchestrator are in their own process groups; mixed kill mode
+# sends SIGTERM to the leader and SIGKILL to lingering descendants.
+KillMode=mixed
+TimeoutStopSec=15
+
+[Install]
+WantedBy=multi-user.target

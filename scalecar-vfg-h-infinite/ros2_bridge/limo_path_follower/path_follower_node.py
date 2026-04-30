@@ -25,6 +25,8 @@ from rclpy.node import Node
 from rclpy.qos import QoSProfile, QoSDurabilityPolicy, QoSReliabilityPolicy, QoSHistoryPolicy
 from nav_msgs.msg import Odometry, Path
 from geometry_msgs.msg import Twist
+from std_msgs.msg import Float32MultiArray, MultiArrayDimension, Bool
+from rcl_interfaces.msg import SetParametersResult
 
 from vfg_pathfollowing import (
     BezierPath,
@@ -127,7 +129,26 @@ class PathFollowerNode(Node):
         self.sub_path = self.create_subscription(
             Path, ref_topic, self._path_cb, latched_qos)
 
+        # Reset sub: True clears the loaded path, returning the node to idle.
+        # Used by the battle-station "Stop scenario" action.
+        self.sub_reset = self.create_subscription(
+            Bool, '/path_follower/reset', self._reset_cb, 10)
+
+        # Allow runtime tuning of v_const via /path_follower_node/set_parameters.
+        # Without this callback, ros2 param set updates the parameter store but
+        # self.v_const stays frozen at the constructor-time value.
+        self.add_on_set_parameters_callback(self._params_cb)
+
         self.pub_cmd = self.create_publisher(Twist, 'cmd_vel_raw', 10)
+        # Telemetry for the battle-station UI. Layout (Float32MultiArray):
+        #   [x, y, yaw, v, s_star, total_length, kappa, rho, e_psi, delta_cmd, has_path]
+        # has_path is 1.0 once a reference is loaded, else 0.0.
+        self.pub_status = self.create_publisher(
+            Float32MultiArray, '/path_follower/status', 10)
+        self._status_labels = [
+            'x', 'y', 'yaw', 'v', 's_star', 'total_length',
+            'kappa', 'rho', 'e_psi', 'delta_cmd', 'has_path',
+        ]
 
         timer_period = self.dt_ctrl  # seconds
         self.timer = self.create_timer(timer_period, self._control_cb)
@@ -141,6 +162,22 @@ class PathFollowerNode(Node):
     # -----------------------------------------------------------------
     # Callbacks
     # -----------------------------------------------------------------
+
+    def _params_cb(self, params):
+        for p in params:
+            if p.name == 'v_const':
+                v = float(p.value)
+                v = max(0.0, min(3.0, v))
+                self.v_const = v
+                self.get_logger().info(f'v_const updated to {v:.2f} m/s (runtime)')
+        return SetParametersResult(successful=True)
+
+    def _reset_cb(self, msg: Bool):
+        if msg.data and self.path is not None:
+            self.path = None
+            self.guidance = None
+            self._delta_prev = 0.0
+            self.get_logger().info('Path cleared via /path_follower/reset')
 
     def _odom_cb(self, msg: Odometry):
         """Extract pose and velocity from Odometry message."""
@@ -185,6 +222,21 @@ class PathFollowerNode(Node):
             f'Loaded reference path: {len(waypoints)} waypoints, '
             f'total length {new_path.total_length:.2f} m.')
 
+    def _publish_status(self, s_star=0.0, total_length=0.0, kappa=0.0,
+                        rho=0.0, e_psi=0.0, delta_cmd=0.0, has_path=0.0):
+        msg = Float32MultiArray()
+        dim = MultiArrayDimension()
+        dim.label = ','.join(self._status_labels)
+        dim.size = len(self._status_labels)
+        dim.stride = len(self._status_labels)
+        msg.layout.dim.append(dim)
+        msg.data = [
+            float(self._x), float(self._y), float(self._yaw), float(self._v),
+            float(s_star), float(total_length), float(kappa), float(rho),
+            float(e_psi), float(delta_cmd), float(has_path),
+        ]
+        self.pub_status.publish(msg)
+
     def _control_cb(self):
         """Timer callback: compute and publish control command."""
         cmd = Twist()
@@ -192,11 +244,13 @@ class PathFollowerNode(Node):
         # Safety: no reference path yet -> zero velocity
         if self.path is None or self.guidance is None:
             self.pub_cmd.publish(cmd)
+            self._publish_status(has_path=0.0)
             return
 
         # Safety: check odom timeout (0.5 s)
         if self._odom_stamp is None:
             self.pub_cmd.publish(cmd)  # zero velocity
+            self._publish_status(total_length=self.path.total_length, has_path=1.0)
             return
 
         dt_since_odom = (self.get_clock().now() - self._odom_stamp).nanoseconds * 1e-9
@@ -205,6 +259,7 @@ class PathFollowerNode(Node):
                 f'Odometry timeout ({dt_since_odom:.2f} s). Sending zero velocity.')
             self._delta_prev = 0.0
             self.pub_cmd.publish(cmd)
+            self._publish_status(total_length=self.path.total_length, has_path=1.0)
             return
 
         # -- Guidance --------------------------------------------------
@@ -220,6 +275,8 @@ class PathFollowerNode(Node):
             self.get_logger().info('Reached path end. Stopping.')
             self._delta_prev = 0.0
             self.pub_cmd.publish(cmd)
+            self._publish_status(s_star=s_star, total_length=self.path.total_length,
+                                 kappa=kappa, has_path=1.0)
             return
 
         # Heading error (psi_des - psi)
@@ -249,6 +306,9 @@ class PathFollowerNode(Node):
         cmd.linear.x = v
         cmd.angular.z = omega
         self.pub_cmd.publish(cmd)
+        self._publish_status(s_star=s_star, total_length=self.path.total_length,
+                             kappa=kappa, rho=rho, e_psi=e_psi,
+                             delta_cmd=delta_cmd, has_path=1.0)
 
 
 def main(args=None):

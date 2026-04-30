@@ -2,3 +2,7 @@
 .specstory
 .vscode
 .tmp/
+__pycache__/
+tools/path_gen/tile_cache/
+tools/path_gen/out/
+tools/indoor_test/out/

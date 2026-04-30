@@ -142,14 +142,21 @@ The first substantive task is done:
 
 - [x] Replace the hardcoded demo path with a runtime reference input.
   (See "first substantive task" above.)
-- [ ] Extend bag recording with controller-specific topics (controller
-  status, tracking error, active reference, optional debug command). Start
-  in: `Data_Logger.py`.
-- [ ] **Log GNSS data alongside controller runs** (professor's request,
-  for his other project). `GPS-RTK_ROS2_pub_node.py` exists in the repo;
-  confirm what topic it publishes and add it to `Data_Logger.py`'s bag
-  list. Decide whether GNSS is required (block run) or best-effort
-  (warn but continue) for controller experiments.
+- [ ] Extend bag recording with controller-specific topics. Start in:
+  `Data_Logger.py` (TOPICS list at line 30). Currently records
+  `/cmd_vel`, `/cmd_vel_raw`, `/wheel/odom`, `/imu`, `/estop`. Still
+  missing: `/reference_path` (trivial -- just add the string), and
+  controller-internal diagnostics (`psi_des`, `e_d`, `kappa`,
+  `s_star`, pre-saturation `delta_cmd`) which `path_follower_node` does
+  not currently publish. Decide whether to add a single
+  `/path_follower/status` topic or one topic per quantity.
+- [x] **Log GNSS data alongside controller runs** (professor's request).
+  Already wired in `Data_Logger.py:30-35`: records
+  `/gps_rtk_f9p_helical/gps/{fix,nmea,rtk_status}` plus the Pixhawk
+  GPS topics. To verify: run `Data_Logger.py` during a controller test
+  and confirm all six GPS topics appear in the resulting bag with
+  non-empty messages. Open question for professor: format/ordering
+  preferences, RTK-fix gating policy.
 - [ ] Decide RTK gating policy for controller experiments. Start in:
   `run_scenarios_from_files.py`.
 - [ ] Extend preflight topic checks for controller runs. Start in:

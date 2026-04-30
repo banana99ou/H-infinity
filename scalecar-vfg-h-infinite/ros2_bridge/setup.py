@@ -20,6 +20,7 @@ setup(
     entry_points={
         'console_scripts': [
             'path_follower_node = limo_path_follower.path_follower_node:main',
+            'orchestrator_node = limo_path_follower.orchestrator_node:main',
         ],
     },
 )

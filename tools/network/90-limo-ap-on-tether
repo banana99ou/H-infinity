@@ -1,0 +1,55 @@
+#!/bin/bash
+# NetworkManager dispatcher: when a USB tether (RNDIS / iPhone Personal
+# Hotspot) appears, switch the WiFi radio to LIMO_AP. When the tether
+# disappears, drop the AP and let NM autoconnect to the best saved WiFi
+# (FMCL-5G in the lab, nothing outdoors).
+#
+# Installed at /etc/NetworkManager/dispatcher.d/90-limo-ap-on-tether by
+# tools/network/install_tether_dispatcher.sh.
+
+IFACE="${1:-}"
+ACTION="${2:-}"
+
+# Match USB ethernet interfaces only. Onboard wired NIC is enp114s0 and
+# uses the enp* prefix, so it won't match. iPhone tether shows up as
+# enx<MAC> via the ipheth driver; legacy adapters use usb0 etc.
+case "$IFACE" in
+  usb[0-9]*|enx*) ;;
+  *) exit 0 ;;
+esac
+
+# Refuse manual invocation with a fake interface name on `up`. Only checked
+# for `up` because on `down` the interface is gone by definition (USB unplug
+# removes /sys/class/net/<iface> before the dispatcher fires).
+if [ "$ACTION" = "up" ] && [ ! -d "/sys/class/net/$IFACE" ]; then
+  exit 0
+fi
+
+LIMO_AP_CONN="LIMO_AP"
+LOG=/var/log/limo-net-switch.log
+
+log() {
+  printf '%s %s/%s: %s\n' "$(date '+%F %T')" "$IFACE" "$ACTION" "$*" >> "$LOG" 2>/dev/null
+}
+
+# Run nmcli asynchronously so the dispatcher returns quickly. NM serializes
+# dispatcher events per-device; long-running nmcli calls inside this script
+# would block other events and risk deadlock.
+case "$ACTION" in
+  up)
+    log "tether up — switching WiFi to AP"
+    systemd-run --no-block --collect \
+      --unit="limo-ap-up-$(date +%s%N)" \
+      /usr/bin/nmcli connection up "$LIMO_AP_CONN" \
+      >> "$LOG" 2>&1
+    ;;
+  down)
+    log "tether down — dropping AP, NM will autoconnect to saved WiFi"
+    systemd-run --no-block --collect \
+      --unit="limo-ap-down-$(date +%s%N)" \
+      /usr/bin/nmcli connection down "$LIMO_AP_CONN" \
+      >> "$LOG" 2>&1
+    ;;
+esac
+
+exit 0

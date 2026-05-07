@@ -5,17 +5,107 @@ Working checklist for getting the professor-provided H-infinity stack from
 
 ## Status
 
-First hardware bring-up is green. `ros2 run limo_path_follower path_follower_node`
-launches on the NUC, subscribes to `/wheel/odom`, publishes `/cmd_vel_raw`, and
-responds correctly to synthetic odometry. Safety fallbacks (null-odom,
-odom-timeout, shutdown) verified in isolation. No actual wheel motion has been
-tested yet.
+Battle station online and field-tested. Major workstreams since last update
+(2026-04-30):
+
+- **Browser battle station** (`tools/path_gen/interactive.html`):
+  Leaflet map + parametric path designer + rosbridge live link + run controls
+  (Push&Run/Pause/Resume/Stop/Recenter), speed slider via `set_parameters`,
+  inline keyboard teleop with WASD + reverse-turn fix, last-curve persistence
+  via localStorage.
+- **Process orchestrator** (`scalecar-vfg-h-infinite/ros2_bridge/limo_path_follower/orchestrator_node.py`):
+  manages `base_vanilla` / `base_gnss` / `estop` / `follower` subprocesses
+  via `/orchestrator/{start,kill,status}` topics. Stack panel in the HTML
+  shows live state and start/kill buttons.
+- **systemd service** (`tools/orchestrator/limo-battle.service` +
+  `install_service.sh`): boots rosbridge + orchestrator on NUC startup. Enabled
+  and verified surviving reboot.
+- **Telemetry**: `/path_follower/status` (Float32MultiArray) added to
+  `path_follower_node`; `v_const` runtime-tunable via parameter callback;
+  `/path_follower/reset` Bool subscriber clears the loaded path.
+- **Indoor test preset**: `indoor_s` family in the path designer
+  (3 m × 0.4 m S-curve, R_min ≥ 0.57 m).
+- **`estop_cli.py`** subscribes to `/estop_trigger` (browser-driven E-stop)
+  and is now TTY-tolerant (works under systemd without a terminal).
+- **Field network topology** documented in `DOC/network_topology.md`
+  (phone-on-robot + USB-tether + LIMO-AP). Used during outdoor GNSS
+  recording session.
+
+First wheels-on-floor controller test still hasn't happened. The infrastructure
+is ready; next session is the first real run.
+
+## Architectural decisions (committed)
+
+- **GPS stays out of the control loop.** See `DOC/decisions/01_gps_no_fusion.md`.
+  Wheel odom feeds the controller; RTK GPS is logged as semi-ground-truth
+  for post-hoc evaluation. No `robot_localization` EKF, no fused state.
 
 ## Key contract to preserve
 
 - controller consumes live robot feedback and a runtime reference
 - controller publishes `cmd_vel_raw`
 - `estop_cli.py` remains between the controller and final `cmd_vel`
+- GPS is **not** in the control loop (see ADR-01)
+
+## Next session — start here
+
+In rough priority order:
+
+1. **First wheels-on-floor smoke test (indoor).** Indoor S-curve preset is
+   ready. Bring up `base_vanilla` + `estop` + `follower` from the orchestrator,
+   push the `indoor_s` path, set `v_const = 0.2 m/s`, clear the E-stop, and
+   verify the robot tracks the curve. Confirm with the user before letting
+   wheels touch the ground.
+
+2. **Verify `base_gnss` actually publishes.** Start `base_gnss` from the
+   orchestrator and run `ros2 topic list` / `ros2 topic echo --once` to
+   confirm `/gps_rtk_f9p_helical/gps/fix` and `.../rtk_status` flow. The
+   `LIMO+MAVROS+RTK_Node_Launcher.launch.py` launch file exists in
+   `limo_base/launch/` but its end-to-end behavior on this hardware has
+   not been verified post-systemd-install.
+
+3. **Battle-station GPS view (per ADR-01 §"What we DO use GPS for").**
+   Add to `interactive.html`:
+   - Subscribe to `/gps_rtk_f9p_helical/gps/fix` (NavSatFix) and
+     `.../rtk_status`
+   - Big colored fix-quality bar: RTK FIX (green) / RTK FLOAT (yellow) /
+     3D (orange) / NO FIX (red)
+   - Magenta circle marker on the Leaflet map at the GPS lat/lon (distinct
+     from the blue odom-projected marker, so drift is visible)
+   - NTRIP correction-age display
+   - Refuse Push&Run when fix < FLOAT (configurable threshold)
+
+4. **Rosbag recording from the battle station.** Add a "Record run" button
+   that starts/stops `ros2 bag record` for the minimum dataset
+   (`project_spec.md` §11 line 714):
+   `/wheel/odom`, `/cmd_vel_raw`, `/cmd_vel`, `/estop`, `/reference_path`,
+   `/path_follower/status`, `/gps_rtk_f9p_helical/gps/fix`,
+   `/gps_rtk_f9p_helical/gps/rtk_status`. Bag filename = run-ID +
+   wallclock timestamp; embed the same in a sidecar JSON for pairing
+   with the FitTogether SD-card export.
+
+5. **Offline analysis script** (`tools/analysis/run_eval.py`): given a
+   rosbag, compute the headline table from ADR-01:
+   `RMS e_d`, `max e_d`, terminal pose error — once from `/wheel/odom`,
+   once from `/gps_rtk_f9p_helical/gps/fix`. Print the gap. Plot both
+   trajectories overlaid on the reference.
+
+6. **Captive `cmd_vel_raw` watchdog in `estop_cli.py`** (defense in depth):
+   trip the latched E-stop after 1 s of `/cmd_vel_raw` silence. Catches
+   any source going silent (teleop browser dies, follower crashes).
+
+7. **Field-readiness checklist on the NUC**: small script that verifies
+   pre-rooftop-trip everything is healthy (limo-battle.service active,
+   internet reachable, both base launch files importable, etc.).
+
+Open questions for the user before next session:
+
+- Sudo password for the agilex user is `agx` (separate from SSH password
+  `nvidia`). Confirm this stays valid.
+- LIMO AP config — is it persistent in NetworkManager? Do we need to
+  script its setup as part of the orchestrator?
+- For the GPS-quality threshold gate: hard-fail at FLOAT, or only at
+  SINGLE / NO FIX?
 
 ## Next Thing To Implement
 

@@ -26,10 +26,11 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
+mkdir -p /tmp/limo_orchestrator
+
 echo "[start_battle] starting rosbridge_websocket on :9090"
 ros2 launch rosbridge_server rosbridge_websocket_launch.xml > /tmp/limo_orchestrator/rosbridge.log 2>&1 &
 ROSBRIDGE_PID=$!
-mkdir -p /tmp/limo_orchestrator
 sleep 2
 
 echo "[start_battle] starting limo_orchestrator (Ctrl+C to stop everything)"

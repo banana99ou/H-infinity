@@ -77,7 +77,7 @@ In rough priority order:
 
 4. **Rosbag recording from the battle station.** Add a "Record run" button
    that starts/stops `ros2 bag record` for the minimum dataset
-   (`project_spec.md` §11 line 714):
+   (`DOC/system_spec.md` §4 required bag topic set):
    `/wheel/odom`, `/cmd_vel_raw`, `/cmd_vel`, `/estop`, `/reference_path`,
    `/path_follower/status`, `/gps_rtk_f9p_helical/gps/fix`,
    `/gps_rtk_f9p_helical/gps/rtk_status`. Bag filename = run-ID +
@@ -97,6 +97,13 @@ In rough priority order:
 7. **Field-readiness checklist on the NUC**: small script that verifies
    pre-rooftop-trip everything is healthy (limo-battle.service active,
    internet reachable, both base launch files importable, etc.).
+   - 2026-05-07: quick mode landed at `tools/preflight/preflight.sh`.
+     Covers service state, node graph, safety chain pub/sub sets,
+     Ackermann mode, battery, `/wheel/odom` liveness. 11/11 PASS on NUC.
+   - Still TODO: `--full` dynamic test (synthetic odom + path push +
+     E-stop reflex assertion). Stub WARNs in place.
+   - Still TODO: outdoor-only checks (internet reachable, both base
+     launch files importable).
 
 Open questions for the user before next session:
 
@@ -112,8 +119,8 @@ Open questions for the user before next session:
 - [x] Reconcile `~/agiles_ws` (typo) vs `~/agilex_ws` across the repo.
   - NUC confirmed source of truth: `~/agilex_ws`.
   - `env_sanitizer.sh` and `start_ROS.sh` already use `~/agilex_ws` — no
-    edits required. Remaining `agile_ws` / `agiles_ws` mentions live only
-    in `DOC/project_spec.md`, which is owned by the user.
+    edits required. Remaining stale `agile_ws` / `agiles_ws` mentions lived
+    only in the old root project spec, now deleted.
 
 The first substantive task is done:
 
@@ -135,7 +142,7 @@ The first substantive task is done:
 
 ## Critical Blockers
 
-- [ ] **Set the LIMO to Ackermann steering mode before any wheels-on-floor test.**
+- [x] **Set the LIMO to Ackermann steering mode before any wheels-on-floor test.**
   - Why it matters: the controller does the bicycle-model conversion
     `omega = v * tan(delta) / L` on the assumption the LIMO is in Ackermann
     mode. In differential / 4WD mode, `cmd_vel.angular.z` is interpreted
@@ -165,13 +172,13 @@ The first substantive task is done:
     NUC with the prerequisites captured under "NUC deployment caveats" below.
 - [x] Standardize the robot workspace path and environment sourcing.
   - Answer is `~/agilex_ws`. `env_sanitizer.sh` and `start_ROS.sh` are
-    already correct. Remaining stale references are doc-only in
-    `DOC/project_spec.md` (user-owned).
+    already correct. The old root project spec's stale references are gone
+    with it (file deleted).
 - [ ] Freeze the runtime interface before larger edits.
   - Decide: odometry topic (answered: `/wheel/odom`), reference input type
     (still open), diagnostic topics (still open), whether steering telemetry
     exists (still open).
-  - Source of truth: `DOC/project_spec.md`.
+  - Source of truth: `DOC/system_spec.md` §4.
 
 ## Before First Motion
 
@@ -222,7 +229,7 @@ The first substantive task is done:
   - Missing reference -> safe behavior
   - Shutdown -> zero command
   - E-stop override works every time
-  - Source of truth: `DOC/project_spec.md`.
+  - Source of truth: `DOC/system_spec.md` §5–6.
 
 - [ ] Run one low-speed straight-path test before any curved-path test.
   - Goal: prove the wrapper, safety chain, and command mapping are not
@@ -254,7 +261,7 @@ The first substantive task is done:
 - [ ] Decide whether the current INI scenario system should be extended or
   wrapped. Start in: `run_scenarios_from_files.py`, `scenarios/`.
 - [ ] Define a run-ID or timestamp rule for associating ROS bags with the
-  external Ohcoach-cell dataset. Source of truth: `DOC/project_spec.md`.
+  external Ohcoach-cell dataset. Source of truth: `DOC/system_spec.md` §4 (D2–D3).
 
 ## Validation And Tuning
 
@@ -271,42 +278,9 @@ The first substantive task is done:
 
 ## NUC deployment caveats
 
-These four things are non-obvious and will re-bite anyone setting up a fresh
-NUC. Keep them in mind before declaring a runtime environment "ready".
-
-1. **Professor package shipped without `setup.cfg`.** Without the
-   `[install] install_scripts=$base/lib/limo_path_follower` redirect, modern
-   setuptools installs `console_scripts` into `install/<pkg>/bin/` instead of
-   `install/<pkg>/lib/<pkg>/`, and `ros2 run limo_path_follower
-   path_follower_node` returns "No executable found". Our fix added
-   `scalecar-vfg-h-infinite/ros2_bridge/setup.cfg`. Every other ament_python
-   package in `~/agilex_ws/src/` has the same pattern.
-
-2. **`vfg_pathfollowing` is a hard prerequisite, not declared anywhere.**
-   The ROS package's `package.xml` only lists `rclpy`, `nav_msgs`,
-   `geometry_msgs`. The node imports `vfg_pathfollowing` at the top, so on
-   a fresh NUC you must:
-   ```
-   pip3 install --user ~/H-infinity/scalecar-vfg-h-infinite/
-   ```
-   before `ros2 run` will succeed. If you skip this the node crashes with
-   `ModuleNotFoundError: No module named 'vfg_pathfollowing'`.
-
-3. **`setuptools==68.2.2` is pinned in `~/.local` on the NUC.** Versions
-   >= 70 place `console_scripts` in `bin/` regardless of `setup.cfg` and
-   silently break `ros2 run` for **all** ament_python packages on the
-   workspace. If pip or a system update moves it, reinstall:
-   ```
-   pip3 install --user --force-reinstall setuptools==68.2.2
-   ```
-
-4. **Repo lives outside the colcon tree.** The clone is at `~/H-infinity/`;
-   the package is made visible to colcon via a symlink:
-   ```
-   ln -sfn ~/H-infinity/scalecar-vfg-h-infinite/ros2_bridge \
-           ~/agilex_ws/src/limo_path_follower
-   ```
-   Recreate the symlink if the repo moves.
+Moved to `DOC/deployment.md` (the four fresh-NUC prerequisites: `setup.cfg`
+fix, `vfg_pathfollowing` pip install, `setuptools==68.2.2` pin, colcon
+symlink). Read that before setting up a new robot.
 
 ## Known open noise
 

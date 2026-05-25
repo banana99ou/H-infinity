@@ -3,7 +3,7 @@
 **Status**: accepted (2026-04-30)
 **Scope**: paper experiments + everything that runs on the LIMO for this study
 **Supersedes**: nothing
-**Related**: `DOC/project_spec.md` §3, §4.2, §6.7, §15.2, §17.4
+**Related**: `DOC/system_spec.md` §3.3 (L1–L5), `DOC/experiment.md` (operational model)
 
 ## Decision
 
@@ -64,13 +64,12 @@ revisit" below.
    on these platforms uses wheel odom only. Apples-to-apples comparison
    requires the same.
 
-7. **The spec already encoded this.** `project_spec.md` §3 line 36 calls
-   RTK "semi-ground truth for controller **evaluation**"; §4.2 line 45 puts
-   "direct code-level interaction with the Ohcoach-cell" out of scope;
-   §6.7 line 132 confirms the dataset is collected "independently by
-   external hardware and does not require new ROS2 code-level interaction."
-   This ADR ratifies what the spec already says — but in language that
-   protects against accidentally building an EKF "for convenience" later.
+7. **The spec already encoded this.** The original project spec called RTK
+   "semi-ground truth for controller **evaluation**", put "direct code-level
+   interaction with the Ohcoach-cell" out of scope, and confirmed the external
+   dataset is collected independently of the ROS2 stack. That intent now lives
+   in `system_spec.md` §3.3 (L1–L5). This ADR ratifies it — but in language
+   that protects against accidentally building an EKF "for convenience" later.
 
 ## Why (operational lens — where it cuts the other way)
 

@@ -1,45 +1,62 @@
-my mental model of system so far.
-there is premade ros nodes that are setup to run in sim env.
-we're in the process of making each nodes in sim stanalone in hardware.
-there is
+# H-infinity LIMO
 
-## repo map
-DOC: documents, referece
-scalecar-vfg-h-infinite: sim code from Prof. we're refactoring/modifying this codes to work on actual hardware.
-tools/path_gen: parametric path generator + lat/lon overlay viewer for the rooftop test track.
-tools/indoor_test: short indoor sample curves for shaking out the system before going to the rooftop.
+Hardware bring-up of the professor's `scalecar-vfg-h-infinite` path-following
+controller (VFG + LPV-H∞) on the AgileX LIMO. The goal is a **paper-grade
+dataset** comparing LPV-H∞ vs PID-FF across a curvature sweep at fixed speed,
+gathered unattended on a rooftop track with RTK as post-hoc ground truth.
 
-## indoor sample curve
+**The robot is the source of truth.** This laptop has no ROS2 — everything
+runs on the NUC. See `CLAUDE.md` for the edit → rsync → build → run → verify
+loop.
 
-A 5x5 m square workspace with 0.5 m margin on every edge (usable area
-4x4 m). The robot starts at the left side at (0.5, 2.5) in the local
-`odom` frame, facing +x, and follows a sinusoid to (4.5, 2.5).
+## Canonical docs — and what each owns
 
-Geometry
-- y(x) = 2.5 + 0.7 * sin(2*pi*(x - 0.5) / 4),  x in [0.5, 4.5]
-- one full period over 4 m of forward travel
-- y stays in [1.8, 3.2]  (1.3 m clear of every wall)
-- arc length 5.02 m
-- |kappa|_max = 1.727  ->  R_min = 0.579 m  (above LIMO mechanical
-  steering limit ~0.37 m, but with margin)
-- rho_max = |kappa| * v <= 1.73 even at v = 1.0 m/s, well within the
-  LPV scheduling envelope (rho_max = 5)
+| Doc | Owns |
+|---|---|
+| `DOC/system_spec.md` | **What the system must be** — locked requirements (ROC), the canonical interface contract (§4), acceptance criteria. Start here. |
+| `DOC/experiment.md` | **Why + how** — the curvature-sweep pivot, the experimental matrix, the per-cell operational model, orchestrator target state. |
+| `DOC/deployment.md` | NUC deployment caveats, support-script inventory, data-flow diagram, runbook. |
+| `DOC/network_topology.md` | Field network (phone-on-robot + USB tether + LIMO AP) for outdoor RTK. |
+| `DOC/decisions/` | Architecture Decision Records. ADR-01: GPS stays out of the control loop. |
+| `DOC/paper_ijat.pdf` | The sim paper this work follows up on. |
+| `ToDo.md` | Live working checklist + current status + next-session list. |
+| `CLAUDE.md` | Agent operating manual: dev cycle, ssh/rsync, build/run, safety contract, conventions. |
 
-Files
-- `tools/indoor_test/publish_indoor_path.py` -- ROS2 publisher, latched
-  QoS (transient_local + reliable + keep_last 1) on `/reference_path`
-  in frame `odom`, 81 waypoints.
-- `tools/indoor_test/run_indoor.sh` -- launches `path_follower_node`
-  with `v_const:=<speed>` and the publisher together.
-- `tools/indoor_test/out/indoor_path.png` -- workspace overlay +
-  curvature plot.
+Rule of thumb: if a fact lives in two docs, the table above says which copy is
+canonical — fix that one.
 
-Run on the NUC (after rsync):
+## Repo map
+
+| Path | What |
+|---|---|
+| `scalecar-vfg-h-infinite/` | Professor's controller + guidance library (vendored). `vfg_pathfollowing/` is the algorithm; `ros2_bridge/` is our `path_follower_node`. Keep upstream drops isolated from our patches. |
+| `tools/path_gen/` | Browser battle station: Leaflet map + parametric path designer + rosbridge live link + run controls + inline teleop (`interactive.html`). |
+| `tools/orchestrator/` | `start_battle.sh`, the `limo-battle` systemd service + installer. |
+| `tools/network/` | NetworkManager AP-on-tether dispatcher (auto-switch client WiFi ↔ LIMO AP). |
+| `tools/preflight/` | `preflight.sh` — pre-rooftop field-readiness checks. |
+| `tools/indoor_test/` | Short indoor sample curves for shaking out the system before the rooftop. |
+| `tools/diagnostics/` | Ad-hoc on-robot diagnostics. |
+| `scenarios/` | Scenario definitions (and per-venue WGS84 config under `venues/`). |
+| `src/limo_ros2/` | LIMO base driver + launch files (`limo_base`, MAVROS, RTK launcher). |
+| `legacy/` | Superseded scripts kept for reference (INI scenario runner, scripted motion baseline). |
+
+## Indoor sample curve
+
+A 5×5 m workspace with 0.5 m wall margin (usable 4×4 m). Robot starts at
+(0.5, 2.5) in the `odom` frame facing +x and follows a sinusoid to (4.5, 2.5):
+
+- `y(x) = 2.5 + 0.7·sin(2π·(x − 0.5)/4)`, x ∈ [0.5, 4.5] — one full period over 4 m.
+- y stays in [1.8, 3.2] (1.3 m clear of every wall); arc length 5.02 m.
+- |κ|_max = 1.727 → R_min = 0.579 m (above the LIMO ~0.37 m steering limit, with margin).
+- ρ_max = |κ|·v ≤ 1.73 even at v = 1.0 m/s — well inside the LPV envelope (ρ_max = 5).
+
+Files: `tools/indoor_test/publish_indoor_path.py` (latched publisher on
+`/reference_path`, 81 waypoints, frame `odom`), `run_indoor.sh` (launches the
+follower + publisher), `out/indoor_path.png` (overlay + curvature plot).
+
+Run on the NUC (after rsync), robot placed at ≈(0.5, 2.5) facing +x:
 ```
 cd /home/agilex/H-infinity/tools/indoor_test
 ./run_indoor.sh 0.3        # speed in m/s, default 0.3
 ```
-
-Place the robot at roughly (x=0.5, y=2.5) facing +x in the `odom`
-frame before starting. Ctrl+C stops both the controller and the path
-publisher.
+Ctrl+C stops both the controller and the path publisher.

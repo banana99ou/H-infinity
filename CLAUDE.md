@@ -10,14 +10,19 @@ source of truth** — this laptop has no ROS2 installed. Nothing runs locally;
 everything runs on the NUC.
 
 Authoritative docs:
-- `DOC/project_spec.md` — runtime interface contract, safety requirements.
-- `ToDo.md` — working checklist, current status, deployment caveats.
+- `DOC/system_spec.md` — locked requirements (ROC), canonical interface
+  contract (§4), acceptance criteria. The "what it must be".
+- `DOC/experiment.md` — claim pivot, experimental matrix, operational model,
+  orchestrator target state. The "why + how".
+- `DOC/deployment.md` — NUC caveats, support-script inventory, runbook.
+- `ToDo.md` — working checklist, current status, next-session list.
+- `README.md` — repo map + index of which doc owns what.
 
 ## Dev cycle
 
 Every change follows the same loop:
 
-1. **Edit on laptop** (`/Volumes/Sandisk/code/H-infinity/`). Use Read/Edit/Write.
+1. **Edit on laptop** (`/Users/hyeon-yongjeong/code/H-infinity/`). Use Read/Edit/Write.
    Do not try to run ROS2 commands here — they do not exist on macOS.
 2. **Rsync to NUC** (see `## Rsync pattern`). Laptop and NUC drift constantly.
    Assume they are out of sync until you have just rsync'd.
@@ -74,7 +79,7 @@ spawn rsync -avz \
   --exclude=.git --exclude=.DS_Store --exclude=__pycache__ --exclude=*.pyc \
   --exclude=.specstory --exclude=.vscode \
   --exclude=build --exclude=install --exclude=log --exclude=.pytest_cache \
-  /Volumes/Sandisk/code/H-infinity/ \
+  /Users/hyeon-yongjeong/code/H-infinity/ \
   agilex@agilex-nuc12wski7:/home/agilex/H-infinity/
 expect { -re "(P|p)assword:" { send "PASSWORD\r"; exp_continue } eof }
 '
@@ -151,8 +156,8 @@ or silence > 0.5 s, expect all zeros (odom-timeout branch).
 
 Four non-obvious prerequisites on a fresh NUC — missing `setup.cfg` fix,
 `vfg_pathfollowing` pip install, `setuptools==68.2.2` pin, colcon symlink.
-Canonical list lives in `ToDo.md` under "NUC deployment caveats". When
-setting up a new robot, read that section first.
+Canonical list lives in `DOC/deployment.md`. When setting up a new robot,
+read that first.
 
 ## Commit conventions for this repo
 
@@ -161,5 +166,5 @@ setting up a new robot, read that section first.
   drop of `scalecar-vfg-h-infinite/` isolated from our patches so future
   upstream drops diff cleanly (see commits `f7a34a2` and `b577541` for the
   pattern).
-- Do not touch `DOC/project_spec.md` unless the user asks — it has
-  pre-existing unstaged edits that belong to the user's own flow.
+- `DOC/system_spec.md` is the locked spec: if reality and the sheet disagree,
+  fix the sheet first (per its own header). Don't silently diverge from it.

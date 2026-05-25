@@ -241,13 +241,16 @@ class PathFollowerNode(Node):
         """Timer callback: compute and publish control command."""
         cmd = Twist()
 
-        # Safety: no reference path yet -> zero velocity
+        # No reference path yet -> stay silent on /cmd_vel_raw so a teleop
+        # source (e.g. the battle-station keyboard) can drive the robot
+        # without racing our 20 Hz zero-publish at this same topic. The
+        # estop_cli safety chain still gates /cmd_vel; if no one publishes
+        # to /cmd_vel_raw, /cmd_vel naturally goes silent.
         if self.path is None or self.guidance is None:
-            self.pub_cmd.publish(cmd)
             self._publish_status(has_path=0.0)
             return
 
-        # Safety: check odom timeout (0.5 s)
+        # Safety: check odom timeout (0.5 s) -> zero velocity
         if self._odom_stamp is None:
             self.pub_cmd.publish(cmd)  # zero velocity
             self._publish_status(total_length=self.path.total_length, has_path=1.0)

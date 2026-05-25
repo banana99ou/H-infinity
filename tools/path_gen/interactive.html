@@ -192,6 +192,18 @@
     </div>
     <div class="small" id="push-state">no path pushed</div>
 
+    <h3>Path start pose (odom)</h3>
+    <div class="row">
+      <label style="flex:1">x (m)<input type="number" id="anchor-x" step="0.05" value="0"></label>
+      <label style="flex:1">y (m)<input type="number" id="anchor-y" step="0.05" value="0"></label>
+      <label style="flex:1">yaw (&deg;)<input type="number" id="anchor-th" step="1" value="0"></label>
+    </div>
+    <div class="row" style="margin-top:6px;">
+      <button id="btn-anchor-snap" class="primary">Snap to robot pose</button>
+      <button id="btn-anchor-reset">Reset (0,0,0)</button>
+    </div>
+    <div class="small">Cyan dot+arrow on map: drag the dot to translate, drag the tip to rotate. Path is published transformed by this pose.</div>
+
     <label style="margin-top:10px;">target speed (m/s)
       <span class="pill" id="vspeed-val">0.30</span>
       <input type="range" id="vspeed" min="0.0" max="2.0" step="0.05" value="0.30">
@@ -537,6 +549,27 @@ $('basemap').onchange = (e) => {
 
 let pathLayer = null, trackPoly = null, anchorMarker = null, oppMarker = null;
 let startMarker = null, endMarker = null, robotMarker = null, robotHeadingLine = null;
+let pathAnchorPosMarker = null, pathAnchorTipMarker = null, pathAnchorLine = null;
+
+// Pose at which the path's local origin is anchored in the odom frame.
+// path[0] will be published at (x, y) with tangent theta (radians, CCW from +x).
+let pathAnchor = { x: 0, y: 0, theta: 0 };
+// Live robot odom for the "Snap to robot" button.
+let lastRobotOdom = { x: 0, y: 0, theta: 0, t: 0 };
+
+function applyPathAnchor(pts, a) {
+  const c = Math.cos(a.theta), sn = Math.sin(a.theta);
+  return pts.map(([px, py]) => [
+    a.x + px*c - py*sn,
+    a.y + px*sn + py*c,
+  ]);
+}
+
+function syncAnchorInputs() {
+  $('anchor-x').value  = pathAnchor.x.toFixed(2);
+  $('anchor-y').value  = pathAnchor.y.toFixed(2);
+  $('anchor-th').value = (pathAnchor.theta * 180/Math.PI).toFixed(0);
+}
 
 function redraw() {
   const lat0 = parseFloat($('lat').value);
@@ -547,7 +580,9 @@ function redraw() {
   $('bearing_val').textContent = bearing.toFixed(1);
 
   const family = $('family').value;
-  const pts = genPath(family, currentParams, Llong, Lshort);
+  const ptsLocal = genPath(family, currentParams, Llong, Lshort);
+  // Path published & drawn in the odom frame, transformed by the anchor pose.
+  const pts = applyPathAnchor(ptsLocal, pathAnchor);
   const trackCorners = [[0,0],[Llong,0],[Llong,Lshort],[0,Lshort],[0,0]];
 
   const pathLL = pts.map(p => localToLatLon(p, lat0, lon0, bearing));
@@ -619,7 +654,93 @@ function redraw() {
     oppMarker.setLatLng(oppLL);
   }
 
-  window._state = { family, params: { ...currentParams }, lat0, lon0, bearing, Llong, Lshort, pts, pathLL, trackLL };
+  // Path anchor pose marker (cyan): draggable position + heading-tip handle.
+  drawPathAnchorMarker(lat0, lon0, bearing);
+
+  window._state = {
+    family, params: { ...currentParams }, lat0, lon0, bearing, Llong, Lshort,
+    pts, pathLL, trackLL,
+    anchor: { ...pathAnchor },
+  };
+}
+
+function drawPathAnchorMarker(lat0, lon0, bearing) {
+  const TIP_LEN = 0.6;  // metres in odom frame
+  const posXY = [pathAnchor.x, pathAnchor.y];
+  const tipXY = [
+    pathAnchor.x + TIP_LEN * Math.cos(pathAnchor.theta),
+    pathAnchor.y + TIP_LEN * Math.sin(pathAnchor.theta),
+  ];
+  const posLL = localToLatLon(posXY, lat0, lon0, bearing);
+  const tipLL = localToLatLon(tipXY, lat0, lon0, bearing);
+
+  if (!pathAnchorPosMarker) {
+    pathAnchorLine = L.polyline([posLL, tipLL], {
+      color: '#0ff', weight: 2, dashArray: '4 4', interactive: false,
+    }).addTo(map);
+    pathAnchorPosMarker = L.circleMarker(posLL, {
+      radius: 8, color: '#0ff', weight: 3, fillColor: '#0ff', fillOpacity: 0.4,
+      interactive: true, pane: 'markerPane',
+    }).addTo(map);
+    pathAnchorTipMarker = L.circleMarker(tipLL, {
+      radius: 5, color: '#0ff', weight: 2, fillColor: '#0ff', fillOpacity: 0.0,
+      interactive: true, pane: 'markerPane',
+    }).addTo(map);
+    bindPathAnchorDrag();
+  } else {
+    pathAnchorPosMarker.setLatLng(posLL);
+    pathAnchorTipMarker.setLatLng(tipLL);
+    pathAnchorLine.setLatLngs([posLL, tipLL]);
+  }
+}
+
+// circleMarker has no native drag; emulate with map mousemove while button held.
+// Position drag → translate (x,y); tip drag → rotate (theta).
+function bindPathAnchorDrag() {
+  const rooftopXY = () => ({
+    lat0: parseFloat($('lat').value),
+    lon0: parseFloat($('lon').value),
+    bearing: parseFloat($('bearing').value),
+  });
+  const latlonToLocal = (latlng, lat0, lon0, bearingDeg) => {
+    const b = bearingDeg * Math.PI/180;
+    const dlat = (latlng.lat - lat0) * Math.PI/180;
+    const dlon = (latlng.lng - lon0) * Math.PI/180;
+    const north = dlat * EARTH_R;
+    const east  = dlon * EARTH_R * Math.cos(lat0*Math.PI/180);
+    // localToLatLon used [east, north] = [x*sin(b) - y*cos(b), x*cos(b) + y*sin(b)],
+    // so invert: x = east*sin(b) + north*cos(b); y = -east*cos(b) + north*sin(b).
+    return [east*Math.sin(b) + north*Math.cos(b), -east*Math.cos(b) + north*Math.sin(b)];
+  };
+
+  pathAnchorPosMarker.on('mousedown', () => {
+    map.dragging.disable();
+    const move = (e) => {
+      const { lat0, lon0, bearing } = rooftopXY();
+      const [nx, ny] = latlonToLocal(e.latlng, lat0, lon0, bearing);
+      pathAnchor.x = nx;
+      pathAnchor.y = ny;
+      syncAnchorInputs();
+      redraw();
+      persistCurve();
+    };
+    const up = () => { map.off('mousemove', move); map.off('mouseup', up); map.dragging.enable(); };
+    map.on('mousemove', move); map.on('mouseup', up);
+  });
+
+  pathAnchorTipMarker.on('mousedown', () => {
+    map.dragging.disable();
+    const move = (e) => {
+      const { lat0, lon0, bearing } = rooftopXY();
+      const [tx, ty] = latlonToLocal(e.latlng, lat0, lon0, bearing);
+      pathAnchor.theta = Math.atan2(ty - pathAnchor.y, tx - pathAnchor.x);
+      syncAnchorInputs();
+      redraw();
+      persistCurve();
+    };
+    const up = () => { map.off('mousemove', move); map.off('mouseup', up); map.dragging.enable(); };
+    map.on('mousemove', move); map.on('mouseup', up);
+  });
 }
 
 // ---------------- Export ----------------
@@ -843,6 +964,7 @@ function onOdom(msg) {
   const y = msg.pose.pose.position.y;
   const q = msg.pose.pose.orientation;
   const yaw = Math.atan2(2*(q.w*q.z + q.x*q.y), 1 - 2*(q.y*q.y + q.z*q.z));
+  lastRobotOdom = { x, y, theta: yaw, t: lastOdomTime };
   drawRobot(x, y, yaw);
 }
 
@@ -916,9 +1038,15 @@ function pause()  { if (topicEstop) topicEstop.publish(new ROSLIB.Message({ data
 function resume() { if (topicEstop) topicEstop.publish(new ROSLIB.Message({ data: false })); }
 
 function stopScenario() {
-  // Latch E-stop for safety, then reset the follower's loaded path.
+  // Latch E-stop for safety, reset the running follower's loaded path,
+  // AND clear the latched /reference_path message so a follower restart
+  // can't pick up the cached path and resume on its own.
   if (topicEstop) topicEstop.publish(new ROSLIB.Message({ data: true }));
   if (topicReset) topicReset.publish(new ROSLIB.Message({ data: true }));
+  if (topicRefPath) topicRefPath.publish(new ROSLIB.Message({
+    header: { frame_id: 'odom', stamp: { sec: 0, nanosec: 0 } },
+    poses: []
+  }));
   $('push-state').textContent = 'scenario stopped';
 }
 
@@ -966,6 +1094,7 @@ function persistCurve() {
       lat: s.lat0, lon: s.lon0, bearing: s.bearing,
       Llong: s.Llong, Lshort: s.Lshort,
       vspeed: parseFloat($('vspeed').value),
+      anchor: { ...pathAnchor },
     }));
   } catch (e) {}
 }
@@ -983,6 +1112,14 @@ function restoreCurve() {
     if (c.vspeed != null) {
       $('vspeed').value = c.vspeed;
       $('vspeed-val').textContent = parseFloat(c.vspeed).toFixed(2);
+    }
+    if (c.anchor) {
+      pathAnchor = {
+        x: c.anchor.x ?? 0,
+        y: c.anchor.y ?? 0,
+        theta: c.anchor.theta ?? 0,
+      };
+      syncAnchorInputs();
     }
     buildParamUI($('family').value);
     if (c.params) {
@@ -1027,6 +1164,35 @@ $('btn-resume').onclick = resume;
 $('btn-stop').onclick = stopScenario;
 $('btn-recenter').onclick = recenterOnRobot;
 $('btn-teleop').onclick = toggleTeleopPanel;
+
+// Path anchor wire-up
+['anchor-x','anchor-y','anchor-th'].forEach(id => {
+  $(id).addEventListener('input', () => {
+    pathAnchor.x = parseFloat($('anchor-x').value) || 0;
+    pathAnchor.y = parseFloat($('anchor-y').value) || 0;
+    pathAnchor.theta = (parseFloat($('anchor-th').value) || 0) * Math.PI/180;
+    redraw();
+    persistCurve();
+  });
+});
+$('btn-anchor-snap').onclick = () => {
+  if (!lastRobotOdom.t || (Date.now() - lastRobotOdom.t > 3000)) {
+    alert('no recent robot odom (need /wheel/odom flowing)');
+    return;
+  }
+  pathAnchor.x = lastRobotOdom.x;
+  pathAnchor.y = lastRobotOdom.y;
+  pathAnchor.theta = lastRobotOdom.theta;
+  syncAnchorInputs();
+  redraw();
+  persistCurve();
+};
+$('btn-anchor-reset').onclick = () => {
+  pathAnchor = { x: 0, y: 0, theta: 0 };
+  syncAnchorInputs();
+  redraw();
+  persistCurve();
+};
 $('teleop-close').onclick = () => setTeleopShown(false);
 $('estop-btn').onclick = toggleEstop;
 
@@ -1057,6 +1223,12 @@ function setTeleopShown(on) {
     Object.keys(teleopKeys).forEach(k => { teleopKeys[k] = false; });
     refreshTeleopKeys();
     teleopPublishZero();
+    // Tear down the publisher so a stale handle can't keep advertising
+    // /cmd_vel_raw across page reloads or panel toggles.
+    if (teleopPub) {
+      try { teleopPub.unadvertise(); } catch (_) {}
+      teleopPub = null;
+    }
   }
 }
 function toggleTeleopPanel() { setTeleopShown(!teleopShown); }
@@ -1095,8 +1267,13 @@ function teleopPublish(lin, ang) {
 }
 function teleopPublishZero() { teleopPublish(0, 0); }
 
+// Republish the held-key twist at 20 Hz so press-and-hold keeps the robot
+// moving. Skip when no key is held — otherwise we'd race the path_follower's
+// /cmd_vel_raw stream with zero-twists and stutter the wheels at ~40 Hz.
+// Keyup already emits a single zero on the all-released edge.
 setInterval(() => {
   if (!teleopShown || !teleopPub) return;
+  if (!teleopKeys.w && !teleopKeys.a && !teleopKeys.s && !teleopKeys.d) return;
   const { lin, ang } = teleopComputeTwist();
   teleopPublish(lin, ang);
 }, 50);

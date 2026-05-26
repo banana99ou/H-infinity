@@ -38,8 +38,12 @@ verifying in between.
 ## Robot
 
 - Host: `agilex-nuc12wski7`, user `agilex`.
-- SSH password is handled via `expect` (sshpass is not installed on the laptop).
-  The literal password is not stored in this repo; it is shared per-session.
+- SSH/rsync use `expect` (`sshpass` is not installed on the laptop). The
+  `agilex` user/sudo password is **documented in this repo** at
+  `DOC/network_topology.md` (not held only per-session, as previously stated
+  here). Note: SSH may also authenticate via **Tailscale SSH**, in which case
+  the `expect`-sent password is a no-op. To honor a no-secrets-in-repo policy
+  instead, scrub it from `network_topology.md` and share it per-session.
 - NUC repo path: `/home/agilex/H-infinity/` (outside the colcon tree).
 - NUC workspace: `/home/agilex/agilex_ws/` (ROS2 Humble).
 - The package is visible to colcon via this symlink — recreate if it is ever

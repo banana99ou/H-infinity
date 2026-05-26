@@ -96,19 +96,34 @@ from std_msgs.msg import String
 import importlib.util as _ilu
 
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
-# repo root: .../H-infinity ; node is at scalecar-vfg-h-infinite/ros2_bridge/
-#   limo_path_follower/reposition_node.py
-_REPO_ROOT = os.path.abspath(os.path.join(_THIS_DIR, '..', '..', '..'))
+# Resolve the H-infinity repo root. path_overlay.py (tools/, battle station) and
+# scenarios/ are NOT installed into the colcon tree, so the __file__-relative
+# path only works in-source; once colcon copies this node into install/, it
+# breaks. Try: env override, the known NUC repo root (the repo hardcodes
+# /home/agilex/H-infinity elsewhere too, e.g. estop in orchestrator PROCS), then
+# the in-source layout (laptop / rsync'd tree). First whose path_overlay exists.
+_ROOT_CANDIDATES = [p for p in [
+    os.environ.get('H_INFINITY_ROOT'),
+    '/home/agilex/H-infinity',
+    os.path.abspath(os.path.join(_THIS_DIR, '..', '..', '..')),
+] if p]
+_REPO_ROOT = next(
+    (p for p in _ROOT_CANDIDATES
+     if os.path.isfile(os.path.join(p, 'tools', 'path_gen', 'path_overlay.py'))),
+    _ROOT_CANDIDATES[-1])
 _PATH_OVERLAY = os.path.join(_REPO_ROOT, 'tools', 'path_gen', 'path_overlay.py')
 
 
 def _load_path_overlay():
-    """Import tools/path_gen/path_overlay.py by path (it is not a package).
-
-    Returns the module, or raises ImportError. The node degrades gracefully:
-    if the geo helpers are unavailable, it refuses to plan (reports an abort
-    reason) rather than fabricate coordinates.
+    """Import tools/path_gen/path_overlay.py by file location (not a colcon
+    package, so not on the ament path / not installed). Returns the module or
+    raises ImportError. The node degrades gracefully: if the geo helpers are
+    unavailable it refuses to plan (reports an abort reason) rather than
+    fabricate coordinates.
     """
+    if not os.path.isfile(_PATH_OVERLAY):
+        raise ImportError(f'path_overlay.py not found at {_PATH_OVERLAY} '
+                          f'(tried roots: {", ".join(_ROOT_CANDIDATES)})')
     spec = _ilu.spec_from_file_location('h_path_overlay', _PATH_OVERLAY)
     if spec is None or spec.loader is None:
         raise ImportError(f'cannot load path_overlay from {_PATH_OVERLAY}')

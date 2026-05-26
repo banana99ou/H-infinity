@@ -1,0 +1,56 @@
+# Experiment definition for the H-infinity curvature-sweep dataset (T6 / O2).
+#
+# The sequencer (experiment_sequencer_node) reads this file + the referenced
+# venue JSON, expands the matrix x repetitions into a cell list, and drives the
+# full batch unattended. See DOC/experiment.md (matrix + operational model) and
+# DOC/system_spec.md §3.6/§5.
+#
+# Schema (consumed by ExperimentSequencer._load_yaml / _build_cells):
+#   run_id        : str   — names the batch; pairs the checkpoint + sidecars.
+#   venue         : str   — path (repo-relative or absolute) to the venue JSON.
+#   matrix        : map of axis -> list; cartesian product = the cells.
+#                   axes: radius_m, controller, v_const, path_family.
+#   repetitions   : int   — N per cell (the matrix is replicated N times).
+#   gating        : battery + RTK thresholds (M1/M2/F3).
+#   retry         : max_retries (O4) + circuit_breaker_k (F4).
+#   ntfy          : notification channel (T8); topic "" disables push.
+
+run_id: rooftop_sweep_v1
+
+# Venue geometry (corners, exclusions, start/end pins) — see T5.
+# PLACEHOLDER geometry today; re-pin from live RTK before a real batch.
+venue: scenarios/venues/rooftop.json
+
+# The headline curvature sweep at fixed speed (DOC/experiment.md matrix).
+# Full paper matrix is 2 controllers x 2 speeds x 2 families x 4 radii x N=10
+# = 320 runs. Start SMALL on the robot (one controller, one radius, N=1) and
+# widen once a full cell verifies end-to-end.
+matrix:
+  radius_m: [1.0, 0.7, 0.5, 0.4]
+  controller: [lpv-hinf, pid]
+  v_const: [1.0, 0.5]
+  path_family: [step, slalom]
+
+repetitions: 10
+
+gating:
+  # Battery is reported in VOLTS on /limo_status.battery_voltage (hw-confirmed:
+  # ~12.0 V healthy). %->V mapping is an open item; these align with preflight's
+  # warn/halt (10.8/10.5). TODO(hw-verify): confirm the volt thresholds.
+  battery_volts_warn: 11.0
+  battery_volts_halt: 10.5
+  # Per-run acceptance: RTK FIXED (quality=4) for >= this % of the run window
+  # (system_spec §5 "FIXED for >= Y%"). TODO(hw-verify): confirm Y.
+  rtk_run_window_pct: 95
+
+retry:
+  # Auto-retry a failed leg this many times before skipping the cell (O4).
+  max_retries: 1
+  # Halt the whole batch after this many consecutive leg failures (F4).
+  circuit_breaker_k: 3
+
+ntfy:
+  # T8 channel. Leave topic "" to disable push (sequencer imports ntfy
+  # defensively; a missing module or empty topic is a no-op, never a crash).
+  server: https://ntfy.sh
+  topic: ""

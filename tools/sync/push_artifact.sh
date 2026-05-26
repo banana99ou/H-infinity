@@ -30,7 +30,9 @@ base="$(basename "$BAG")"
 # re-establishes, and a retry succeeds. ConnectionAttempts retries the connect
 # within one ssh call; SSH_OPTS is reused for both the rsync transport and the
 # remote-commit. Keep ConnectTimeout modest so N attempts stay bounded.
-SSH_OPTS="-o BatchMode=yes -o ConnectTimeout=12 -o ConnectionAttempts=4"
+# accept-new: trust a new target's host key on first contact (trusted Tailscale
+# mesh) instead of failing BatchMode with "Host key verification failed".
+SSH_OPTS="-o BatchMode=yes -o ConnectTimeout=12 -o ConnectionAttempts=4 -o StrictHostKeyChecking=accept-new"
 # Plus an outer retry around the whole rsync, for a flap that drops mid-connect.
 RETRIES=3
 

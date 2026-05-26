@@ -248,6 +248,53 @@
     </div>
     <textarea id="export_text" placeholder="exported text appears here" readonly></textarea>
 
+    <!-- ============================================================
+         T5 — Venue / working-area editor (V1-V4). Modular block:
+         all venue state lives in the `venue` object and venue* funcs;
+         a later merge (T10 batch-progress) can sit alongside untouched.
+         ============================================================ -->
+    <h3>Venue / working area</h3>
+    <div class="small">
+      Live RTK: <span class="dot" id="rtk-dot"></span><span id="rtk-state">--</span>
+    </div>
+    <div class="row" style="margin-top:6px;">
+      <button id="btn-venue-pin" class="primary">Pin corner (live RTK)</button>
+      <button id="btn-venue-clear-corners">Clear corners</button>
+    </div>
+    <div class="small" id="venue-corner-state">corners: 0 / 4</div>
+    <label style="margin-top:6px;">safety margin (m)
+      <span class="pill" id="venue-margin-val">0.50</span>
+      <input type="range" id="venue-margin" min="0.0" max="2.0" step="0.05" value="0.50">
+    </label>
+    <div class="row" style="margin-top:6px;">
+      <button id="btn-venue-add-excl">Add exclusion (live RTK)</button>
+      <button id="btn-venue-clear-excl">Clear exclusions</button>
+    </div>
+    <label style="margin-top:4px;">exclusion radius (m)
+      <span class="pill" id="venue-excl-r-val">2.00</span>
+      <input type="range" id="venue-excl-r" min="0.2" max="8.0" step="0.1" value="2.0">
+    </label>
+    <div class="small" id="venue-excl-state">exclusions: 0</div>
+    <div class="row" style="margin-top:6px;">
+      <button id="btn-venue-add-start">Add start pin (live RTK)</button>
+      <button id="btn-venue-add-end">Add end pin (live RTK)</button>
+    </div>
+    <div class="row" style="margin-top:6px;">
+      <button id="btn-venue-clear-pins">Clear start/end pins</button>
+      <button id="btn-venue-validate">Validate current curve</button>
+    </div>
+    <div class="small" id="venue-pin-state">pins: 0 start / 0 end</div>
+    <div class="stat" id="venue-validate-state">(validate to check fit + clearance)</div>
+    <div class="row" style="margin-top:6px;">
+      <button id="btn-venue-load">Load rooftop.json</button>
+      <button id="btn-venue-export" class="primary">Export venue JSON</button>
+    </div>
+    <div class="small">
+      Pin actions capture the live <code>/gps_rtk_f9p_helical/gps/fix</code> at click.
+      Drag start/end dots to move; drag the cyan tip to set heading. Inset polygon =
+      corners minus margin; curves must fit it and clear all exclusions.
+    </div>
+
     <h3>Basemap</h3>
     <select id="basemap">
       <option value="osm" selected>OpenStreetMap</option>
@@ -657,6 +704,9 @@ function redraw() {
   // Path anchor pose marker (cyan): draggable position + heading-tip handle.
   drawPathAnchorMarker(lat0, lon0, bearing);
 
+  // Venue overlay shares this frame — repaint it whenever the anchor moves.
+  if (typeof drawVenue === 'function') drawVenue();
+
   window._state = {
     family, params: { ...currentParams }, lat0, lon0, bearing, Llong, Lshort,
     pts, pathLL, trackLL,
@@ -803,6 +853,7 @@ let ros = null;
 let topicEstop = null, topicEstopState = null, topicRefPath = null, topicReset = null;
 let topicOdom = null, topicStatus = null;
 let topicOrchStart = null, topicOrchKill = null, topicOrchStatus = null;
+let topicRtkFix = null;
 let setParamsService = null;
 let lastOdomTime = 0, lastStatusTime = 0, odomCount = 0, statusCount = 0;
 let odomRateTimer = null;
@@ -905,6 +956,24 @@ function subscribeAll() {
     ros, name: '/orchestrator/status', messageType: 'std_msgs/String'
   });
   topicOrchStatus.subscribe(onOrchStatus);
+
+  // T5 — live RTK fix for corner/exclusion/pin capture (V2).
+  topicRtkFix = new ROSLIB.Topic({
+    ros, name: '/gps_rtk_f9p_helical/gps/fix',
+    messageType: 'sensor_msgs/msg/NavSatFix'
+  });
+  topicRtkFix.subscribe(onRtkFix);
+
+  // FIXED/FLOAT is NOT distinguishable from NavSatFix.status on this F9P
+  // (it reads -1/0 even when the driver reports RTK). The authoritative
+  // signal is the driver's rtk_status string, e.g.
+  //   "FIX: RTK FIXED (quality=4, sats=..., ...)".  (hw-confirmed 2026-05-26
+  //   on the live graph; literal quality=4 still pending an open-sky FIXED.)
+  topicRtkStatus = new ROSLIB.Topic({
+    ros, name: '/gps_rtk_f9p_helical/gps/rtk_status',
+    messageType: 'std_msgs/msg/String'
+  });
+  topicRtkStatus.subscribe(onRtkStatus);
 
   // Path-follower v_const setter
   setParamsService = new ROSLIB.Service({
@@ -1083,6 +1152,364 @@ function setVConst(v) {
     $('vspeed-state').innerHTML = `<span class="err">service error: ${err}</span>`;
   });
 }
+
+// ============================================================
+// T5 — Venue / working-area editor (V1-V4)
+// Self-contained module. State lives in `venue`; rendering in
+// drawVenue(); RTK capture in onRtkFix()+lastRtkFix. Reuses
+// localToLatLon / genPath / analyze and the heading-tip marker idiom.
+// ============================================================
+
+// Latest live RTK fix from /gps_rtk_f9p_helical/gps/fix (lat/lon for pinning).
+// FIXED determination comes from the rtk_status string, NOT NavSatFix.status
+// (which stays -1/0 on this F9P even under RTK) — see onRtkStatus below.
+let lastRtkFix = { lat: null, lon: null, status: null, t: 0 };
+
+// Latest parsed RTK quality from the rtk_status string topic.
+let lastRtkStatus = { quality: null, raw: '', t: 0 };
+let topicRtkStatus = null;
+
+// Quality int that denotes RTK FIXED on the F9P (driver fix_quality_to_desc:
+// 4 = "RTK FIXED", 5 = "FLOAT"). hw-confirmed: rtk_status is the right source
+// and carries a "quality=N" token; the literal 4 still wants an open-sky FIXED
+// to confirm end-to-end. See DOC/gap_analysis.md Part C #3.
+const RTK_FIXED_QUALITY = 4;
+
+function onRtkStatus(msg) {
+  const m = /quality=(\d+)/.exec(msg.data || '');
+  lastRtkStatus = {
+    quality: m ? parseInt(m[1], 10) : null,
+    raw: msg.data || '',
+    t: Date.now(),
+  };
+}
+
+function rtkIsFixed() {
+  return lastRtkStatus.quality === RTK_FIXED_QUALITY &&
+         (Date.now() - lastRtkStatus.t) < 3000;
+}
+
+const venue = {
+  name: 'rooftop',
+  frame: 'rtk_enu',
+  corners: [],          // [{lat, lon}] up to 4, in pin order
+  safety_margin_m: 0.5,
+  exclusions: [],       // [{kind:'circle', lat, lon, radius_m}]
+  start_pins: [],       // [{id, lat, lon, heading_deg}]
+  end_pins: [],         // [{id, lat, lon, heading_deg}]
+};
+
+// Leaflet layers owned by the venue module (kept separate from path layers).
+let venueRectLayer = null, venueInsetLayer = null;
+let venueCornerMarkers = [];
+let venueExclLayers = [];
+let venuePinLayers = [];   // {posMarker, tipMarker, line, ref} per start/end pin
+
+function onRtkFix(msg) {
+  lastRtkFix = {
+    lat: msg.latitude, lon: msg.longitude,
+    status: (msg.status && msg.status.status !== undefined) ? msg.status.status : null,
+    t: Date.now(),
+  };
+  const fresh = (Date.now() - lastRtkFix.t) < 2000;
+  setDot('rtk-dot', (fresh && rtkIsFixed()) ? 'ok' : 'bad');
+  const q = (lastRtkStatus.quality !== null) ? lastRtkStatus.quality : '?';
+  const label = rtkIsFixed() ? 'FIXED' : `not FIXED (quality=${q})`;
+  $('rtk-state').textContent =
+    `${lastRtkFix.lat.toFixed(8)}, ${lastRtkFix.lon.toFixed(8)} — ${label}`;
+}
+
+function rtkFresh() { return lastRtkFix.lat !== null && (Date.now() - lastRtkFix.t) < 3000; }
+
+function captureRtkOrAlert(what) {
+  if (!rtkFresh()) {
+    alert(`no fresh RTK fix on /gps_rtk_f9p_helical/gps/fix — cannot ${what}`);
+    return null;
+  }
+  return { lat: lastRtkFix.lat, lon: lastRtkFix.lon };
+}
+
+// ---- Geometry helpers (meters via the file's small-angle ENU) ----
+// Reuse the same anchor the rest of the file uses so venue + path overlay
+// stay in one frame. latlonToLocal is the inverse of localToLatLon.
+function venueAnchor() {
+  return {
+    lat0: parseFloat($('lat').value),
+    lon0: parseFloat($('lon').value),
+    bearing: parseFloat($('bearing').value),
+  };
+}
+function latlonToLocalXY(lat, lon, lat0, lon0, bearingDeg) {
+  const b = bearingDeg * Math.PI/180;
+  const north = (lat - lat0) * Math.PI/180 * EARTH_R;
+  const east  = (lon - lon0) * Math.PI/180 * EARTH_R * Math.cos(lat0*Math.PI/180);
+  // invert localToLatLon's [east, north] = [x*sin(b) - y*cos(b), x*cos(b) + y*sin(b)]
+  return [east*Math.sin(b) + north*Math.cos(b), -east*Math.cos(b) + north*Math.sin(b)];
+}
+function cornersLocalXY() {
+  const { lat0, lon0, bearing } = venueAnchor();
+  return venue.corners.map(c => latlonToLocalXY(c.lat, c.lon, lat0, lon0, bearing));
+}
+
+// Inset polygon = convex-ordered corners pulled inward by the margin.
+// Works for a (roughly) convex quad; we order corners CCW first.
+function orderCCW(poly) {
+  const cx = poly.reduce((s,p)=>s+p[0],0)/poly.length;
+  const cy = poly.reduce((s,p)=>s+p[1],0)/poly.length;
+  return [...poly].sort((a,b)=>Math.atan2(a[1]-cy,a[0]-cx)-Math.atan2(b[1]-cy,b[0]-cx));
+}
+function insetPolygonXY(margin) {
+  if (venue.corners.length < 3) return [];
+  const poly = orderCCW(cornersLocalXY());
+  const cx = poly.reduce((s,p)=>s+p[0],0)/poly.length;
+  const cy = poly.reduce((s,p)=>s+p[1],0)/poly.length;
+  // Pull each vertex toward the centroid by `margin` measured along its ray.
+  return poly.map(([x,y]) => {
+    const dx = x-cx, dy = y-cy, d = Math.hypot(dx,dy);
+    if (d < 1e-6) return [x,y];
+    const k = Math.max(0, d - margin) / d;
+    return [cx + dx*k, cy + dy*k];
+  });
+}
+function pointInPolygon(pt, poly) {
+  let inside = false;
+  for (let i=0, j=poly.length-1; i<poly.length; j=i++) {
+    const xi=poly[i][0], yi=poly[i][1], xj=poly[j][0], yj=poly[j][1];
+    const hit = ((yi>pt[1]) !== (yj>pt[1])) &&
+                (pt[0] < (xj-xi)*(pt[1]-yi)/(yj-yi)+xi);
+    if (hit) inside = !inside;
+  }
+  return inside;
+}
+
+// ---- Validation (V4): every sampled path point must sit inside the inset
+//      polygon AND outside every exclusion (radius + margin clearance). ----
+function validateCurveAgainstVenue() {
+  const s = window._state;
+  if (!s || !s.pts || s.pts.length < 2) {
+    return { ok: false, reason: 'no current curve to validate' };
+  }
+  if (venue.corners.length < 3) {
+    return { ok: false, reason: `need >= 3 corners pinned (have ${venue.corners.length})` };
+  }
+  const { lat0, lon0, bearing } = venueAnchor();
+  const inset = insetPolygonXY(venue.safety_margin_m);
+  // s.pts are already in the path-overlay local frame, same frame as inset.
+  const exclXY = venue.exclusions.map(e => ({
+    c: latlonToLocalXY(e.lat, e.lon, lat0, lon0, bearing),
+    r: e.radius_m,
+  }));
+  let outCount = 0, exclHit = 0;
+  for (const p of s.pts) {
+    if (!pointInPolygon(p, inset)) outCount++;
+    for (const e of exclXY) {
+      const d = Math.hypot(p[0]-e.c[0], p[1]-e.c[1]);
+      if (d < e.r + venue.safety_margin_m) { exclHit++; break; }
+    }
+  }
+  if (outCount > 0) return { ok: false, reason: `${outCount}/${s.pts.length} points outside inset polygon` };
+  if (exclHit > 0)  return { ok: false, reason: `${exclHit}/${s.pts.length} points violate an exclusion (+margin)` };
+  return { ok: true, reason: `all ${s.pts.length} points inside inset & clear of ${exclXY.length} exclusion(s)` };
+}
+
+// ---- Rendering ----
+function drawVenue() {
+  const { lat0, lon0, bearing } = venueAnchor();
+
+  // Clear prior venue layers.
+  if (venueRectLayer)  { map.removeLayer(venueRectLayer);  venueRectLayer = null; }
+  if (venueInsetLayer) { map.removeLayer(venueInsetLayer); venueInsetLayer = null; }
+  venueCornerMarkers.forEach(m => map.removeLayer(m)); venueCornerMarkers = [];
+  venueExclLayers.forEach(l => map.removeLayer(l)); venueExclLayers = [];
+  venuePinLayers.forEach(p => { map.removeLayer(p.posMarker); map.removeLayer(p.tipMarker); map.removeLayer(p.line); });
+  venuePinLayers = [];
+
+  // Corner rectangle (pinned corners, ordered) + inset polygon.
+  if (venue.corners.length >= 1) {
+    venue.corners.forEach((c, i) => {
+      const m = L.circleMarker([c.lat, c.lon], {
+        radius: 6, color: '#ff0', weight: 2, fillColor: '#ff0', fillOpacity: 0.6,
+        title: `corner ${i+1}`
+      }).addTo(map);
+      venueCornerMarkers.push(m);
+    });
+  }
+  if (venue.corners.length >= 3) {
+    const ordered = orderCCW(cornersLocalXY());
+    const rectLL = ordered.map(xy => localToLatLon(xy, lat0, lon0, bearing));
+    venueRectLayer = L.polygon(rectLL, { color: '#ff0', weight: 2, fill: false }).addTo(map);
+    const insetLL = insetPolygonXY(venue.safety_margin_m).map(xy => localToLatLon(xy, lat0, lon0, bearing));
+    venueInsetLayer = L.polygon(insetLL, { color: '#0f0', weight: 2, dashArray: '5 5', fill: false }).addTo(map);
+  }
+
+  // Circular exclusions.
+  venue.exclusions.forEach((e) => {
+    const c = L.circle([e.lat, e.lon], {
+      radius: e.radius_m, color: '#f33', weight: 2, fillColor: '#f33', fillOpacity: 0.2
+    }).addTo(map);
+    venueExclLayers.push(c);
+  });
+
+  // Start/end pins: draggable pos + heading tip (reuse the cyan tip idiom).
+  const TIP_LEN = 0.8; // metres
+  const drawPin = (ref, color) => {
+    const posXY = latlonToLocalXY(ref.lat, ref.lon, lat0, lon0, bearing);
+    const hd = ref.heading_deg * Math.PI/180;
+    // heading is compass-relative; in local frame +x is `bearing`, so the
+    // local angle of a compass heading is (heading - bearing).
+    const localAng = (ref.heading_deg - bearing) * Math.PI/180;
+    const tipXY = [posXY[0] + TIP_LEN*Math.cos(localAng), posXY[1] + TIP_LEN*Math.sin(localAng)];
+    const posLL = localToLatLon(posXY, lat0, lon0, bearing);
+    const tipLL = localToLatLon(tipXY, lat0, lon0, bearing);
+    const line = L.polyline([posLL, tipLL], { color, weight: 2, dashArray: '3 3', interactive: false }).addTo(map);
+    const posMarker = L.circleMarker(posLL, {
+      radius: 7, color, weight: 3, fillColor: color, fillOpacity: 0.5, pane: 'markerPane', interactive: true,
+    }).addTo(map).bindTooltip(`${ref.id} (${ref._kind})`);
+    const tipMarker = L.circleMarker(tipLL, {
+      radius: 5, color, weight: 2, fillColor: color, fillOpacity: 0.0, pane: 'markerPane', interactive: true,
+    }).addTo(map);
+    bindVenuePinDrag(posMarker, tipMarker, ref);
+    venuePinLayers.push({ posMarker, tipMarker, line, ref });
+  };
+  venue.start_pins.forEach(p => drawPin({ ...p, _kind: 'start' }, '#0f8'));
+  venue.end_pins.forEach(p => drawPin({ ...p, _kind: 'end' }, '#f80'));
+
+  // Update readouts.
+  $('venue-corner-state').textContent = `corners: ${venue.corners.length} / 4`;
+  $('venue-excl-state').textContent = `exclusions: ${venue.exclusions.length}`;
+  $('venue-pin-state').textContent = `pins: ${venue.start_pins.length} start / ${venue.end_pins.length} end`;
+}
+
+// Drag pos to move pin; drag tip to set heading (compass deg). Mutates the
+// underlying ref object (which is the same array entry in venue.*).
+function bindVenuePinDrag(posMarker, tipMarker, ref) {
+  posMarker.on('mousedown', () => {
+    map.dragging.disable();
+    const move = (e) => {
+      const { lat0, lon0, bearing } = venueAnchor();
+      // find the real entry in venue arrays and update its lat/lon
+      const arr = ref._kind === 'start' ? venue.start_pins : venue.end_pins;
+      const real = arr.find(x => x.id === ref.id);
+      if (real) { real.lat = e.latlng.lat; real.lon = e.latlng.lng; }
+      drawVenue();
+    };
+    const up = () => { map.off('mousemove', move); map.off('mouseup', up); map.dragging.enable(); };
+    map.on('mousemove', move); map.on('mouseup', up);
+  });
+  tipMarker.on('mousedown', () => {
+    map.dragging.disable();
+    const move = (e) => {
+      const { lat0, lon0, bearing } = venueAnchor();
+      const arr = ref._kind === 'start' ? venue.start_pins : venue.end_pins;
+      const real = arr.find(x => x.id === ref.id);
+      if (!real) return;
+      const pos = latlonToLocalXY(real.lat, real.lon, lat0, lon0, bearing);
+      const tip = latlonToLocalXY(e.latlng.lat, e.latlng.lng, lat0, lon0, bearing);
+      const localAng = Math.atan2(tip[1]-pos[1], tip[0]-pos[0]);
+      // back to compass heading: heading = localAng + bearing
+      let hdg = (localAng * 180/Math.PI) + bearing;
+      hdg = ((hdg % 360) + 360) % 360;
+      real.heading_deg = parseFloat(hdg.toFixed(1));
+      drawVenue();
+    };
+    const up = () => { map.off('mousemove', move); map.off('mouseup', up); map.dragging.enable(); };
+    map.on('mousemove', move); map.on('mouseup', up);
+  });
+}
+
+// ---- Export / load ----
+function venueToJSON() {
+  return {
+    name: venue.name,
+    frame: venue.frame,
+    corners_wgs84: venue.corners.map(c => ({ lat: c.lat, lon: c.lon })),
+    safety_margin_m: venue.safety_margin_m,
+    exclusions: venue.exclusions.map(e => ({ kind: 'circle', lat: e.lat, lon: e.lon, radius_m: e.radius_m })),
+    start_pins: venue.start_pins.map(p => ({ id: p.id, lat: p.lat, lon: p.lon, heading_deg: p.heading_deg })),
+    end_pins:   venue.end_pins.map(p => ({ id: p.id, lat: p.lat, lon: p.lon, heading_deg: p.heading_deg })),
+  };
+}
+function exportVenueJSON() {
+  const txt = JSON.stringify(venueToJSON(), null, 2);
+  download(`venue_${venue.name}.json`, txt);
+  $('export_text').value = txt;
+}
+function loadVenueObject(v) {
+  venue.name = v.name || 'rooftop';
+  venue.frame = v.frame || 'rtk_enu';
+  venue.corners = (v.corners_wgs84 || []).map(c => ({ lat: c.lat, lon: c.lon }));
+  venue.safety_margin_m = v.safety_margin_m != null ? v.safety_margin_m : 0.5;
+  venue.exclusions = (v.exclusions || []).map(e => ({ kind: 'circle', lat: e.lat, lon: e.lon, radius_m: e.radius_m }));
+  venue.start_pins = (v.start_pins || []).map(p => ({ id: p.id, lat: p.lat, lon: p.lon, heading_deg: p.heading_deg }));
+  venue.end_pins   = (v.end_pins   || []).map(p => ({ id: p.id, lat: p.lat, lon: p.lon, heading_deg: p.heading_deg }));
+  $('venue-margin').value = venue.safety_margin_m;
+  $('venue-margin-val').textContent = venue.safety_margin_m.toFixed(2);
+  drawVenue();
+}
+
+// ---- Venue UI wire-up ----
+let venueStartCount = 0, venueEndCount = 0;
+function nextPinId(kind) {
+  return kind === 'start' ? `S${++venueStartCount}` : `E${++venueEndCount}`;
+}
+
+$('btn-venue-pin').onclick = () => {
+  if (venue.corners.length >= 4) { alert('already have 4 corners — clear first to re-pin'); return; }
+  const f = captureRtkOrAlert('pin corner');
+  if (!f) return;
+  venue.corners.push({ lat: f.lat, lon: f.lon });
+  drawVenue();
+};
+$('btn-venue-clear-corners').onclick = () => { venue.corners = []; drawVenue(); };
+$('venue-margin').oninput = (e) => {
+  venue.safety_margin_m = parseFloat(e.target.value);
+  $('venue-margin-val').textContent = venue.safety_margin_m.toFixed(2);
+  drawVenue();
+};
+$('venue-excl-r').oninput = (e) => {
+  $('venue-excl-r-val').textContent = parseFloat(e.target.value).toFixed(2);
+};
+$('btn-venue-add-excl').onclick = () => {
+  const f = captureRtkOrAlert('add exclusion');
+  if (!f) return;
+  venue.exclusions.push({ kind: 'circle', lat: f.lat, lon: f.lon, radius_m: parseFloat($('venue-excl-r').value) });
+  drawVenue();
+};
+$('btn-venue-clear-excl').onclick = () => { venue.exclusions = []; drawVenue(); };
+$('btn-venue-add-start').onclick = () => {
+  const f = captureRtkOrAlert('add start pin');
+  if (!f) return;
+  venue.start_pins.push({ id: nextPinId('start'), lat: f.lat, lon: f.lon, heading_deg: parseFloat($('bearing').value) });
+  drawVenue();
+};
+$('btn-venue-add-end').onclick = () => {
+  const f = captureRtkOrAlert('add end pin');
+  if (!f) return;
+  venue.end_pins.push({ id: nextPinId('end'), lat: f.lat, lon: f.lon, heading_deg: parseFloat($('bearing').value) });
+  drawVenue();
+};
+$('btn-venue-clear-pins').onclick = () => { venue.start_pins = []; venue.end_pins = []; venueStartCount = 0; venueEndCount = 0; drawVenue(); };
+$('btn-venue-validate').onclick = () => {
+  const r = validateCurveAgainstVenue();
+  $('venue-validate-state').innerHTML = r.ok
+    ? `<span class="ok">PASS — ${r.reason}</span>`
+    : `<span class="err">FAIL — ${r.reason}</span>`;
+};
+$('btn-venue-export').onclick = exportVenueJSON;
+$('btn-venue-load').onclick = () => {
+  const input = document.createElement('input');
+  input.type = 'file'; input.accept = '.json,application/json';
+  input.onchange = () => {
+    const file = input.files[0]; if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      try { loadVenueObject(JSON.parse(reader.result)); }
+      catch (e) { alert('venue JSON parse error: ' + e.message); }
+    };
+    reader.readAsText(file);
+  };
+  input.click();
+};
 
 // ---------------- localStorage persistence ----------------
 const LS_KEY = 'limo_battle_last_curve';

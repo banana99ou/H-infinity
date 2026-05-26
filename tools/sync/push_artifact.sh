@@ -40,10 +40,14 @@ push_one() {  # $1 = label, $2 = target "user@host:/path/"
   local label="$1" target="$2"
   [ -n "$target" ] || { echo "[push_artifact] $label: no target set, skip"; return 0; }
   echo "[push_artifact] -> $label : ${target}${base}"
-  # -s/--protect-args handles the space in "Experiment Data" (Linux rsync).
+  # The space in "Experiment Data" is passed RAW (no backslash, no -s). Modern
+  # rsync (the NUC sender, >=3.2.4) sends args literally (secluded-args), so the
+  # plain path lands correctly on both the NAS (modern) and the Mac (old 2.6.9,
+  # which rejects -s). Escaping the space here produced a literal 'Experiment\ Data'
+  # directory, so do NOT escape.
   local ok=0 attempt
   for attempt in $(seq 1 "$RETRIES"); do
-    if $NICE $IONICE rsync -azs $BWOPT \
+    if $NICE $IONICE rsync -az $BWOPT \
          -e "ssh $SSH_OPTS" --exclude='.git' \
          "$BAG" "$target"; then ok=1; break; fi
     echo "[push_artifact] $label rsync attempt $attempt/$RETRIES failed (path-flap?), retrying" >&2

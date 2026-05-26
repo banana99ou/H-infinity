@@ -206,6 +206,46 @@ def local_to_latlon(xy, anchor: Anchor):
     return np.column_stack([lat, lon])
 
 
+def latlon_to_local(latlon, anchor: Anchor):
+    """Inverse of ``local_to_latlon``: (lat, lon) deg -> local (x, y) m.
+
+    Uses the same small-angle ENU model and the same shared ``anchor`` so a
+    round-trip ``latlon_to_local(local_to_latlon(p))`` returns ``p`` to within
+    the linearisation error of the flat-earth approximation (sub-mm over the
+    rooftop's ~40 m extent).
+
+    Accepts a single ``(lat, lon)`` pair or an ``(N, 2)`` array; returns an
+    ``(N, 2)`` array of ``(x, y)``.
+
+    Forward map (see ``local_to_latlon``)::
+
+        east  = x * sin(b) - y * cos(b)
+        north = x * cos(b) + y * sin(b)
+
+    The 2x2 rotation taking (x, y) -> (east, north) is orthonormal, so its
+    inverse is its transpose::
+
+        x =  east * sin(b) + north * cos(b)
+        y = -east * cos(b) + north * sin(b)
+    """
+    bearing = math.radians(anchor.bearing_deg)
+
+    latlon = np.asarray(latlon, dtype=float)
+    lat = latlon[..., 0]
+    lon = latlon[..., 1]
+
+    dlat = lat - anchor.lat0
+    dlon = lon - anchor.lon0
+    north = dlat * (math.pi / 180.0) * EARTH_R
+    east = dlon * (math.pi / 180.0) * EARTH_R * math.cos(math.radians(anchor.lat0))
+
+    sb = math.sin(bearing)
+    cb = math.cos(bearing)
+    x = east * sb + north * cb
+    y = -east * cb + north * sb
+    return np.column_stack([x, y])
+
+
 # -----------------------------------------------------------------------------
 # Web Mercator tile math + Esri World Imagery fetcher
 # -----------------------------------------------------------------------------

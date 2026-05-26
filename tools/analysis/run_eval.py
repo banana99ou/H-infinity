@@ -79,10 +79,28 @@ except Exception as exc:  # pragma: no cover - defensive
 # Topic names (the recorded set — see Data_Logger.py TOPICS / the T7 contract).
 TOPIC_ODOM = "/wheel/odom"
 TOPIC_RTK_FIX = "/gps_rtk_f9p_helical/gps/fix"
+TOPIC_RTK_STATUS = "/gps_rtk_f9p_helical/gps/rtk_status"
+TOPIC_PIX_FIX = "/pixhawk/global_position/raw/fix"
 TOPIC_STATUS = "/path_follower/status"
 TOPIC_TIMING = "/path_follower/timing"
 TOPIC_CMD_VEL = "/cmd_vel"
 TOPIC_CMD_VEL_RAW = "/cmd_vel_raw"
+TOPIC_ESTOP = "/estop"
+
+# RTK FIXED is quality==4 on the rtk_status String (NavSatFix.status cannot
+# distinguish RTK on this F9P — feedback_rtk_and_venue). The driver formats
+# "... (quality=N, sats=...) ...".
+import re as _re
+_RTK_QUALITY_RE = _re.compile(r"quality=(\d+)")
+RTK_FIXED_QUALITY = 4
+
+
+def parse_rtk_quality(status_str):
+    """Extract the integer fix quality from an rtk_status String, or None."""
+    if not status_str:
+        return None
+    m = _RTK_QUALITY_RE.search(str(status_str))
+    return int(m.group(1)) if m else None
 
 # Status Float32MultiArray layout (path_follower_node.py:172-179, hw-verified).
 STATUS_LABELS = [
@@ -190,18 +208,24 @@ def read_bag(bag_dir):
     out = {
         TOPIC_ODOM: None,
         TOPIC_RTK_FIX: None,
+        TOPIC_RTK_STATUS: None,
+        TOPIC_PIX_FIX: None,
         TOPIC_STATUS: None,
         TOPIC_TIMING: None,
         TOPIC_CMD_VEL: None,
         TOPIC_CMD_VEL_RAW: None,
+        TOPIC_ESTOP: None,
     }
     # Accumulators
     odom = {"stamp": [], "x": [], "y": [], "yaw": [], "v": []}
-    rtk = {"stamp": [], "lat": [], "lon": [], "status": []}
+    rtk = {"stamp": [], "lat": [], "lon": [], "alt": [], "status": []}
+    rtk_status = {"stamp": [], "quality": []}
+    pix = {"stamp": [], "lat": [], "lon": [], "alt": []}
     status = {"stamp": [], "delta_cmd": [], "e_psi": [], "has_path": []}
     timing = {"stamp": [], "ms": []}
     cmd = {"stamp": [], "ang_z": [], "lin_x": []}
     cmd_raw = {"stamp": [], "ang_z": [], "lin_x": []}
+    estop = {"stamp": [], "active": []}
 
     want = set(out.keys())
 
@@ -223,7 +247,17 @@ def read_bag(bag_dir):
                 rtk["stamp"].append(t)
                 rtk["lat"].append(msg.latitude)
                 rtk["lon"].append(msg.longitude)
+                rtk["alt"].append(getattr(msg, "altitude", float("nan")))
                 rtk["status"].append(int(getattr(msg.status, "status", 0)))
+            elif topic == TOPIC_RTK_STATUS:
+                q = parse_rtk_quality(getattr(msg, "data", ""))
+                rtk_status["stamp"].append(t)
+                rtk_status["quality"].append(q if q is not None else -1)
+            elif topic == TOPIC_PIX_FIX:
+                pix["stamp"].append(t)
+                pix["lat"].append(msg.latitude)
+                pix["lon"].append(msg.longitude)
+                pix["alt"].append(getattr(msg, "altitude", float("nan")))
             elif topic == TOPIC_STATUS:
                 data = list(msg.data)
                 status["stamp"].append(t)
@@ -246,6 +280,9 @@ def read_bag(bag_dir):
                 cmd_raw["stamp"].append(t)
                 cmd_raw["ang_z"].append(msg.angular.z)
                 cmd_raw["lin_x"].append(msg.linear.x)
+            elif topic == TOPIC_ESTOP:
+                estop["stamp"].append(t)
+                estop["active"].append(1.0 if bool(msg.data) else 0.0)
 
     def _np(d):
         if not d["stamp"]:
@@ -254,11 +291,38 @@ def read_bag(bag_dir):
 
     out[TOPIC_ODOM] = _np(odom)
     out[TOPIC_RTK_FIX] = _np(rtk)
+    out[TOPIC_RTK_STATUS] = _np(rtk_status)
+    out[TOPIC_PIX_FIX] = _np(pix)
     out[TOPIC_STATUS] = _np(status)
     out[TOPIC_TIMING] = _np(timing)
     out[TOPIC_CMD_VEL] = _np(cmd)
     out[TOPIC_CMD_VEL_RAW] = _np(cmd_raw)
+    out[TOPIC_ESTOP] = _np(estop)
     return out
+
+
+def fixed_mask_for(fix_stamps, rtk_status, fixed_quality=RTK_FIXED_QUALITY):
+    """Boolean mask over fix_stamps: True where the nearest rtk_status is FIXED.
+
+    The rtk_status String topic carries the authoritative fix quality; match
+    each NavSatFix sample to the temporally-nearest rtk_status sample. If there
+    is no rtk_status topic at all, returns None (caller falls back to using
+    every fix, as before).
+    """
+    if rtk_status is None or len(rtk_status.get("stamp", [])) == 0:
+        return None
+    qs = np.asarray(rtk_status["stamp"], float)
+    qv = np.asarray(rtk_status["quality"], float)
+    order = np.argsort(qs)
+    qs, qv = qs[order], qv[order]
+    fix_stamps = np.asarray(fix_stamps, float)
+    idx = np.searchsorted(qs, fix_stamps)
+    idx = np.clip(idx, 0, len(qs) - 1)
+    # pick nearer of idx and idx-1
+    left = np.clip(idx - 1, 0, len(qs) - 1)
+    pick = np.where(np.abs(qs[idx] - fix_stamps) <= np.abs(fix_stamps - qs[left]),
+                    idx, left)
+    return qv[pick] == fixed_quality
 
 
 def _yaw_from_quat(x, y, z, w):
@@ -534,6 +598,7 @@ def evaluate(bag_dir, sidecar, t_transient=2.0, k_e=3.0):
         "run_id": sidecar.get("run_id"),
         "cell_id": sidecar.get("cell_id"),
         "leg": sidecar.get("leg"),
+        "cell_params": sidecar.get("cell_params"),
         "path_recipe": recipe,
         "analytic_total_length_m": float(path.total_length),
         "controller_tuning": ctrl_tuning,
@@ -565,7 +630,25 @@ def evaluate(bag_dir, sidecar, t_transient=2.0, k_e=3.0):
             f"no {TOPIC_RTK_FIX} messages in bag; RTK-truth metrics skipped")
         result["metrics"]["rtk_truth"] = None
         result["rtk_anchor"] = None
+        result["rtk_fixed_fraction"] = None
     else:
+        # RTK-truth is only ground truth where the fix is RTK FIXED (quality=4).
+        # Filter to FIXED samples; fall back to all fixes if rtk_status absent.
+        mask = fixed_mask_for(rtk["stamp"], bag[TOPIC_RTK_STATUS])
+        if mask is None:
+            result["rtk_fixed_fraction"] = None
+            result["warnings"].append(
+                f"no {TOPIC_RTK_STATUS} in bag; RTK-truth uses ALL fixes "
+                "regardless of quality (cannot confirm FIXED).")
+        else:
+            frac = float(np.mean(mask)) if len(mask) else 0.0
+            result["rtk_fixed_fraction"] = frac
+            if int(np.sum(mask)) >= 2:
+                rtk = {k: v[mask] for k, v in rtk.items()}
+            else:
+                result["warnings"].append(
+                    f"only {int(np.sum(mask))} RTK-FIXED samples; RTK-truth "
+                    "falls back to all fixes (metrics unreliable).")
         x, y, yaw, anchor = project_rtk_to_local(
             rtk["lat"], rtk["lon"], anchor_spec)
         # RTK has no native body velocity; approximate from successive fixes.
@@ -608,6 +691,80 @@ def _speed_from_track(stamp, x, y):
     v[:-1] = spd
     v[-1] = spd[-1]
     return np.nan_to_num(v, nan=0.0)
+
+
+def build_per_sample_frame(bag_dir, sidecar, k_e=3.0, bag=None):
+    """Per-sample aligned arrays for one leg, for the lossless export layer (T11).
+
+    Returns ``{"odom": {...}, "rtk": {...}, "gnss_rtk": {...}, "gnss_pix": {...},
+    "meta": {...}}`` where each sub-dict maps column -> 1-D array. Reuses the same
+    path rebuild + ``errors_along_path`` as the metrics path, so the exported
+    series are consistent with the scored metrics. ``gnss_*`` carry RAW lat/lon
+    (the prof's separate GNSS product) — never projected, never filtered.
+    """
+    recipe = sidecar.get("path_recipe")
+    if not recipe:
+        raise ValueError("sidecar has no path_recipe")
+    ctrl_tuning = sidecar.get("controller_tuning", {}) or {}
+    r_min = float(ctrl_tuning.get("R_min", ctrl_tuning.get("r_min", 0.5)))
+    eff_k_e = float(ctrl_tuning.get("k_e", k_e))
+    venue = sidecar.get("venue", {}) or {}
+    anchor_spec = venue.get("anchor")
+    path = build_path_from_recipe(recipe, r_min_default=r_min)
+
+    if bag is None:
+        bag = read_bag(bag_dir)
+
+    frame = {"odom": {}, "rtk": {}, "gnss_rtk": {}, "gnss_pix": {},
+             "meta": {"run_id": sidecar.get("run_id"),
+                      "cell_id": sidecar.get("cell_id"),
+                      "leg": sidecar.get("leg"),
+                      "analytic_total_length_m": float(path.total_length)}}
+
+    odom = bag[TOPIC_ODOM]
+    if odom is not None:
+        e_d, e_psi, kappa, rho, s_star, psi_des = errors_along_path(
+            path, odom["x"], odom["y"], odom["yaw"], k_e=eff_k_e)
+        t = odom["stamp"] - odom["stamp"][0] if len(odom["stamp"]) else odom["stamp"]
+        frame["odom"] = {
+            "t": t, "stamp": odom["stamp"], "x": odom["x"], "y": odom["y"],
+            "yaw": odom["yaw"], "v": odom["v"], "e_d": e_d, "e_psi": e_psi,
+            "kappa": kappa, "rho": rho, "s_star": s_star, "psi_des": psi_des,
+        }
+
+    rtk = bag[TOPIC_RTK_FIX]
+    if rtk is not None:
+        # RAW lat/lon product (unfiltered, unprojected) — the GNSS dataset (L2).
+        q = None
+        mask = fixed_mask_for(rtk["stamp"], bag[TOPIC_RTK_STATUS])
+        if mask is not None:
+            q = mask.astype(int)
+        frame["gnss_rtk"] = {
+            "stamp": rtk["stamp"], "lat": rtk["lat"], "lon": rtk["lon"],
+            "alt": rtk.get("alt", np.full(len(rtk["stamp"]), np.nan)),
+            "is_fixed": q if q is not None else np.full(len(rtk["stamp"]), -1),
+        }
+        # local-frame RTK-truth series (FIXED-filtered, scored against the path)
+        r = rtk
+        if mask is not None and int(np.sum(mask)) >= 2:
+            r = {k: v[mask] for k, v in rtk.items()}
+        x, y, yaw, _anchor = project_rtk_to_local(r["lat"], r["lon"], anchor_spec)
+        e_d, e_psi, kappa, rho, s_star, psi_des = errors_along_path(
+            path, x, y, yaw, k_e=eff_k_e)
+        t = r["stamp"] - r["stamp"][0] if len(r["stamp"]) else r["stamp"]
+        frame["rtk"] = {
+            "t": t, "stamp": r["stamp"], "lat": r["lat"], "lon": r["lon"],
+            "x": x, "y": y, "yaw": yaw, "e_d": e_d, "e_psi": e_psi,
+            "kappa": kappa, "rho": rho, "s_star": s_star, "psi_des": psi_des,
+        }
+
+    pix = bag[TOPIC_PIX_FIX]
+    if pix is not None:
+        frame["gnss_pix"] = {
+            "stamp": pix["stamp"], "lat": pix["lat"], "lon": pix["lon"],
+            "alt": pix.get("alt", np.full(len(pix["stamp"]), np.nan)),
+        }
+    return frame
 
 
 def default_out_path(bag_dir):

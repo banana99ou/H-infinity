@@ -1,0 +1,3 @@
+# Generated test artifacts — regenerate with make_fixture.py
+fixtures/
+*.metrics.json

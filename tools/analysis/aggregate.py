@@ -95,19 +95,28 @@ def load_records(metrics_dir, pattern, split):
             continue
 
         tuning = d.get("controller_tuning", {}) or {}
-        controller = normalise_controller(
-            tuning.get("controller_type")
-            or tuning.get("controller")
-            or d.get("controller_type"))
+        cp = d.get("cell_params", {}) or {}
         recipe = d.get("path_recipe", {}) or {}
         params = recipe.get("params", {}) or {}
-        R = params.get("R")
+        # Prefer cell_params (the sequencer's authoritative axes); fall back to
+        # controller_tuning / recipe for older metrics JSONs.
+        controller = normalise_controller(
+            cp.get("controller")
+            or tuning.get("controller_type")
+            or tuning.get("controller")
+            or d.get("controller_type"))
+        R = cp.get("radius_m", params.get("R"))
+        v_const = cp.get("v_const")
+        path_family = cp.get("path_family", recipe.get("type"))
 
         split_metrics = (d.get("metrics", {}) or {}).get(split)
         records.append({
             "file": p,
             "controller": controller,
             "R": float(R) if R is not None else None,
+            "v_const": float(v_const) if v_const is not None else None,
+            "path_family": str(path_family) if path_family is not None else None,
+            "leg": d.get("leg"),
             "cell_id": d.get("cell_id"),
             "run_id": d.get("run_id"),
             "recipe_type": recipe.get("type"),
@@ -129,17 +138,30 @@ _METRIC_KEYS = [
 
 
 def aggregate_cells(records):
-    """Group by (controller, R) and summarise each metric over N reps."""
+    """Group by the full cell (controller, v_const, path_family, R).
+
+    Pools repetitions AND directions (forward/return legs) — direction is a
+    covariate, per the locked decision — and summarises each metric over the N
+    legs in the cell.
+    """
     groups = defaultdict(list)
     for r in records:
         if r["metrics"] is None:
             continue
-        groups[(r["controller"], r["R"])].append(r["metrics"])
+        groups[(r["controller"], r["v_const"], r["path_family"], r["R"])].append(r)
 
     cells = []
-    for (controller, R), ms in sorted(
-            groups.items(), key=lambda kv: (str(kv[0][0]), kv[0][1] or 0)):
-        summary = {"controller": controller, "R": R, "n": len(ms)}
+    for (controller, v_const, path_family, R), rs in sorted(
+            groups.items(),
+            key=lambda kv: (str(kv[0][0]), kv[0][1] or 0, str(kv[0][2]),
+                            kv[0][3] or 0)):
+        ms = [r["metrics"] for r in rs]
+        summary = {"controller": controller, "v_const": v_const,
+                   "path_family": path_family, "R": R, "n": len(ms),
+                   "n_forward": sum(1 for r in rs if str(r["leg"]).lower() in
+                                    ("atob", "a_to_b", "forward")),
+                   "n_return": sum(1 for r in rs if str(r["leg"]).lower() in
+                                   ("btoa", "b_to_a", "return"))}
         for key in _METRIC_KEYS:
             vals = np.array([m[key] for m in ms
                              if m.get(key) is not None], dtype=float)
@@ -153,6 +175,17 @@ def aggregate_cells(records):
                 summary[f"{key}_n"] = 0
         cells.append(summary)
     return cells
+
+
+def slices_of(cells):
+    """Distinct (v_const, path_family) operating slices present in the cells."""
+    return sorted({(c["v_const"], c["path_family"]) for c in cells},
+                  key=lambda s: (s[0] or 0, str(s[1])))
+
+
+def _slice_label(v_const, path_family):
+    v = f"v{v_const:g}" if v_const is not None else "vNA"
+    return f"{v}_{path_family or 'NA'}"
 
 
 # =============================================================================
@@ -243,7 +276,7 @@ def curvature_tolerance_index(cells, tol_deg=10.0):
 # Figures
 # =============================================================================
 
-def plot_headline(cells, out_path, split):
+def plot_headline(cells, out_path, split, title_suffix=""):
     """Max heading error vs R, LPV vs PID, error bars over reps."""
     by_ctrl = defaultdict(list)
     for c in cells:
@@ -266,7 +299,7 @@ def plot_headline(cells, out_path, split):
                     capsize=4, linewidth=1.5, label=ctrl)
     ax.set_xlabel("Turn radius R [m]")
     ax.set_ylabel("Max heading error [deg]")
-    ax.set_title(f"Max heading error vs R  ({split})")
+    ax.set_title(f"Max heading error vs R  ({split}{title_suffix})")
     ax.grid(True, alpha=0.3)
     ax.legend()
     fig.tight_layout()
@@ -321,7 +354,10 @@ def plot_compute_cost(records, out_path):
     labels = sorted(by_ctrl)
     data = [by_ctrl[k] for k in labels]
     fig, ax = plt.subplots(figsize=(6, 4))
-    ax.boxplot(data, labels=labels, showmeans=True)
+    try:
+        ax.boxplot(data, tick_labels=labels, showmeans=True)  # mpl >= 3.9
+    except TypeError:
+        ax.boxplot(data, labels=labels, showmeans=True)       # older mpl
     for i, k in enumerate(labels, start=1):
         if maxes[k]:
             ax.scatter([i] * len(maxes[k]), maxes[k], marker="x",
@@ -367,12 +403,36 @@ def main(argv=None):
           f"(split={args.split})")
 
     cells = aggregate_cells(records)
-    wilcox = wilcoxon_lpv_vs_pid(records, metric=args.wilcoxon_metric)
-    cti = curvature_tolerance_index(cells, tol_deg=args.cti_tol_deg)
+    write_cell_summary_csv(cells, os.path.join(out_dir, "cell_summary.csv"))
 
-    headline = plot_headline(cells, os.path.join(out_dir, "headline_max_epsi_vs_R.png"),
-                             args.split)
-    cti_png = plot_cti(cti, os.path.join(out_dir, "curvature_tolerance_index.png"))
+    # Per operating slice (v_const, path_family): headline + CTI + Wilcoxon,
+    # since each is a single-slice claim (mixing speeds/families is meaningless).
+    slice_results = {}
+    for (v_const, path_family) in slices_of(cells):
+        label = _slice_label(v_const, path_family)
+        scells = [c for c in cells
+                  if c["v_const"] == v_const and c["path_family"] == path_family]
+        srecs = [r for r in records
+                 if r["v_const"] == v_const and r["path_family"] == path_family]
+        headline = plot_headline(
+            scells, os.path.join(out_dir, f"headline_{label}.png"),
+            args.split, title_suffix=f", {label}")
+        cti = curvature_tolerance_index(scells, tol_deg=args.cti_tol_deg)
+        cti_png = plot_cti(cti, os.path.join(out_dir, f"cti_{label}.png"))
+        wilcox = wilcoxon_lpv_vs_pid(srecs, metric=args.wilcoxon_metric)
+        slice_results[label] = {
+            "v_const": v_const, "path_family": path_family,
+            "n_cells": len(scells),
+            "wilcoxon_lpv_vs_pid": wilcox,
+            "curvature_tolerance_index": cti,
+            "figures": {"headline": headline, "cti": cti_png},
+        }
+        if wilcox.get("ok"):
+            print(f"[aggregate] {label}: Wilcoxon p={wilcox['p_value']:.4g}, "
+                  f"LPV better {wilcox['lpv_better_count']}/{wilcox['n_pairs']}")
+        else:
+            print(f"[aggregate] {label}: Wilcoxon not run ({wilcox.get('reason')})")
+
     cost_png = plot_compute_cost(records, os.path.join(out_dir, "compute_cost.png"))
 
     summary = {
@@ -380,27 +440,32 @@ def main(argv=None):
         "n_legs": len(records),
         "n_cells": len(cells),
         "cells": cells,
-        "wilcoxon_lpv_vs_pid": wilcox,
-        "curvature_tolerance_index": cti,
-        "figures": {
-            "headline": headline,
-            "cti": cti_png,
-            "compute_cost": cost_png,
-        },
+        "slices": slice_results,
+        "compute_cost_figure": cost_png,
     }
-    summary_path = os.path.join(out_dir, "aggregate_summary.json")
+    summary_path = os.path.join(out_dir, "stats.json")
     with open(summary_path, "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2)
         f.write("\n")
-    print(f"[aggregate] wrote {summary_path}")
-
-    if wilcox.get("ok"):
-        print(f"[aggregate] Wilcoxon ({wilcox['metric']}): "
-              f"p={wilcox['p_value']:.4g}, n_pairs={wilcox['n_pairs']}, "
-              f"LPV better in {wilcox['lpv_better_count']}/{wilcox['n_pairs']}")
-    else:
-        print(f"[aggregate] Wilcoxon not run: {wilcox.get('reason')}")
+    print(f"[aggregate] wrote {summary_path} + cell_summary.csv "
+          f"({len(cells)} cells, {len(slice_results)} slices)")
     return 0
+
+
+def write_cell_summary_csv(cells, path):
+    import csv
+    base = ["controller", "v_const", "path_family", "R", "n",
+            "n_forward", "n_return"]
+    metric_cols = []
+    for key in _METRIC_KEYS:
+        metric_cols += [f"{key}_mean", f"{key}_std", f"{key}_n"]
+    cols = base + metric_cols
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=cols, extrasaction="ignore")
+        w.writeheader()
+        for c in cells:
+            w.writerow(c)
 
 
 if __name__ == "__main__":

@@ -27,15 +27,13 @@ FAILED_CHECKS=()
 # not silently flip the gate. quality=4 == FIXED, quality=5 == FLOAT (source:
 # fix_quality_to_desc() in GPS-RTK_ROS2_pub_node.py).
 #
-# hw-confirmed 2026-05-26: rtk_status is std_msgs/String and carries a
-# "quality=N" token, e.g. NO FIX gave
-#   "FIX: NO FIX (quality=0, sats=0, HDOP=99.99, rate=10.0Hz) | ..."
-# so the "quality=N" substring match below is the right shape and the gate
-# correctly FAILs when not FIXED. Still pending: an open-sky FIXED to confirm
-# the literal quality=4 end-to-end (was NO FIX indoors during verification).
+# rtk_status is std_msgs/String carrying a "quality=N" token (hw-confirmed
+# 2026-05-26; NO FIX gave quality=0). quality=4 = RTK FIXED, 5 = RTK FLOAT per
+# the NMEA GGA fix-quality standard AND the driver's fix_quality_to_desc()
+# (GPS-RTK_ROS2_pub_node.py:164-171) — authoritative, no open-sky test needed.
 RTK_STATUS_TOPIC="/gps_rtk_f9p_helical/gps/rtk_status"
-RTK_FIXED_MATCH="quality=4"   # TODO(hw-verify): confirm literal at open-sky FIXED
-RTK_FLOAT_MATCH="quality=5"   # TODO(hw-verify): FLOAT -> WARN (not yet converged)
+RTK_FIXED_MATCH="quality=4"   # RTK FIXED (NMEA GGA + driver source)
+RTK_FLOAT_MATCH="quality=5"   # RTK FLOAT -> WARN (not yet converged)
 
 # Run-window RTK-FIXED coverage requirement Y (spec §5: "FIXED for >= Y% of the
 # window"). This is a per-run acceptance gate the sequencer (T6) will enforce

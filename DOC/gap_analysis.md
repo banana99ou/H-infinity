@@ -30,9 +30,10 @@ the T1/T3/T5/T7/T9 work, and verified with wheels-up synthetic odom.
 not `NavSatFix.status` (which can't distinguish RTK on this F9P). Static-checked
 only (browser UI unverified).
 
-**Still blocked on a physical condition:** open-sky **RTK FIXED** (was NO-FIX
-indoors) to confirm the `quality=4` literal; **R_min** measurement (U-turn);
-wheels-on-floor for T4/T6.
+**Still blocked on a physical condition:** **R_min** measurement (U-turn) and a
+wheels-on-floor session for T4/T6. (RTK `quality=4`=FIXED is confirmed by the
+NMEA GGA standard + the driver source — *not* a blocker; an open-sky FIXED is
+only a nice end-to-end sanity check.)
 
 Robot-verification checklist items 1–4 are now resolved (see Part C).
 
@@ -267,7 +268,7 @@ exact patterns and the four NUC deployment caveats.
 **Robot-verification checklist — RESOLVED 2026-05-26 (live graph):**
 1. ✅ `limo_base` exposes **no** odom-reset service (only MAVROS `*/reset|clear`). → T3 overlay is the mechanism.
 2. ✅ `/limo_status` is `limo_msgs/msg/LimoStatus`; `battery_voltage` is **float64 VOLTS** (live 12.0–12.1), `motion_mode=1` (Ackermann), `control_mode=1`.
-3. ✅ `rtk_status` is `std_msgs/String`, a rich line carrying a `quality=N` token (NO-FIX gave `quality=0`). FIXED → `quality=4` (driver `fix_quality_to_desc`); **literal still pending an open-sky FIXED**. Reacquisition time not measured (no fix indoors).
+3. ✅ `rtk_status` is `std_msgs/String`, a rich line carrying a `quality=N` token (NO-FIX gave `quality=0`). `quality=4`=FIXED, `5`=FLOAT per the **NMEA GGA standard** + driver `fix_quality_to_desc()` (`GPS-RTK_ROS2_pub_node.py:164-171`) — authoritative, no open-sky test needed. Reacquisition time not measured (no fix indoors).
 4. ⏳ Reposition tolerances + battery volt thresholds (M2) still open — need a wheels-on-floor session and a user decision on the %→V mapping (observed 12.0 V healthy).
 
 **Open spec items to resolve with the user (not blocking most tasks):** battery %→volts

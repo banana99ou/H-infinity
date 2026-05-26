@@ -107,18 +107,9 @@ class PathFollowerNode(Node):
             self.path = None
             self.guidance = None
 
-        # -- Controller -------------------------------------------------
-        ctrl_key = ctrl_type.lower().strip()
-        if ctrl_key in ('lpv-hinf', 'lpv_hinf', 'lpv', 'hinf'):
-            self.controller = LPVHinfController.default(dt=self.dt_ctrl)
-            self._ctrl_type = 'lpv-hinf'
-        elif ctrl_key in ('pid-ff', 'pid_ff', 'pid'):
-            self.controller = PIDFeedforward(K_P=K_P, K_D=K_D, L=self.wheelbase)
-            self._ctrl_type = 'pid-ff'
-        else:
-            self.get_logger().error(f'Unknown controller_type: {ctrl_type}')
-            raise ValueError(f"Unknown controller_type '{ctrl_type}'. "
-                             f"Choose from: 'lpv-hinf', 'pid-ff'")
+        # -- Controller (live-switchable via the controller_type param) --
+        self._K_P, self._K_D = K_P, K_D
+        self.controller, self._ctrl_type = self._build_controller(ctrl_type)
 
         self.get_logger().info(
             f'Controller: {self._ctrl_type}, v={self.v_const:.2f} m/s, '
@@ -213,6 +204,18 @@ class PathFollowerNode(Node):
     # Callbacks
     # -----------------------------------------------------------------
 
+    def _build_controller(self, ctrl_type):
+        """Build the steering controller for a controller_type string and return
+        (controller, canonical_name). Used at startup and for live switching via
+        the controller_type param (the sequencer flips lpv-hinf<->pid per cell)."""
+        key = (ctrl_type or '').lower().strip()
+        if key in ('lpv-hinf', 'lpv_hinf', 'lpv', 'hinf'):
+            return LPVHinfController.default(dt=self.dt_ctrl), 'lpv-hinf'
+        elif key in ('pid-ff', 'pid_ff', 'pid'):
+            return PIDFeedforward(K_P=self._K_P, K_D=self._K_D, L=self.wheelbase), 'pid-ff'
+        raise ValueError(f"Unknown controller_type '{ctrl_type}'. "
+                         f"Choose from: 'lpv-hinf', 'pid-ff'")
+
     def _params_cb(self, params):
         for p in params:
             if p.name == 'v_const':
@@ -220,6 +223,16 @@ class PathFollowerNode(Node):
                 v = max(0.0, min(3.0, v))
                 self.v_const = v
                 self.get_logger().info(f'v_const updated to {v:.2f} m/s (runtime)')
+            elif p.name == 'controller_type':
+                try:
+                    new_ctrl, name = self._build_controller(p.value)
+                except ValueError as exc:
+                    self.get_logger().error(str(exc))
+                    return SetParametersResult(successful=False, reason=str(exc))
+                self.controller = new_ctrl
+                self._ctrl_type = name
+                self._delta_prev = 0.0  # drop stale smoothing state across a switch
+                self.get_logger().info(f"controller_type switched to '{name}' (runtime)")
         return SetParametersResult(successful=True)
 
     def _reset_cb(self, msg: Bool):

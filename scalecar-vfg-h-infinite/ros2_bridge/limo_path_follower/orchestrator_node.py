@@ -57,6 +57,17 @@ PROCS = {
         'ros2', 'run', 'limo_path_follower', 'path_follower_node',
         '--ros-args', '-r', '/wheel/odom:=/wheel/odom_zeroed',
     ],
+    # T4 (R1-R4, P3): RTK go-to-pose between recorded runs. Publishes cmd_vel_raw
+    # only while repositioning. MUST NOT run concurrently with 'follower' (C6) —
+    # the sequencer enforces exactly one cmd_vel_raw publisher.
+    'reposition': [
+        'ros2', 'run', 'limo_path_follower', 'reposition_node',
+    ],
+    # T6: the experiment sequencer (the integrator). Drives the matrix unattended
+    # by start/kill-ing the movers above through this orchestrator.
+    'sequencer': [
+        'ros2', 'run', 'limo_path_follower', 'experiment_sequencer_node',
+    ],
 }
 
 EXCLUSIVE = {'base_vanilla', 'base_gnss'}

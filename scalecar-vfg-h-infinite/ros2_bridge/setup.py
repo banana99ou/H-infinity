@@ -22,6 +22,8 @@ setup(
             'path_follower_node = limo_path_follower.path_follower_node:main',
             'orchestrator_node = limo_path_follower.orchestrator_node:main',
             'odom_zero_node = limo_path_follower.odom_zero_node:main',
+            'reposition_node = limo_path_follower.reposition_node:main',
+            'experiment_sequencer_node = limo_path_follower.experiment_sequencer_node:main',
         ],
     },
 )

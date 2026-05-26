@@ -3,7 +3,19 @@
 The setup that worked outdoors during GNSS recording, and the constraint
 that forced it.
 
-## The constraint
+The system has **two RTK receivers with two independent correction paths**:
+
+- **FitTogether OHCOACH Cell Y3** — blackbox NTRIP receiver on the LIMO,
+  internet-fed via phone hotspot. Topic-less, SD-card-only, role is the
+  professor's separate dataset (L5 in `system_spec.md`). Described in this
+  section.
+- **Helical ZED-F9P** — ROS-integrated rover on the LIMO; the topic the
+  whole experiment hangs on (L2, L4, R1, M1). RTCM3-fed from a **local
+  basestation** broadcasting over LIMO_AP. Described in the
+  "RTK base subtopology" section below; deployment lives at
+  `tools/rtk_base/`.
+
+## The constraint (FitTogether)
 
 The **FitTogether OHCOACH Cell Y3** RTK GPS receiver requires a **specific
 SSID + password** to be configured into its firmware. It connects to that
@@ -62,14 +74,63 @@ So the network has to come *to* the GPS, not the other way around.
   directly by hostname (`agilex-nuc12wski7`) since they're on the same L2
   segment via the AP. Tailscale name resolution still works either way.
 
+## RTK base subtopology (helical F9P correction path)
+
+The helical F9P on the LIMO needs RTCM3 corrections to reach RTK FIXED.
+**Until 2026-05-26** those corrections came from a TCP broadcaster running
+on the operator MacBook — which pinned the operator to the rooftop and
+broke "press start and walk away." **From 2026-05-26** the broadcaster runs
+on a Raspberry Pi at the base tripod (`tools/rtk_base/`); the MacBook is
+free to leave.
+
+```
+       stationary at one rooftop corner
+       ┌──────────────────────────────────────────┐
+       │  [ survey antenna ] ── SMA ──┐           │
+       │           on tripod           │           │
+       │                               ↓           │
+       │                       [ base F9P ]       │
+       │                               │ USB       │
+       │                               ↓           │
+       │                       [ Pi + power bank ] │
+       │                       rtk-base.service    │
+       │                       :2101 RTCM3 stream  │
+       └──────────────┬────────────────────────────┘
+                      │ WiFi (LIMO_AP, client)
+                      ↓
+       [ LIMO NUC ]   GPS-RTK_ROS2_pub_node.py
+          │ TCP client to <pi-ip>:2101
+          │ USB
+          ↓
+       [ helical F9P rover ] → /gps_rtk_f9p_helical/*
+```
+
+Notes:
+
+- **The Pi joins LIMO_AP as a client**, same AP as the operator MacBook.
+  Adds one more device to the AP's client list (currently: Pi + MacBook).
+- **The rover's `TCP_HOST` is hardcoded** to `10.42.0.170` at
+  `GPS-RTK_ROS2_pub_node.py:52`. The Pi is given that static IP in its
+  NetworkManager profile for LIMO_AP. Making `TCP_HOST` a CLI flag is a
+  follow-up; until then, the Pi must land at `.170`.
+- **Survey-In each power-on** is the default base position mode (per
+  `feedback_rtk_and_venue` — venue corners are arbitrary map clicks
+  anyway). Switch to Fixed-mode TMODE3 with a one-time survey when V1
+  reproducibility matters.
+- **Range/power:** LIMO_AP claims ~30-50 m outdoor; a 10000 mAh power bank
+  runs Pi + F9P for ~10 h on a Pi 4. See `tools/rtk_base/README.md` for
+  the BoM and the field bring-up recipe.
+
 ## Roles + ownership
 
 | Device | Brings | Configured by |
 |---|---|---|
-| Phone | cellular uplink + specific SSID for the GPS | session operator |
-| FitTogether OHCOACH Cell Y3 | NTRIP RTK fix, logs to its own SD | turn on, walk away |
-| LIMO NUC | bridge (USB-tether → WiFi AP) + ROS stack | systemd / `start_battle.sh` |
-| MacBook | battle station (browser) + run control | operator |
+| Phone | cellular uplink + specific SSID for the FitTogether | session operator |
+| FitTogether OHCOACH Cell Y3 | NTRIP RTK fix, logs to its own SD (L5 data) | turn on, walk away |
+| LIMO NUC | bridge (USB-tether → WiFi AP) + ROS stack + helical F9P serial host | systemd / `start_battle.sh` |
+| **RTK base Pi** | **RTCM3 broadcaster for the helical F9P; static IP `10.42.0.170` on LIMO_AP** | **`tools/rtk_base/install.sh`** |
+| **base F9P + antenna + tripod** | **stationary GNSS source for RTCM3; Survey-In each power-on** | **u-center one-time (TMODE3, RTCM3 1005/1077/1087/1097/1127/1230, save to flash)** |
+| MacBook | battle station (browser) + run control — no longer required at the venue once base is deployed | operator |
 
 ## Implications for the battle station
 
@@ -157,3 +218,14 @@ Caveats:
   FitTogether records its own timestamps; the rosbag records NUC's. They
   must be aligned offline. NTP on the NUC + FitTogether's GNSS-disciplined
   clock should give sub-100ms agreement, but this hasn't been validated.
+  Same caveat applies to the RTK base Pi: its journal timestamps and the
+  NUC's bag timestamps are independent until NTP + GNSS-discipline aligns
+  them.
+- **Rover-side `TCP_HOST` is hardcoded** at `GPS-RTK_ROS2_pub_node.py:52`.
+  The Pi must be statically configured at `10.42.0.170` on LIMO_AP until
+  this becomes a CLI flag (or until mDNS / DHCP reservation lands).
+- **No base-loss alert** to the operator yet. The Pi's `journalctl -u
+  rtk-base` shows local health and the NUC's RTCM-stale detection (5 s
+  window) is the only NUC-side signal. M1/F2 in `system_spec.md` want
+  explicit RTK-loss gating + push notification (ntfy); the broadcaster
+  doesn't surface health to the NUC graph yet.

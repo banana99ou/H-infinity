@@ -30,6 +30,15 @@ the T1/T3/T5/T7/T9 work, and verified with wheels-up synthetic odom.
 not `NavSatFix.status` (which can't distinguish RTK on this F9P). Static-checked
 only (browser UI unverified).
 
+**Also landed 2026-05-26 (PM):** RTK base broadcaster ported to a stationary Pi
+(`tools/rtk_base/`, commit `165af09`). The basestation correction pipeline that
+makes `quality=4` reachable in the field is no longer MacBook-bound — the
+broadcaster now runs as a `rtk-base.service` systemd unit on a Pi sitting at
+the base tripod. Source-only this commit (no Pi imaged yet); first bench soak
+is the next blocking step before any rooftop run produces real RTK-FIXED data.
+This unblocks the *physical setup* underlying L2/L4/R1/M1; the *gating logic*
+they want is still T9 (preflight) + T6 (sequencer).
+
 **Still blocked on a physical condition:** **R_min** measurement (U-turn) and a
 wheels-on-floor session for T4/T6. (RTK `quality=4`=FIXED is confirmed by the
 NMEA GGA standard + the driver source — *not* a blocker; an open-sky FIXED is

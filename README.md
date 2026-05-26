@@ -16,7 +16,7 @@ loop.
 | `DOC/system_spec.md` | **What the system must be** — locked requirements (ROC), the canonical interface contract (§4), acceptance criteria. Start here. |
 | `DOC/experiment.md` | **Why + how** — the curvature-sweep pivot, the experimental matrix, the per-cell operational model, orchestrator target state. |
 | `DOC/deployment.md` | NUC deployment caveats, support-script inventory, data-flow diagram, runbook. |
-| `DOC/network_topology.md` | Field network (phone-on-robot + USB tether + LIMO AP) for outdoor RTK. |
+| `DOC/network_topology.md` | Field network (phone-on-robot + USB tether + LIMO AP) for outdoor RTK; RTK base subtopology (Pi + base F9P) for the helical F9P's RTCM source. |
 | `DOC/decisions/` | Architecture Decision Records. ADR-01: GPS stays out of the control loop. |
 | `DOC/paper_ijat.pdf` | The sim paper this work follows up on. |
 | `ToDo.md` | Live working checklist + current status + next-session list. |
@@ -34,6 +34,7 @@ canonical — fix that one.
 | `tools/orchestrator/` | `start_battle.sh`, the `limo-battle` systemd service + installer. |
 | `tools/network/` | NetworkManager AP-on-tether dispatcher (auto-switch client WiFi ↔ LIMO AP). |
 | `tools/preflight/` | `preflight.sh` — pre-rooftop field-readiness checks. |
+| `tools/rtk_base/` | RTK basestation broadcaster (Pi-side): `rtcm_server.py` + systemd unit + udev rule + installer + README. Replaces the MacBook-bound `agile_ws/rtcm_server.py` so unattended runs are possible. Pairs with the rover at `GPS-RTK_ROS2_pub_node.py`. |
 | `tools/indoor_test/` | Short indoor sample curves for shaking out the system before the rooftop. |
 | `tools/diagnostics/` | Ad-hoc on-robot diagnostics. |
 | `scenarios/` | Scenario definitions (and per-venue WGS84 config under `venues/`). |

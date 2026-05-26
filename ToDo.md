@@ -30,6 +30,12 @@ Battle station online and field-tested. Major workstreams since last update
 - **Field network topology** documented in `DOC/network_topology.md`
   (phone-on-robot + USB-tether + LIMO-AP). Used during outdoor GNSS
   recording session.
+- **RTK basestation broadcaster ported** (`tools/rtk_base/`, 2026-05-26):
+  Linux-ready `rtcm_server.py` + systemd unit + udev rule + installer +
+  README. Replaces the MacBook-bound `agile_ws/rtcm_server.py` so the
+  operator no longer has to stay at the rooftop for unattended runs. **Not
+  yet deployed on a real Pi** — first deployment + bench soak is now the
+  blocking next step before any rooftop run can produce RTK-FIXED data.
 
 First wheels-on-floor controller test still hasn't happened. The infrastructure
 is ready; next session is the first real run.
@@ -64,7 +70,38 @@ In rough priority order:
    `limo_base/launch/` but its end-to-end behavior on this hardware has
    not been verified post-systemd-install.
 
-3. **Battle-station GPS view (per ADR-01 §"What we DO use GPS for").**
+3. **Deploy + soak-test the RTK basestation** (`tools/rtk_base/`). Blocking
+   precondition for anything producing RTK-FIXED in the field.
+   - Image a Pi (Raspberry Pi OS Bookworm), `git clone H-infinity`,
+     `tools/rtk_base/README.md` has the full recipe.
+   - Add LIMO_AP to the Pi's NetworkManager profiles with a **static IPv4
+     of `10.42.0.170/24`** (matches the rover-side hardcode at
+     `GPS-RTK_ROS2_pub_node.py:52`).
+   - Run `tools/rtk_base/install.sh`. Plug in the base F9P, confirm
+     `/dev/f9p_base` symlink, `sudo systemctl start rtk-base`,
+     `journalctl -u rtk-base -f` should show `[reader] starting` and
+     `[status] alive=True`.
+   - Configure the base F9P once in u-center: **TMODE3 Survey-In** (60 s
+     min, 5 m accuracy), RTCM3 1005/1077/1087/1097/1127/1230 on USB at
+     1 Hz, save to flash. (Switch to Fixed-mode TMODE3 later when V1
+     reproducibility matters.)
+   - **Bench soak (4+ h):** Pi from the power bank, F9P with antenna at
+     window, NUC running `GPS-RTK_ROS2_pub_node.py`. Watch journal +
+     `ros2 topic echo /gps_rtk_f9p_helical/gps/rtk_status`. Provoke:
+     yank F9P USB → replug; yank Pi WiFi → rejoin; reboot Pi. All three
+     must recover unattended.
+   - **Rooftop soak (2 h):** real survey-in, drive the LIMO manually
+     through the corners of the intended working area, confirm `quality=4`
+     sustained. Note any geometric dropouts (WiFi range marginality).
+   - Follow-ups after deployment (not blocking the first soak):
+     - Make `TCP_HOST` a CLI flag in `GPS-RTK_ROS2_pub_node.py` (drop the
+       hardcoded `10.42.0.170`), and/or add mDNS resolution for
+       `rtk-base.local` on the rover side.
+     - Add a `/rtk_base/health` topic or ntfy push on `alive` transitions
+       (M1/F2 in `DOC/system_spec.md`). Right now the journal is the only
+       signal that the base is alive.
+
+4. **Battle-station GPS view (per ADR-01 §"What we DO use GPS for").**
    Add to `interactive.html`:
    - Subscribe to `/gps_rtk_f9p_helical/gps/fix` (NavSatFix) and
      `.../rtk_status`
@@ -75,7 +112,7 @@ In rough priority order:
    - NTRIP correction-age display
    - Refuse Push&Run when fix < FLOAT (configurable threshold)
 
-4. **Rosbag recording from the battle station.** Add a "Record run" button
+5. **Rosbag recording from the battle station.** Add a "Record run" button
    that starts/stops `ros2 bag record` for the minimum dataset
    (`DOC/system_spec.md` §4 required bag topic set):
    `/wheel/odom`, `/cmd_vel_raw`, `/cmd_vel`, `/estop`, `/reference_path`,
@@ -84,17 +121,17 @@ In rough priority order:
    wallclock timestamp; embed the same in a sidecar JSON for pairing
    with the FitTogether SD-card export.
 
-5. **Offline analysis script** (`tools/analysis/run_eval.py`): given a
+6. **Offline analysis script** (`tools/analysis/run_eval.py`): given a
    rosbag, compute the headline table from ADR-01:
    `RMS e_d`, `max e_d`, terminal pose error — once from `/wheel/odom`,
    once from `/gps_rtk_f9p_helical/gps/fix`. Print the gap. Plot both
    trajectories overlaid on the reference.
 
-6. **Captive `cmd_vel_raw` watchdog in `estop_cli.py`** (defense in depth):
+7. **Captive `cmd_vel_raw` watchdog in `estop_cli.py`** (defense in depth):
    trip the latched E-stop after 1 s of `/cmd_vel_raw` silence. Catches
    any source going silent (teleop browser dies, follower crashes).
 
-7. **Field-readiness checklist on the NUC**: small script that verifies
+8. **Field-readiness checklist on the NUC**: small script that verifies
    pre-rooftop-trip everything is healthy (limo-battle.service active,
    internet reachable, both base launch files importable, etc.).
    - 2026-05-07: quick mode landed at `tools/preflight/preflight.sh`.

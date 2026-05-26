@@ -35,6 +35,14 @@ push_one() {  # $1 = label, $2 = target "user@host:/path/"
        -e "ssh -o BatchMode=yes -o ConnectTimeout=20" --exclude='.git' \
        "$BAG" "$target"; then
     echo "[push_artifact] $label OK: $base"
+    # Commit the remote archive's own git history (best-effort, non-fatal).
+    # target "user@host:/path/Experiment Data/" -> userhost + repo path.
+    local uh="${target%%:*}" rp="${target#*:}"
+    if ssh -o BatchMode=yes -o ConnectTimeout=20 "$uh" \
+         'R="'"$rp"'"; [ -d "$R/.git" ] || exit 0; git -C "$R" add -A; git -C "$R" diff --cached --quiet || git -C "$R" commit -q -m "archive '"$base"'"' \
+         2>/dev/null; then
+      echo "[push_artifact] $label repo committed: $base"
+    fi
   else
     echo "[push_artifact] $label FAILED (skipped, non-fatal): $base" >&2
   fi

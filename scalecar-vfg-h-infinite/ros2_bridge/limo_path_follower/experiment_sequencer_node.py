@@ -174,6 +174,14 @@ class ExperimentSequencer(Node):
         self._batt_halt = float(self._gating.get("battery_volts_halt", 10.5))
         self._rtk_window_pct = float(self._gating.get("rtk_run_window_pct", 95))
 
+        # -- Artifact archiving: push each finished bag off the robot (Mac
+        #    priority + NAS), detached + rate-limited so it never competes with
+        #    the next run. See tools/sync/push_artifact.sh.
+        self._art = self._cfg.get("artifact_sync", {}) or {}
+        self._art_enabled = bool(self._art.get("enabled", False))
+        self._push_artifact_sh = os.path.join(
+            _REPO_ROOT, "tools", "sync", "push_artifact.sh")
+
         # -- Build the cell list (cartesian product x repetitions) ------
         self._cells = self._build_cells(self._cfg)
         self.n_cells = len(self._cells)
@@ -1079,6 +1087,40 @@ class ExperimentSequencer(Node):
             Data_Logger.write_sidecar(self._leg_bag_path, sidecar)
         except Exception as exc:
             self.get_logger().error(f"sidecar write failed: {exc}")
+        # Bag + sidecar are finalized -> archive off the robot (non-blocking).
+        self._archive_leg(self._leg_bag_path)
+
+    def _archive_leg(self, bag_path):
+        """Fire-and-forget push of one finished bag off the robot (Mac priority +
+        NAS) via tools/sync/push_artifact.sh, fully detached + rate-limited so it
+        does NOT compete with the next run. A copy failure never affects the
+        batch. Granularity is per-run today (the tested, default path); the
+        bwlimit/detach keep it non-interfering. Fall back to per-cell/batch in
+        experiment.yaml only if a run ever shows contention."""
+        if not (self._art_enabled and bag_path):
+            return
+        if not os.path.isfile(self._push_artifact_sh):
+            self.get_logger().warn(
+                f"artifact_sync enabled but missing {self._push_artifact_sh}; skip")
+            return
+        env = dict(os.environ)
+        if self._art.get("mac_target"):
+            env["ARTIFACT_MAC_TARGET"] = str(self._art["mac_target"])
+        if self._art.get("nas_target"):
+            env["ARTIFACT_NAS_TARGET"] = str(self._art["nas_target"])
+        env["ARTIFACT_BWLIMIT_KBPS"] = str(self._art.get("bwlimit_kbps", 0))
+        if self._art.get("local_repo"):
+            env["ARTIFACT_LOCAL_REPO"] = str(self._art["local_repo"])
+        try:
+            subprocess.Popen(
+                ["bash", self._push_artifact_sh, bag_path],
+                env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                start_new_session=True,  # detach: own session, won't block the loop
+            )
+            self.get_logger().info(
+                f"artifact_sync: dispatched push for {os.path.basename(bag_path)}")
+        except Exception as exc:
+            self.get_logger().warn(f"artifact_sync dispatch failed (non-fatal): {exc}")
 
     # ==================================================================
     # Reposition target / no-op (R4)

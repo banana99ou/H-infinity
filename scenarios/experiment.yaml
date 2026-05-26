@@ -57,3 +57,19 @@ ntfy:
   # defensively; a missing module or empty topic is a no-op, never a crash).
   server: https://ntfy.sh
   topic: ""
+
+artifact_sync:
+  # Push each finished bag off the robot to the Mac (priority) + NAS, detached +
+  # rate-limited + low-priority (nice/ionice) so it never competes with the next
+  # run. .git is excluded (each archive keeps its own independent git history).
+  # tools/sync/push_artifact.sh does the work; the sequencer fires it per-run.
+  enabled: true
+  granularity: per-run       # per-run|per-cell|batch — per-run is wired; the
+                             #   bwlimit+detach keep it non-interfering. Switch
+                             #   only if a run ever shows contention.
+  bwlimit_kbps: 4000         # rsync --bwlimit (0 = unlimited)
+  # Mac needs Remote Login ON + the NUC key authorized; until then this target
+  # fast-fails and is skipped (non-fatal). Tailscale MagicDNS name 'macbook-air'.
+  mac_target: "hyeon-yongjeong@macbook-air:/Users/hyeon-yongjeong/code/H-infinity/Experiment Data/"
+  nas_target: "me@nanasrv:/home/me/Experiment Data/"
+  local_repo: "/home/agilex/H-infinity/Experiment Data"   # robot's own git history

@@ -41,9 +41,15 @@ sudo cp "$HERE/$UDEV_RULE_NAME" /etc/udev/rules.d/
 sudo udevadm control --reload
 sudo udevadm trigger --subsystem-match=tty
 
-# 4. systemd unit.
-echo "[install] installing $SERVICE_NAME"
-sudo cp "$HERE/$SERVICE_NAME" /etc/systemd/system/
+# 4. systemd unit. Rewrite hardcoded paths in the unit to match where this
+#    repo actually lives on this host — the template ships with
+#    /home/pi/H-infinity/tools/rtk_base as a placeholder; we substitute the
+#    real $HERE so the same template works whether the repo is at
+#    ~/H-infinity or ~/code/H-infinity or anywhere else.
+echo "[install] installing $SERVICE_NAME (paths -> $HERE)"
+TEMPLATE_PATH="/home/pi/H-infinity/tools/rtk_base"
+sed "s|$TEMPLATE_PATH|$HERE|g" "$HERE/$SERVICE_NAME" \
+    | sudo tee "/etc/systemd/system/$SERVICE_NAME" > /dev/null
 sudo systemctl daemon-reload
 sudo systemctl enable "$SERVICE_NAME"
 

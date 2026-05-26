@@ -1,0 +1,661 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""Per-leg evaluation: rosbag2 + sidecar -> metrics JSON (T11 / A1, A3).
+
+Reads ONE recorded leg (a rosbag2 directory + its paired
+``<bag>.sidecar.json``), reconstructs the driven trajectory two ways, rebuilds
+the analytic reference path from the sidecar ``path_recipe`` (the *same*
+mapping the follower used at drive time), recomputes cross-track / heading
+error against that reference, and emits ``compute_metrics()`` **twice**:
+
+  * **odom-belief**  — trajectory from ``/wheel/odom`` (what the controller saw)
+  * **RTK-truth**    — trajectory from ``/gps_rtk_f9p_helical/gps/fix``
+                       projected to the venue-local frame (ground truth)
+
+On top of the library metrics it adds **terminal-pose-error** (Euclidean +
+heading at the last sample vs the path endpoint) and **steering-effort**
+(integral / RMS of ``delta_cmd`` from ``/path_follower/status``, with a
+``/cmd_vel`` angular fallback), plus a compute-cost summary from
+``/path_follower/timing``.
+
+Design constraints (laptop authoring; see CLAUDE.md):
+  * No ROS sourcing. Bags are read with the ``rosbags`` pip library, which
+    parses rosbag2 sqlite3 / mcap directly. If it is not installed we fail with
+    a clear, actionable message rather than fabricating numbers.
+  * Real-bag validation is DEFERRED to the trip (no bags exist yet). This tool
+    is written to run end-to-end on a single bag+sidecar and to error clearly
+    when an input is missing.
+
+Usage::
+
+    python3 tools/analysis/run_eval.py /path/to/<bag_dir> \\
+        [--sidecar /path/to/<bag>.sidecar.json] \\
+        [--out /path/to/<bag>.metrics.json] \\
+        [--t-transient 2.0] [--k-e 3.0]
+
+If ``--sidecar`` is omitted it defaults to ``<bag_dir>.sidecar.json`` (the T7
+naming) and then ``<bag_dir>/<basename>.sidecar.json``.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import os
+import sys
+
+import numpy as np
+
+
+# -----------------------------------------------------------------------------
+# Imports of repo libraries (path classes, guidance, metrics). These are pure
+# numpy and import fine on the laptop (verified: `vfg import OK`).
+# -----------------------------------------------------------------------------
+
+_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+_VFG_ROOT = os.path.join(_REPO_ROOT, "scalecar-vfg-h-infinite")
+if _VFG_ROOT not in sys.path:
+    sys.path.insert(0, _VFG_ROOT)
+# path_overlay lives under tools/path_gen — reuse its lat/lon <-> local helpers.
+_PATHGEN = os.path.join(_REPO_ROOT, "tools", "path_gen")
+if _PATHGEN not in sys.path:
+    sys.path.insert(0, _PATHGEN)
+
+try:
+    from vfg_pathfollowing.paths.step_curvature import StepCurvaturePath
+    from vfg_pathfollowing.paths.slalom import SlalomPath
+    from vfg_pathfollowing.guidance.vfg import VectorFieldGuidance
+    from vfg_pathfollowing.simulation.result import SimResult
+    from vfg_pathfollowing.simulation.metrics import compute_metrics
+except Exception as exc:  # pragma: no cover - defensive
+    raise SystemExit(
+        "[run_eval] cannot import vfg_pathfollowing from "
+        f"{_VFG_ROOT!r}: {exc}\n"
+        "This tool needs the in-repo path/guidance/metrics library."
+    )
+
+
+# Topic names (the recorded set — see Data_Logger.py TOPICS / the T7 contract).
+TOPIC_ODOM = "/wheel/odom"
+TOPIC_RTK_FIX = "/gps_rtk_f9p_helical/gps/fix"
+TOPIC_STATUS = "/path_follower/status"
+TOPIC_TIMING = "/path_follower/timing"
+TOPIC_CMD_VEL = "/cmd_vel"
+TOPIC_CMD_VEL_RAW = "/cmd_vel_raw"
+
+# Status Float32MultiArray layout (path_follower_node.py:172-179, hw-verified).
+STATUS_LABELS = [
+    "x", "y", "yaw", "v", "s_star", "total_length",
+    "kappa", "rho", "e_psi", "delta_cmd", "has_path",
+]
+STATUS_DELTA_CMD = STATUS_LABELS.index("delta_cmd")
+
+
+# =============================================================================
+# Analytic reference reconstruction (mirror of path_follower_node.build_path_from_recipe)
+# =============================================================================
+
+def build_path_from_recipe(recipe, r_min_default=0.5):
+    """Map a recipe dict -> analytic PathBase, identically to the follower node.
+
+    Kept byte-for-byte equivalent to ``PathFollowerNode.build_path_from_recipe``
+    (path_follower_node.py:294-357) so the analytic reference we score against is
+    *exactly* the curve that was driven. The only difference: the node reads its
+    U-turn radius from the live ``R_min`` param; here we take it from the recipe
+    if present, else from ``r_min_default`` (which the caller can override from
+    the sidecar's controller_tuning if it carries an R_min).
+
+    Schema::  {"type": "step"|"slalom"|"uturn", "params": {...}}
+    """
+    if not isinstance(recipe, dict):
+        raise ValueError(
+            f"recipe must be a JSON object, got {type(recipe).__name__}")
+
+    ptype = str(recipe.get("type", "")).lower().strip()
+    params = recipe.get("params", {}) or {}
+    if not isinstance(params, dict):
+        raise ValueError("recipe 'params' must be a JSON object")
+
+    def _f(key, default):
+        return float(params.get(key, default))
+
+    def _i(key, default):
+        return int(params.get(key, default))
+
+    if ptype == "step":
+        return StepCurvaturePath(
+            L1=_f("L1", 5.0),
+            R=_f("R", 0.5),
+            theta_arc=_f("theta_arc", math.pi / 2),
+            L2=_f("L2", 5.0),
+            direction=_i("direction", 1),
+        )
+    elif ptype == "slalom":
+        return SlalomPath(
+            R=_f("R", 0.5),
+            theta_arc=_f("theta_arc", math.pi / 2),
+            L1=_f("L1", 5.0),
+            L_mid=_f("L_mid", 2.0),
+            n_arcs=_i("n_arcs", 6),
+            L_end=_f("L_end", 25.0),
+        )
+    elif ptype == "uturn":
+        return StepCurvaturePath(
+            L1=_f("L1", 1.0),
+            R=_f("R", r_min_default),
+            theta_arc=math.pi,
+            L2=_f("L2", 1.0),
+            direction=_i("direction", 1),
+        )
+    else:
+        raise ValueError(
+            f"unknown recipe type '{ptype}'; expected 'step', 'slalom', or 'uturn'")
+
+
+# =============================================================================
+# Bag reading (rosbags lib; degrade gracefully if absent)
+# =============================================================================
+
+def _require_rosbags():
+    try:
+        from rosbags.highlevel import AnyReader  # noqa: F401
+        return AnyReader
+    except Exception as exc:
+        raise SystemExit(
+            "[run_eval] the 'rosbags' pip library is required to read rosbag2 "
+            "files without sourcing ROS.\n"
+            "  Install it on whatever host runs the analysis:  pip install rosbags\n"
+            f"  (import failed with: {exc})\n"
+            "Fallback: if 'rosbags' cannot be installed, decode the bag on the "
+            "NUC with ROS sourced and `ros2 bag` / rosbag2_py, then feed the "
+            "extracted arrays in — but do not invent values."
+        )
+
+
+def read_bag(bag_dir):
+    """Read the topics we need from a rosbag2 directory.
+
+    Returns a dict of arrays keyed by topic. Each entry holds parallel arrays
+    keyed by field (e.g. 'stamp', 'x', 'y', ...). Missing topics map to None so
+    callers can decide how to degrade.
+    """
+    AnyReader = _require_rosbags()
+    from pathlib import Path
+
+    bag = Path(bag_dir)
+    if not bag.exists():
+        raise SystemExit(f"[run_eval] bag path does not exist: {bag_dir}")
+
+    out = {
+        TOPIC_ODOM: None,
+        TOPIC_RTK_FIX: None,
+        TOPIC_STATUS: None,
+        TOPIC_TIMING: None,
+        TOPIC_CMD_VEL: None,
+        TOPIC_CMD_VEL_RAW: None,
+    }
+    # Accumulators
+    odom = {"stamp": [], "x": [], "y": [], "yaw": [], "v": []}
+    rtk = {"stamp": [], "lat": [], "lon": [], "status": []}
+    status = {"stamp": [], "delta_cmd": [], "e_psi": [], "has_path": []}
+    timing = {"stamp": [], "ms": []}
+    cmd = {"stamp": [], "ang_z": [], "lin_x": []}
+    cmd_raw = {"stamp": [], "ang_z": [], "lin_x": []}
+
+    want = set(out.keys())
+
+    with AnyReader([bag]) as reader:
+        conns = [c for c in reader.connections if c.topic in want]
+        for conn, t_ns, raw in reader.messages(connections=conns):
+            msg = reader.deserialize(raw, conn.msgtype)
+            t = t_ns * 1e-9
+            topic = conn.topic
+            if topic == TOPIC_ODOM:
+                p = msg.pose.pose.position
+                q = msg.pose.pose.orientation
+                odom["stamp"].append(t)
+                odom["x"].append(p.x)
+                odom["y"].append(p.y)
+                odom["yaw"].append(_yaw_from_quat(q.x, q.y, q.z, q.w))
+                odom["v"].append(msg.twist.twist.linear.x)
+            elif topic == TOPIC_RTK_FIX:
+                rtk["stamp"].append(t)
+                rtk["lat"].append(msg.latitude)
+                rtk["lon"].append(msg.longitude)
+                rtk["status"].append(int(getattr(msg.status, "status", 0)))
+            elif topic == TOPIC_STATUS:
+                data = list(msg.data)
+                status["stamp"].append(t)
+                status["delta_cmd"].append(
+                    data[STATUS_DELTA_CMD] if len(data) > STATUS_DELTA_CMD else float("nan"))
+                status["e_psi"].append(
+                    data[STATUS_LABELS.index("e_psi")]
+                    if len(data) > STATUS_LABELS.index("e_psi") else float("nan"))
+                status["has_path"].append(
+                    data[STATUS_LABELS.index("has_path")]
+                    if len(data) > STATUS_LABELS.index("has_path") else 0.0)
+            elif topic == TOPIC_TIMING:
+                timing["stamp"].append(t)
+                timing["ms"].append(float(msg.data))
+            elif topic == TOPIC_CMD_VEL:
+                cmd["stamp"].append(t)
+                cmd["ang_z"].append(msg.angular.z)
+                cmd["lin_x"].append(msg.linear.x)
+            elif topic == TOPIC_CMD_VEL_RAW:
+                cmd_raw["stamp"].append(t)
+                cmd_raw["ang_z"].append(msg.angular.z)
+                cmd_raw["lin_x"].append(msg.linear.x)
+
+    def _np(d):
+        if not d["stamp"]:
+            return None
+        return {k: np.asarray(v, dtype=float) for k, v in d.items()}
+
+    out[TOPIC_ODOM] = _np(odom)
+    out[TOPIC_RTK_FIX] = _np(rtk)
+    out[TOPIC_STATUS] = _np(status)
+    out[TOPIC_TIMING] = _np(timing)
+    out[TOPIC_CMD_VEL] = _np(cmd)
+    out[TOPIC_CMD_VEL_RAW] = _np(cmd_raw)
+    return out
+
+
+def _yaw_from_quat(x, y, z, w):
+    """Yaw (Z) from a quaternion."""
+    siny_cosp = 2.0 * (w * z + x * y)
+    cosy_cosp = 1.0 - 2.0 * (y * y + z * z)
+    return math.atan2(siny_cosp, cosy_cosp)
+
+
+# =============================================================================
+# RTK -> local frame projection (reuse path_overlay helpers)
+# =============================================================================
+
+def project_rtk_to_local(lat, lon, anchor_spec):
+    """Project RTK lat/lon arrays to the venue-local (x, y) frame.
+
+    Reuses ``tools/path_gen/path_overlay.latlon_to_local`` with an ``Anchor``.
+    ``anchor_spec`` is a dict {lat0, lon0, bearing_deg}; if None, falls back to
+    the hardcoded rooftop anchor in path_overlay (LAT0/LON0/BEARING_DEG).
+
+    Returns (x, y, yaw) arrays. yaw is the course-over-ground derived from
+    successive RTK samples (forward-difference), so the first sample copies the
+    second's heading. This is the same notion the reposition node uses.
+    """
+    import path_overlay as po
+
+    if anchor_spec is None:
+        anchor = po.Anchor(po.LAT0, po.LON0, po.BEARING_DEG)
+    else:
+        anchor = po.Anchor(
+            float(anchor_spec["lat0"]),
+            float(anchor_spec["lon0"]),
+            float(anchor_spec.get("bearing_deg", po.BEARING_DEG)),
+        )
+
+    latlon = np.column_stack([np.asarray(lat, float), np.asarray(lon, float)])
+    xy = po.latlon_to_local(latlon, anchor)  # (N, 2)
+    x = xy[:, 0]
+    y = xy[:, 1]
+
+    yaw = _course_over_ground(x, y)
+    return x, y, yaw, anchor
+
+
+def _course_over_ground(x, y):
+    """Heading from forward differences of an (x, y) track [rad]."""
+    n = len(x)
+    yaw = np.zeros(n)
+    if n < 2:
+        return yaw
+    dx = np.diff(x)
+    dy = np.diff(y)
+    cog = np.arctan2(dy, dx)
+    yaw[:-1] = cog
+    yaw[-1] = cog[-1]
+    # Smooth out segments where the robot is essentially stationary (noise).
+    step = np.hypot(dx, dy)
+    for i in range(1, n - 1):
+        if step[i] < 1e-3:  # under 1 mm between fixes -> reuse previous heading
+            yaw[i] = yaw[i - 1]
+    return yaw
+
+
+# =============================================================================
+# Error reconstruction against the analytic reference
+# =============================================================================
+
+def errors_along_path(path, x, y, yaw, k_e=3.0):
+    """Compute (e_d, e_psi, kappa, rho, s_star, psi_des) along a trajectory.
+
+    e_d via ``path.signed_distance`` (the spec's named primitive); e_psi and
+    psi_des via ``VectorFieldGuidance`` (the same guidance the controller ran).
+    rho = |kappa| (speed-agnostic here; the runtime rho folds v in, but for an
+    analysis figure |kappa| is the path-intrinsic schedule).
+
+    All arrays are length N (one per trajectory sample). Uses the previous
+    sample's s_star as the warm-start for the next projection (monotone-ish
+    arc-length tracking, robust on self-approaching paths like the U-turn).
+    """
+    guidance = VectorFieldGuidance(path, k_e=k_e)
+    n = len(x)
+    e_d = np.zeros(n)
+    e_psi = np.zeros(n)
+    kappa = np.zeros(n)
+    s_star = np.zeros(n)
+    psi_des = np.zeros(n)
+
+    s_prev = None
+    for i in range(n):
+        q = (x[i], y[i])
+        ed_i, s_i = path.signed_distance(q, s_init=s_prev)
+        res = guidance.compute(q, yaw[i])
+        e_d[i] = ed_i
+        s_star[i] = s_i
+        kappa[i] = res["kappa"]
+        psi_des[i] = res["psi_des"]
+        ep = res["psi_des"] - yaw[i]
+        e_psi[i] = math.atan2(math.sin(ep), math.cos(ep))  # wrap to (-pi, pi]
+        s_prev = s_i
+
+    rho = np.abs(kappa)
+    return e_d, e_psi, kappa, rho, s_star, psi_des
+
+
+def build_sim_result(t, x, y, yaw, v, path, label, k_e=3.0):
+    """Assemble a SimResult-shaped object so compute_metrics() can score it.
+
+    ``t`` is re-zeroed to start at 0 so the metrics' ``t_transient`` window has
+    a meaningful origin (bag stamps are absolute epoch seconds).
+    """
+    t = np.asarray(t, float)
+    if len(t):
+        t = t - t[0]
+    e_d, e_psi, kappa, rho, s_star, psi_des = errors_along_path(
+        path, x, y, yaw, k_e=k_e)
+    return SimResult(
+        time=t,
+        X=np.asarray(x, float),
+        Y=np.asarray(y, float),
+        psi=np.asarray(yaw, float),
+        v=np.asarray(v, float),
+        delta=np.zeros(len(t)),
+        psi_des=psi_des,
+        e_psi=e_psi,
+        e_d=e_d,
+        kappa=kappa,
+        rho=rho,
+        delta_cmd=np.zeros(len(t)),
+        label=label,
+    )
+
+
+# =============================================================================
+# Extra metrics: terminal pose error + steering effort + compute cost
+# =============================================================================
+
+def terminal_pose_error(path, x, y, yaw):
+    """Euclidean + heading error at the final trajectory sample vs path end."""
+    if len(x) == 0:
+        return {"terminal_pos_err_m": None, "terminal_heading_err_deg": None}
+    s_end = path.total_length
+    p_end = path.position(s_end)
+    psi_end = path.heading(s_end)
+    dx = x[-1] - p_end[0]
+    dy = y[-1] - p_end[1]
+    pos_err = float(math.hypot(dx, dy))
+    dpsi = yaw[-1] - psi_end
+    dpsi = math.atan2(math.sin(dpsi), math.cos(dpsi))
+    return {
+        "terminal_pos_err_m": pos_err,
+        "terminal_heading_err_deg": float(math.degrees(abs(dpsi))),
+    }
+
+
+def steering_effort(status, cmd_raw, cmd):
+    """Steering-effort metrics from delta_cmd (preferred) with cmd_vel fallback.
+
+    Returns RMS, integral of |rate|, and total variation. delta_cmd from
+    ``/path_follower/status`` is the true steering command (rad); if that topic
+    is absent we fall back to angular.z on /cmd_vel_raw then /cmd_vel (the
+    actuation surrogate).
+    """
+    src = None
+    t = sig = None
+    if status is not None and "delta_cmd" in status:
+        d = status["delta_cmd"]
+        if np.any(np.isfinite(d)):
+            t = status["stamp"]
+            sig = d
+            src = "status.delta_cmd"
+    if sig is None and cmd_raw is not None:
+        t = cmd_raw["stamp"]
+        sig = cmd_raw["ang_z"]
+        src = "cmd_vel_raw.angular_z"
+    if sig is None and cmd is not None:
+        t = cmd["stamp"]
+        sig = cmd["ang_z"]
+        src = "cmd_vel.angular_z"
+    if sig is None or len(sig) == 0:
+        return {"source": None, "rms": None, "total_variation": None,
+                "abs_rate_integral": None}
+
+    sig = np.asarray(sig, float)
+    finite = np.isfinite(sig)
+    sig = sig[finite]
+    t = np.asarray(t, float)[finite]
+    if len(sig) == 0:
+        return {"source": src, "rms": None, "total_variation": None,
+                "abs_rate_integral": None}
+
+    rms = float(np.sqrt(np.mean(sig ** 2)))
+    tv = float(np.sum(np.abs(np.diff(sig)))) if len(sig) > 1 else 0.0
+    # integral of |d sig / dt| dt = same as total variation in value; report the
+    # time-weighted |rate| integral too for completeness.
+    if len(sig) > 1:
+        dt = np.diff(t)
+        dt[dt <= 0] = np.nan
+        rate = np.abs(np.diff(sig)) / dt
+        abs_rate_integral = float(np.nansum(np.abs(np.diff(sig))))
+    else:
+        abs_rate_integral = 0.0
+    return {"source": src, "rms": rms, "total_variation": tv,
+            "abs_rate_integral": abs_rate_integral}
+
+
+def compute_cost(timing):
+    """Per-cycle controller compute-cost summary from /path_follower/timing."""
+    if timing is None or len(timing.get("ms", [])) == 0:
+        return {"n": 0, "mean_ms": None, "p50_ms": None, "p95_ms": None,
+                "max_ms": None}
+    ms = np.asarray(timing["ms"], float)
+    ms = ms[np.isfinite(ms)]
+    if len(ms) == 0:
+        return {"n": 0, "mean_ms": None, "p50_ms": None, "p95_ms": None,
+                "max_ms": None}
+    return {
+        "n": int(len(ms)),
+        "mean_ms": float(np.mean(ms)),
+        "p50_ms": float(np.percentile(ms, 50)),
+        "p95_ms": float(np.percentile(ms, 95)),
+        "max_ms": float(np.max(ms)),
+    }
+
+
+# =============================================================================
+# Sidecar loading
+# =============================================================================
+
+def load_sidecar(bag_dir, sidecar_arg):
+    """Resolve and load the paired sidecar JSON."""
+    candidates = []
+    if sidecar_arg:
+        candidates.append(sidecar_arg)
+    bag_dir = bag_dir.rstrip("/")
+    base = os.path.basename(bag_dir)
+    candidates.append(f"{bag_dir}.sidecar.json")
+    candidates.append(os.path.join(bag_dir, f"{base}.sidecar.json"))
+    for c in candidates:
+        if c and os.path.isfile(c):
+            with open(c, "r", encoding="utf-8") as f:
+                return json.load(f), c
+    raise SystemExit(
+        "[run_eval] no sidecar JSON found. Tried:\n  " +
+        "\n  ".join(candidates) +
+        "\nPass --sidecar explicitly. The sidecar (T7 D3) carries the "
+        "path_recipe needed to rebuild the analytic reference.")
+
+
+# =============================================================================
+# Main
+# =============================================================================
+
+def evaluate(bag_dir, sidecar, t_transient=2.0, k_e=3.0):
+    """Run the full per-leg evaluation; return the metrics dict."""
+    recipe = sidecar.get("path_recipe")
+    if not recipe:
+        raise SystemExit(
+            "[run_eval] sidecar has no 'path_recipe'; cannot rebuild the "
+            "analytic reference. (Is this a T7-produced sidecar?)")
+
+    ctrl_tuning = sidecar.get("controller_tuning", {}) or {}
+    r_min = float(ctrl_tuning.get("R_min", ctrl_tuning.get("r_min", 0.5)))
+    eff_k_e = float(ctrl_tuning.get("k_e", k_e))
+    venue = sidecar.get("venue", {}) or {}
+    anchor_spec = venue.get("anchor")  # optional {lat0, lon0, bearing_deg}
+
+    path = build_path_from_recipe(recipe, r_min_default=r_min)
+
+    bag = read_bag(bag_dir)
+
+    result = {
+        "bag_path": os.path.abspath(bag_dir),
+        "run_id": sidecar.get("run_id"),
+        "cell_id": sidecar.get("cell_id"),
+        "leg": sidecar.get("leg"),
+        "path_recipe": recipe,
+        "analytic_total_length_m": float(path.total_length),
+        "controller_tuning": ctrl_tuning,
+        "k_e_used": eff_k_e,
+        "t_transient_s": t_transient,
+        "metrics": {},
+        "warnings": [],
+    }
+
+    # ---- odom-belief ----------------------------------------------------
+    odom = bag[TOPIC_ODOM]
+    if odom is None:
+        result["warnings"].append(
+            f"no {TOPIC_ODOM} messages in bag; odom-belief metrics skipped")
+        result["metrics"]["odom_belief"] = None
+    else:
+        sr_odom = build_sim_result(
+            odom["stamp"], odom["x"], odom["y"], odom["yaw"], odom["v"],
+            path, label="odom-belief", k_e=eff_k_e)
+        m = compute_metrics(sr_odom, t_transient=t_transient)
+        m.update(terminal_pose_error(path, odom["x"], odom["y"], odom["yaw"]))
+        m["n_samples"] = int(len(odom["stamp"]))
+        result["metrics"]["odom_belief"] = m
+
+    # ---- RTK-truth ------------------------------------------------------
+    rtk = bag[TOPIC_RTK_FIX]
+    if rtk is None:
+        result["warnings"].append(
+            f"no {TOPIC_RTK_FIX} messages in bag; RTK-truth metrics skipped")
+        result["metrics"]["rtk_truth"] = None
+        result["rtk_anchor"] = None
+    else:
+        x, y, yaw, anchor = project_rtk_to_local(
+            rtk["lat"], rtk["lon"], anchor_spec)
+        # RTK has no native body velocity; approximate from successive fixes.
+        v = _speed_from_track(rtk["stamp"], x, y)
+        sr_rtk = build_sim_result(
+            rtk["stamp"], x, y, yaw, v, path, label="rtk-truth", k_e=eff_k_e)
+        m = compute_metrics(sr_rtk, t_transient=t_transient)
+        m.update(terminal_pose_error(path, x, y, yaw))
+        m["n_samples"] = int(len(rtk["stamp"]))
+        result["metrics"]["rtk_truth"] = m
+        result["rtk_anchor"] = {
+            "lat0": anchor.lat0, "lon0": anchor.lon0,
+            "bearing_deg": anchor.bearing_deg,
+            "from_sidecar": anchor_spec is not None,
+        }
+        if anchor_spec is None:
+            result["warnings"].append(
+                "no venue.anchor in sidecar; used hardcoded rooftop anchor "
+                "from path_overlay (LAT0/LON0/BEARING_DEG). Confirm this matches "
+                "the recording venue.")
+
+    # ---- shared extras --------------------------------------------------
+    result["steering_effort"] = steering_effort(
+        bag[TOPIC_STATUS], bag[TOPIC_CMD_VEL_RAW], bag[TOPIC_CMD_VEL])
+    result["compute_cost"] = compute_cost(bag[TOPIC_TIMING])
+
+    return result
+
+
+def _speed_from_track(stamp, x, y):
+    """Approximate longitudinal speed from successive positions [m/s]."""
+    n = len(x)
+    v = np.zeros(n)
+    if n < 2:
+        return v
+    dt = np.diff(np.asarray(stamp, float))
+    dt[dt <= 0] = np.nan
+    dist = np.hypot(np.diff(x), np.diff(y))
+    spd = dist / dt
+    v[:-1] = spd
+    v[-1] = spd[-1]
+    return np.nan_to_num(v, nan=0.0)
+
+
+def default_out_path(bag_dir):
+    bag_dir = bag_dir.rstrip("/")
+    return f"{bag_dir}.metrics.json"
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(
+        description="Per-leg evaluation: rosbag2 + sidecar -> metrics JSON.")
+    ap.add_argument("bag", help="rosbag2 directory for one leg")
+    ap.add_argument("--sidecar", default=None,
+                    help="paired sidecar JSON (default: <bag>.sidecar.json)")
+    ap.add_argument("--out", default=None,
+                    help="output metrics JSON (default: <bag>.metrics.json)")
+    ap.add_argument("--t-transient", type=float, default=2.0,
+                    help="transient window excluded from steady-state RMS [s]")
+    ap.add_argument("--k-e", type=float, default=3.0,
+                    help="VFG convergence gain for e_psi reconstruction "
+                         "(overridden by sidecar controller_tuning.k_e if set)")
+    args = ap.parse_args(argv)
+
+    sidecar, sidecar_path = load_sidecar(args.bag, args.sidecar)
+    result = evaluate(args.bag, sidecar, t_transient=args.t_transient,
+                      k_e=args.k_e)
+    result["sidecar_path"] = os.path.abspath(sidecar_path)
+
+    out = args.out or default_out_path(args.bag)
+    tmp = out + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(result, f, indent=2)
+        f.write("\n")
+    os.replace(tmp, out)
+
+    print(f"[run_eval] wrote {out}")
+    for w in result["warnings"]:
+        print(f"[run_eval] WARNING: {w}")
+    # Brief stdout summary.
+    for split in ("odom_belief", "rtk_truth"):
+        m = result["metrics"].get(split)
+        if m is None:
+            print(f"[run_eval] {split}: (skipped)")
+            continue
+        print(f"[run_eval] {split}: "
+              f"rms_e_d={m.get('rms_e_d')}, max_e_psi_deg={m.get('max_e_psi_deg')}, "
+              f"term_pos={m.get('terminal_pos_err_m')}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

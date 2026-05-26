@@ -53,6 +53,10 @@ A USB WiFi dongle with an external antenna is a useful contingency if the Pi
 to LIMO_AP link is marginal at the far edge of the working area — but don't
 buy one pre-emptively, test first.
 
+> **First-time deploy?** Use the linear checklist runbook at
+> [`DOC/rtk_base_deploy.md`](../../DOC/rtk_base_deploy.md). This README is
+> the reference; the runbook is the day-of script.
+
 ## One-time setup, on the Pi
 
 Assumes a fresh Raspberry Pi OS Bookworm install, `pi` user, the repo cloned

@@ -72,6 +72,9 @@ In rough priority order:
 
 3. **Deploy + soak-test the RTK basestation** (`tools/rtk_base/`). Blocking
    precondition for anything producing RTK-FIXED in the field.
+   **Day-of runbook:** [`DOC/rtk_base_deploy.md`](DOC/rtk_base_deploy.md) —
+   linear checklist, go/no-go per phase, troubleshooting table. Read that
+   first; the bullets below are the summary view.
    - Image a Pi (Raspberry Pi OS Bookworm), `git clone H-infinity`,
      `tools/rtk_base/README.md` has the full recipe.
    - Add LIMO_AP to the Pi's NetworkManager profiles with a **static IPv4

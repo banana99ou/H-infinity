@@ -214,6 +214,34 @@
     <div class="stat" id="telemetry">(waiting for /path_follower/status)</div>
     <div class="progress" style="margin-top:6px;"><div id="prog-bar" style="width:0%"></div></div>
 
+    <!-- ============================================================
+         T10 — Experiment batch progress + pause/resume (M5, F5).
+         Modular block: subscribes /experiment/status, publishes
+         /experiment/cmd. All ids prefixed `exp-`; JS funcs `exp*`.
+         Abort also fires the existing /estop_trigger path (toggleEstop's
+         topicEstop). Sits alongside the venue/stack blocks untouched.
+         ============================================================ -->
+    <h3>Experiment</h3>
+    <div class="stat" style="margin-bottom:4px;">
+      <span class="dot" id="exp-dot"></span>sequencer: <span id="exp-rate">--</span>
+    </div>
+    <div class="stat" id="exp-progress">(waiting for /experiment/status)</div>
+    <div class="progress" style="margin-top:6px;"><div id="exp-prog-bar" style="width:0%"></div></div>
+    <div class="stat" id="exp-detail" style="margin-top:6px;"></div>
+    <div class="small" id="exp-message"></div>
+    <div class="row" style="margin-top:6px;">
+      <button id="exp-btn-pause">Pause</button>
+      <button id="exp-btn-resume" class="primary">Resume</button>
+    </div>
+    <div class="row" style="margin-top:6px;">
+      <button id="exp-btn-skip">Skip cell</button>
+      <button id="exp-btn-abort" class="estop" style="font-size:14px;padding:8px;">ABORT</button>
+    </div>
+    <div class="small">
+      Pause/Resume/Skip publish to <code>/experiment/cmd</code>. <b>Abort</b> stops
+      the batch <i>and</i> latches the E-stop (<code>/estop_trigger</code>).
+    </div>
+
     <details>
       <summary>Anchor &amp; track geometry</summary>
       <label>lat <input type="number" id="lat" step="0.000001" value="37.61174497"></label>
@@ -858,8 +886,10 @@ let topicEstop = null, topicEstopState = null, topicRefPath = null, topicReset =
 let topicOdom = null, topicStatus = null;
 let topicOrchStart = null, topicOrchKill = null, topicOrchStatus = null;
 let topicRtkFix = null;
+let topicExpStatus = null, topicExpCmd = null;   // T10 — /experiment/{status,cmd}
 let setParamsService = null;
 let lastOdomTime = 0, lastStatusTime = 0, odomCount = 0, statusCount = 0;
+let lastExpTime = 0, expCount = 0;                // T10 — sequencer freshness
 let odomRateTimer = null;
 let estopActive = null;
 
@@ -877,8 +907,11 @@ function setConnUI(connected) {
   if (!connected) {
     setDot('odom-dot', null);
     setDot('status-dot', null);
+    setDot('exp-dot', null);
     $('odom-rate').textContent = '--';
     $('status-rate').textContent = '--';
+    $('exp-rate').textContent = '--';
+    lastExpTime = 0; expCount = 0;
     $('estop-state').textContent = 'state: unknown (not connected)';
     $('stack-panel').innerHTML = '(connect first)';
     $('vspeed-state').textContent = '(set after connect)';
@@ -979,6 +1012,16 @@ function subscribeAll() {
   });
   topicRtkStatus.subscribe(onRtkStatus);
 
+  // T10 — Experiment sequencer (T6 contract). Status is std_msgs/String JSON;
+  // command is std_msgs/String JSON {action:'pause'|'resume'|'abort'|'skip'}.
+  topicExpStatus = new ROSLIB.Topic({
+    ros, name: '/experiment/status', messageType: 'std_msgs/msg/String'
+  });
+  topicExpStatus.subscribe(onExpStatus);
+  topicExpCmd = new ROSLIB.Topic({
+    ros, name: '/experiment/cmd', messageType: 'std_msgs/msg/String'
+  });
+
   // Path-follower v_const setter
   setParamsService = new ROSLIB.Service({
     ros, name: '/path_follower_node/set_parameters',
@@ -1028,7 +1071,11 @@ function updateRates() {
   $('status-rate').textContent = `${statusCount} Hz`;
   setDot('odom-dot',   (now - lastOdomTime)   < 1500 ? 'ok' : 'bad');
   setDot('status-dot', (now - lastStatusTime) < 1500 ? 'ok' : 'bad');
-  odomCount = 0; statusCount = 0;
+  // T10 — sequencer status is low-rate (per phase, not per cycle); treat as
+  // fresh within 5 s and show messages/sec rather than a control-loop Hz.
+  $('exp-rate').textContent = lastExpTime ? `${expCount}/s` : '--';
+  setDot('exp-dot', !lastExpTime ? null : ((now - lastExpTime) < 5000 ? 'ok' : 'warn'));
+  odomCount = 0; statusCount = 0; expCount = 0;
 }
 
 function onOdom(msg) {
@@ -1155,6 +1202,77 @@ function setVConst(v) {
   }, (err) => {
     $('vspeed-state').innerHTML = `<span class="err">service error: ${err}</span>`;
   });
+}
+
+// ============================================================
+// T10 — Experiment batch progress + pause/resume (M5, F5)
+// Self-contained module. Consumes the T6 sequencer contract:
+//   sub /experiment/status (std_msgs/String JSON {run_id, cell_id,
+//        cell_index, n_cells, leg, phase, pass, fail, eta_s, message})
+//   pub /experiment/cmd    (std_msgs/String JSON {action})
+// Abort also fires the existing E-stop path (topicEstop → /estop_trigger).
+// ============================================================
+
+function expFmtEta(s) {
+  if (s == null || !isFinite(s) || s < 0) return '--';
+  s = Math.round(s);
+  const m = Math.floor(s / 60), sec = s % 60;
+  return m > 0 ? `${m}m ${sec}s` : `${sec}s`;
+}
+
+function onExpStatus(msg) {
+  lastExpTime = Date.now(); expCount++;
+  let d;
+  try { d = JSON.parse(msg.data); } catch (e) {
+    $('exp-progress').innerHTML = '<span class="err">bad /experiment/status JSON</span>';
+    return;
+  }
+
+  const idx   = Number(d.cell_index);
+  const total = Number(d.n_cells);
+  const haveIdx = isFinite(idx) && isFinite(total) && total > 0;
+  // cell_index is 0-based; show 1-based "current / total" to the operator.
+  const cur = haveIdx ? Math.min(idx + 1, total) : 0;
+  const pct = haveIdx ? Math.min(100, Math.max(0, 100 * cur / total)) : 0;
+  $('exp-prog-bar').style.width = pct.toFixed(1) + '%';
+
+  const phase = d.phase != null ? String(d.phase) : '--';
+  const pass = Number(d.pass) || 0, fail = Number(d.fail) || 0;
+  const failClass = fail > 0 ? 'err' : 'ok';
+
+  $('exp-progress').innerHTML =
+    `cell ${haveIdx ? `${cur} / ${total}` : '--'} ` +
+    `(${haveIdx ? pct.toFixed(0) : '--'}%) &nbsp; ` +
+    `run: <span class="ok">${d.run_id != null ? d.run_id : '--'}</span>`;
+
+  $('exp-detail').innerHTML =
+    `cell-id: ${d.cell_id != null ? d.cell_id : '--'} &nbsp; leg: ${d.leg != null ? d.leg : '--'}<br>` +
+    `phase: <span class="pill">${phase}</span> &nbsp; ETA: ${expFmtEta(d.eta_s)}<br>` +
+    `<span class="ok">pass: ${pass}</span> &nbsp; ` +
+    `<span class="${failClass}">fail: ${fail}</span>`;
+
+  $('exp-message').textContent = d.message != null ? String(d.message) : '';
+}
+
+function expSendCmd(action) {
+  if (!ros || !topicExpCmd) { alert('not connected'); return false; }
+  topicExpCmd.publish(new ROSLIB.Message({ data: JSON.stringify({ action }) }));
+  $('exp-message').textContent = `sent: ${action} @ ${new Date().toLocaleTimeString()}`;
+  return true;
+}
+
+function expPause()  { expSendCmd('pause'); }
+function expResume() { expSendCmd('resume'); }
+function expSkip() {
+  if (!confirm('Skip the current experiment cell?')) return;
+  expSendCmd('skip');
+}
+// Abort: tell the sequencer to abort AND latch the E-stop (defence in depth —
+// the sequencer may not be alive/listening, but the E-stop always gates motion).
+function expAbort() {
+  if (!confirm('ABORT the batch and latch E-stop?')) return;
+  expSendCmd('abort');
+  if (topicEstop) topicEstop.publish(new ROSLIB.Message({ data: true }));
 }
 
 // ============================================================
@@ -1618,6 +1736,12 @@ $('btn-resume').onclick = resume;
 $('btn-stop').onclick = stopScenario;
 $('btn-recenter').onclick = recenterOnRobot;
 $('btn-teleop').onclick = toggleTeleopPanel;
+
+// T10 — experiment sequencer command buttons
+$('exp-btn-pause').onclick  = expPause;
+$('exp-btn-resume').onclick = expResume;
+$('exp-btn-skip').onclick   = expSkip;
+$('exp-btn-abort').onclick  = expAbort;
 
 // Path anchor wire-up
 ['anchor-x','anchor-y','anchor-th'].forEach(id => {

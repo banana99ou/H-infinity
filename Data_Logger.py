@@ -22,11 +22,21 @@ import time
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional, Sequence
 
-import rclpy  # pyright: ignore[reportMissingImports]
-from rclpy.node import Node  # pyright: ignore[reportMissingImports]
-from rclpy._rclpy_pybind11 import RCLError  # pyright: ignore[reportMissingImports]
-
-from std_msgs.msg import Bool, String  # pyright: ignore[reportMissingImports]
+# ROS imports are optional at module load: the pure helpers (build_sidecar,
+# write_sidecar, BagRecorder, build_leg_dirname) are reused off-robot (laptop
+# analysis, tools/analysis/make_sidecar.py) where rclpy is not installed. The
+# health node + CLI main() still require ROS and only run on the NUC.
+try:
+    import rclpy  # pyright: ignore[reportMissingImports]
+    from rclpy.node import Node  # pyright: ignore[reportMissingImports]
+    from rclpy._rclpy_pybind11 import RCLError  # pyright: ignore[reportMissingImports]
+    from std_msgs.msg import Bool, String  # pyright: ignore[reportMissingImports]
+    _HAVE_RCLPY = True
+except Exception:  # pragma: no cover - laptop has no ROS
+    _HAVE_RCLPY = False
+    Node = object          # lets DataLoggerHealthNode be defined (used only on NUC)
+    RCLError = Exception
+    Bool = String = None   # resolve method annotations (msg: Bool) at class-def time
 
 
 TOPICS = [

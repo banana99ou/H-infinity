@@ -38,8 +38,24 @@ PROCS = {
     'estop': [
         'python3', '/home/agilex/H-infinity/estop_cli.py', '--no-ping',
     ],
+    # T3 (L3): the odom-zeroing overlay. Subscribes raw /wheel/odom,
+    # republishes /wheel/odom_zeroed re-anchored to the latched origin; the
+    # sequencer latches a fresh origin by publishing True to /odom_zero/reset
+    # just before each recorded leg. Raw /wheel/odom is left intact so the bag
+    # still records true wheel odom.
+    'odom_zero': [
+        'ros2', 'run', 'limo_path_follower', 'odom_zero_node',
+    ],
+    # The follower's odom subscription is hardcoded to '/wheel/odom'
+    # (path_follower_node.py:121). We do NOT edit that hardcode; instead we
+    # remap it onto the zeroed stream at launch so the controller tracks the
+    # analytic curve from a freshly-zeroed (0,0,0) origin (analytic paths start
+    # at origin heading +x). The '--ros-args -r' remap rewrites only this
+    # process's subscription; the raw topic and the bag recording of it are
+    # unaffected. Run 'odom_zero' before 'follower'.
     'follower': [
         'ros2', 'run', 'limo_path_follower', 'path_follower_node',
+        '--ros-args', '-r', '/wheel/odom:=/wheel/odom_zeroed',
     ],
 }
 

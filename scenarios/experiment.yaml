@@ -71,5 +71,10 @@ artifact_sync:
   # Mac needs Remote Login ON + the NUC key authorized; until then this target
   # fast-fails and is skipped (non-fatal). Tailscale MagicDNS name 'macbook-air'.
   mac_target: "hyeon-yongjeong@macbook-air:/Users/hyeon-yongjeong/code/H-infinity/Experiment Data/"
-  nas_target: "me@nanasrv:/home/me/Experiment Data/"
+  # nas_target DISABLED pending routing decision: the code repo (incl. gitignored
+  # Experiment Data) is Syncthing-synced from the Mac to the NAS at
+  # /mnt/raid0/main/code, so the Mac->NAS copy may already be covered by Syncthing
+  # (no direct NUC->NAS push needed). If direct push is wanted, set this to
+  # "me@nanasrv:/mnt/raid0/main/code/Experiment Data/" (NOT /home/me).
+  nas_target: ""
   local_repo: "/home/agilex/H-infinity/Experiment Data"   # robot's own git history

@@ -9,15 +9,44 @@ Legend: ✅ met · ⚠️ partial · ❌ missing.
 
 ---
 
+## Session update — 2026-05-26 (hardware-verified on the live robot)
+
+First on-robot pass. Brought up `base_gnss`, ran the missing-info sweep, deployed
+the T1/T3/T5/T7/T9 work, and verified with wheels-up synthetic odom.
+
+**Verified ✅ (synthetic, wheels up):**
+- **T1** — recipe → exact analytic curve: reported `total_length` == analytic
+  `4.7854 m` *exactly* (not a Bezier re-spline); curvature a sharp `0→1/R` step;
+  `/path_follower/done` latches; `/path_follower/timing` mean **0.43 ms/cycle**.
+  → P1, P4, O3(done), A3(timing) closed.
+- **T3** — odom-zero overlay: mirror before reset → `(0,0,0)` at reset → SE(2)-
+  relative after, raw `/wheel/odom` untouched. → L3 closed.
+- **T7** — `BagRecorder` records a real bag, all 4 new topics captured, sidecar
+  parses with all D3 keys. → D1, D3 closed.
+- **T9** — RTK-FIXED gate FAILs on NO-FIX with exit code 1 (gate-able);
+  `cmd_vel_raw` publisher check present; battery/motion_mode/odom checks pass.
+
+**Corrected:** T5 now reads RTK-FIXED from the `rtk_status` string (`quality=4`),
+not `NavSatFix.status` (which can't distinguish RTK on this F9P). Static-checked
+only (browser UI unverified).
+
+**Still blocked on a physical condition:** open-sky **RTK FIXED** (was NO-FIX
+indoors) to confirm the `quality=4` literal; **R_min** measurement (U-turn);
+wheels-on-floor for T4/T6.
+
+Robot-verification checklist items 1–4 are now resolved (see Part C).
+
+---
+
 ## Part A — Gap matrix (ROC → current state)
 
 ### 3.1 Reference path generation
 | ROC | State | Evidence |
 |---|---|---|
-| P1 analytic step-curvature | ⚠️ | `StepCurvaturePath` exists (`vfg_pathfollowing/paths/step_curvature.py`, starts at origin, exact step) but isn't delivered to the controller analytically — see P4. |
+| P1 analytic step-curvature | ✅ | Delivered analytically via `/reference_path_recipe` (T1, `path_follower_node.py` `build_path_from_recipe`). **hw-verified**: curvature a sharp `0→1/R` step. |
 | P2 analytic slalom | ⚠️ | `SlalomPath` exists (`vfg_pathfollowing/paths/slalom.py`), same delivery gap. |
 | P3 turnaround (U-turn, 3-point) | ❌ | U-turn expressible as `StepCurvaturePath(theta_arc=π)` but not wired; 3-point needs reverse, which the follower can't do (`path_follower_node.py:309` sets `linear.x=v_const≥0`). |
-| P4 deliver without distortion | ❌ | Follower re-splines every `/reference_path` to `BezierPath` (`path_follower_node.py:210`), rounding the curvature step. Analytic in-node path exists only for the hardcoded `use_demo_path` (`:84`). |
+| P4 deliver without distortion | ✅ | Recipe builds the analytic path in-node (T1); **hw-verified** reported `total_length` == analytic exactly. Bezier path kept only for ad-hoc P5. |
 | P5 ad-hoc Bezier | ✅ | `_path_cb` (`path_follower_node.py:193-218`) + battle-station path designer. |
 
 ### 3.2 Control & safety
@@ -35,7 +64,7 @@ Legend: ✅ met · ⚠️ partial · ❌ missing.
 |---|---|---|
 | L1 odom-only feedback in run | ✅ | follower subscribes `/wheel/odom` only (`path_follower_node.py:121`). |
 | L2 RTK recorded as GT | ⚠️ | RTK published (`GPS-RTK_ROS2_pub_node.py`) and in `Data_Logger.py` TOPICS, but not yet per-run sequenced. |
-| L3 odom reset w/o disturbing RTK | ❌ | No odom-reset mechanism anywhere. |
+| L3 odom reset w/o disturbing RTK | ✅ | `odom_zero_node` (T3) re-anchors via SE(2) offset; **hw-verified** + confirmed no native `limo_base` reset service exists. Raw `/wheel/odom` untouched. |
 | L4 RTK between-run only | ✅ | Invariant holds by design (ADR-01); no reposition yet to violate it. |
 | L5 regular GPS recorded (sep. dataset) | ✅ | `/pixhawk/...` topics in `Data_Logger.py:34-36`. |
 
@@ -54,15 +83,15 @@ V1 persist venue / V2 RTK corner pins / V3 exclusion-aware placement / V4 valida
 ### 3.7 Recording & data management
 | ROC | State | Evidence |
 |---|---|---|
-| D1 bag per leg, full topic set | ⚠️ | `Data_Logger.py` records a fixed list but **missing** `/reference_path`, `/path_follower/status`, `/path_follower/done`, `/path_follower/timing`; not per-leg sequenced. |
+| D1 bag per leg, full topic set | ✅ | `Data_Logger.py` TOPICS now include the 4 follower topics; `BagRecorder` (T7) records the full set per leg. **hw-verified** all 4 present. Per-leg sequencing comes with T6. |
 | D2 deterministic layout + run-ID | ⚠️ | Naming scheme exists (`Data_Logger.py:45-51`) but no run-ID/cell pairing. |
-| D3 sidecar JSON | ❌ | none. |
+| D3 sidecar JSON | ✅ | `build_sidecar`/`write_sidecar` (T7), all D3 fields; **hw-verified** parses next to the bag. |
 | D4 pass/fail classification | ❌ | none. |
 
 ### 3.8 Monitoring & alerting
 | ROC | State | Evidence |
 |---|---|---|
-| M1 preflight gate | ⚠️ | `preflight.sh` checks service/node-graph/safety-chain/`motion_mode`/battery/odom-rate, but **no RTK-FIXED check**, and it's a standalone script, not a per-cell gate. |
+| M1 preflight gate | ⚠️ | `preflight.sh` now adds an RTK-FIXED gate + `cmd_vel_raw` publisher check (T9, **hw-verified** FAIL→exit 1). Still standalone (T6 must invoke it per-cell) and run-window RTK-% (Y) unset. |
 | M2 battery alert/halt | ⚠️ | `/limo_status.battery_voltage` available; preflight warns <10.8 V / fails <10.5 V. **Spec says 30%/20% but telemetry is VOLTS** — thresholds must be restated in volts (open item). No runtime alert/halt. |
 | M3 wallclock heartbeat | ❌ | none. |
 | M4 ntfy alerts | ❌ | no notification code in repo. |
@@ -73,7 +102,7 @@ V1 persist venue / V2 RTK corner pins / V3 exclusion-aware placement / V4 valida
 |---|---|---|
 | A1 per-bag metrics ×2 | ⚠️ | `compute_metrics()` (`vfg_pathfollowing/simulation/metrics.py`) does RMS/max e_psi/e_d on a `SimResult`; **no bag→SimResult converter**, no odom-belief vs RTK-truth split, terminal-pose-error + steering-effort need adding. |
 | A2 aggregation/Wilcoxon/plot | ❌ | none (scipy available). |
-| A3 compute-cost | ❌ | no per-cycle timing instrumentation. |
+| A3 compute-cost | ⚠️ | Per-cycle timing now published on `/path_follower/timing` (T1, **hw-verified** 0.43 ms mean); the aggregation/figure (T11) is still missing. |
 
 ### 3.10 Fault handling
 | ROC | State | Evidence |
@@ -227,16 +256,19 @@ exact patterns and the four NUC deployment caveats.
 - Path lib: `scalecar-vfg-h-infinite/vfg_pathfollowing/paths/` ; metrics `.../simulation/metrics.py`
 
 **Confirmed interface facts:**
-- `/limo_status` carries `motion_mode` (1 = Ackermann) and `battery_voltage` (VOLTS — 11.1 nominal, preflight warns <10.8, fails <10.5).
+- `/limo_status` is `limo_msgs/msg/LimoStatus`: `motion_mode` (1 = Ackermann), `control_mode`, `battery_voltage` (float64 VOLTS — 12.0 live, preflight warns <10.8, fails <10.5), `vehicle_state`, `error_code`. (hw-confirmed 2026-05-26.)
 - `/path_follower/status` is a `Float32MultiArray`: `[x,y,yaw,v,s_star,total_length,kappa,rho,e_psi,delta_cmd,has_path]`.
 - `/reference_path` is `nav_msgs/Path`, latched (TRANSIENT_LOCAL), frame must equal `odom_frame`.
+- Recipe in on `/reference_path_recipe` (`std_msgs/String` JSON, TRANSIENT_LOCAL); done on `/path_follower/done` (`std_msgs/Bool`, latched); timing on `/path_follower/timing` (`std_msgs/Float32` ms). (T1, hw-verified.)
+- `/wheel/odom` is `nav_msgs/Odometry` @ ~50 Hz from `limo_base_node`; `/cmd_vel` sink is `limo_base_node` (1 sub).
+- RTK: `/gps_rtk_f9p_helical/gps/fix` is `sensor_msgs/NavSatFix` (lat/lon for pinning), but `status.status` does **not** distinguish RTK FIXED — use the `rtk_status` `quality=4` token instead.
 - Path classes start at origin heading +x ⇒ a freshly-zeroed odom aligns the analytic curve.
 
-**Robot-verification checklist (do at the next robot session; robot was off during planning):**
-1. Does `limo_base` expose a native **odom-reset service**? (decides T3 approach)
-2. `/limo_status` message **type + exact field names/units** (battery %, vs voltage; confirm `motion_mode` enum).
-3. RTK `rtk_status` **string values** for FIXED vs FLOAT, and reacquisition time after dropout (T4/T9 thresholds).
-4. Reposition position/heading **tolerances** and battery **volt thresholds** for M2 (resolve the spec's %→V mismatch).
+**Robot-verification checklist — RESOLVED 2026-05-26 (live graph):**
+1. ✅ `limo_base` exposes **no** odom-reset service (only MAVROS `*/reset|clear`). → T3 overlay is the mechanism.
+2. ✅ `/limo_status` is `limo_msgs/msg/LimoStatus`; `battery_voltage` is **float64 VOLTS** (live 12.0–12.1), `motion_mode=1` (Ackermann), `control_mode=1`.
+3. ✅ `rtk_status` is `std_msgs/String`, a rich line carrying a `quality=N` token (NO-FIX gave `quality=0`). FIXED → `quality=4` (driver `fix_quality_to_desc`); **literal still pending an open-sky FIXED**. Reacquisition time not measured (no fix indoors).
+4. ⏳ Reposition tolerances + battery volt thresholds (M2) still open — need a wheels-on-floor session and a user decision on the %→V mapping (observed 12.0 V healthy).
 
 **Open spec items to resolve with the user (not blocking most tasks):** battery %→volts
 mapping (M2), exact RTK-FIXED dwell K and run-window RTK % Y (M1/§5), retry limit + circuit-

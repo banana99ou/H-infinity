@@ -26,25 +26,39 @@ NICE="nice -n 19"
 IONICE=""; command -v ionice >/dev/null 2>&1 && IONICE="ionice -c3"
 base="$(basename "$BAG")"
 
+# Tailscale direct paths flap: the FIRST connect can time out while the path
+# re-establishes, and a retry succeeds. ConnectionAttempts retries the connect
+# within one ssh call; SSH_OPTS is reused for both the rsync transport and the
+# remote-commit. Keep ConnectTimeout modest so N attempts stay bounded.
+SSH_OPTS="-o BatchMode=yes -o ConnectTimeout=12 -o ConnectionAttempts=4"
+# Plus an outer retry around the whole rsync, for a flap that drops mid-connect.
+RETRIES=3
+
 push_one() {  # $1 = label, $2 = target "user@host:/path/"
   local label="$1" target="$2"
   [ -n "$target" ] || { echo "[push_artifact] $label: no target set, skip"; return 0; }
   echo "[push_artifact] -> $label : ${target}${base}"
   # -s/--protect-args handles the space in "Experiment Data" (Linux rsync).
-  if $NICE $IONICE rsync -azs $BWOPT \
-       -e "ssh -o BatchMode=yes -o ConnectTimeout=20" --exclude='.git' \
-       "$BAG" "$target"; then
+  local ok=0 attempt
+  for attempt in $(seq 1 "$RETRIES"); do
+    if $NICE $IONICE rsync -azs $BWOPT \
+         -e "ssh $SSH_OPTS" --exclude='.git' \
+         "$BAG" "$target"; then ok=1; break; fi
+    echo "[push_artifact] $label rsync attempt $attempt/$RETRIES failed (path-flap?), retrying" >&2
+    sleep $((attempt * 3))
+  done
+  if [ "$ok" = "1" ]; then
     echo "[push_artifact] $label OK: $base"
     # Commit the remote archive's own git history (best-effort, non-fatal).
     # target "user@host:/path/Experiment Data/" -> userhost + repo path.
     local uh="${target%%:*}" rp="${target#*:}"
-    if ssh -o BatchMode=yes -o ConnectTimeout=20 "$uh" \
+    if ssh $SSH_OPTS "$uh" \
          'R="'"$rp"'"; [ -d "$R/.git" ] || exit 0; git -C "$R" add -A; git -C "$R" diff --cached --quiet || git -C "$R" commit -q -m "archive '"$base"'"' \
          2>/dev/null; then
       echo "[push_artifact] $label repo committed: $base"
     fi
   else
-    echo "[push_artifact] $label FAILED (skipped, non-fatal): $base" >&2
+    echo "[push_artifact] $label FAILED after $RETRIES tries (skipped, non-fatal): $base" >&2
   fi
 }
 

@@ -1,58 +1,94 @@
-# RTK basestation — first-deployment runbook
+# RTK basestation — Pi broadcaster deployment runbook
 
-Day-of checklist for standing up the Pi-based RTK basestation for the first
-time. Written **2026-05-26** for the next-session deploy; reusable as a
-generic first-deploy SOP for future Pis.
+Day-of checklist for **putting the existing basestation (Pi + already-
+configured base F9P) onto LIMO_AP and into the rover's RTCM pipeline** —
+i.e., replacing the MacBook role for unattended operation. Written
+**2026-05-26** for the next-session deploy.
+
+What this runbook **assumes is already true**:
+- The base F9P has TMODE3 (Survey-In) and RTCM3 output saved to its flash
+  from prior basestation use. Phase 4 only sanity-checks this.
+- The Pi already has Raspberry Pi OS Bookworm. Phase 1 is just "power on
+  and SSH" — no imager step.
 
 Pairs with:
 - [tools/rtk_base/README.md](../tools/rtk_base/README.md) — the reference
   (topology, hardware, "why"). This document is the linear checklist; the
-  README is what you look at when something is unclear.
+  README is what you look at when something is unclear or you need to
+  re-configure the F9P from scratch.
 - [ToDo.md](../ToDo.md) item 3 — the backlog entry this runbook executes.
 
 **End-of-day target:** `quality=4` sustained on the bench for 30+ min, then a
 4 h+ soak running unattended overnight. **Stretch:** repeat on the rooftop.
 
-## Pre-trip (before leaving for the lab)
+## Phase 0 — Tonight at home (preload, 20 min)
 
-Pack:
-- [ ] Pi (any model that runs Raspberry Pi OS Bookworm) + microSD (8 GB+) +
-      Pi power supply
+The Pi already has Pi OS Bookworm onboard and the base F9P is already
+configured as a basestation. Tonight is about preloading the two things you
+*won't* have at school: a known WiFi to bring the Pi online, and Tailscale
+so you can SSH from your MacBook without sharing a network.
+
+0.1. **Power the Pi at home**, SSH in via whatever local method works
+(ethernet, mDNS, or the home WiFi if it's already in the Pi's profiles).
+
+0.2. **Preload the school WiFi profile** with autoconnect:
+```
+sudo nmcli connection add type wifi con-name school ifname wlan0 \
+    ssid '<SCHOOL_SSID>' \
+    wifi-sec.key-mgmt wpa-psk \
+    wifi-sec.psk '<SCHOOL_PASSWORD>' \
+    connection.autoconnect yes \
+    connection.autoconnect-priority 50
+```
+(Lower priority than LIMO_AP — see Phase 2 — so the Pi prefers LIMO_AP when
+both are available at the lab.)
+
+0.3. **Install Tailscale on the Pi:**
+```
+curl -fsSL https://tailscale.com/install.sh | sh
+sudo tailscale up                     # prints a URL; auth with your tailnet
+tailscale ip -4                       # note the Tailscale IP
+```
+
+0.4. **Confirm from the MacBook** (while still at home):
+```
+ssh pi@<pi-tailscale-hostname>        # or @<tailscale-ip>
+```
+
+If that works, the Pi is reachable from anywhere as long as it has any
+working internet — school WiFi, LIMO_AP-with-NUC-tether, anywhere.
+
+0.5. **Pack:**
+- [ ] Pi (already has PIOS) + Pi power supply
 - [ ] **USB power bank** (10 000+ mAh) for the soak test
-- [ ] Base F9P + USB-to-Pi cable
+- [ ] Base F9P (already configured) + USB-to-Pi cable
 - [ ] Base antenna + SMA cable
 - [ ] Tripod
-- [ ] Ethernet cable for initial Pi setup (or preconfigure WiFi in the imager
-      and skip the cable)
+- [ ] Ethernet cable as a last-resort fallback if both school WiFi and
+      Tailscale somehow fail (rare; school WiFi usually just works)
 
-Confirm:
+0.6. **Confirm — write down or screenshot now**, you'll want them tomorrow:
 - [ ] LIMO_AP SSID + password (look up on the NUC:
-      `nmcli connection show LIMO_AP | grep -E "ssid|psk"` — `psk` only shows
-      if you run as the right user; otherwise read `/etc/NetworkManager/system-connections/LIMO_AP.nmconnection`)
-- [ ] u-center installed on the MacBook for the F9P config step
-- [ ] Raspberry Pi Imager installed on the MacBook (if the microSD isn't
-      flashed yet)
+      `sudo cat /etc/NetworkManager/system-connections/LIMO_AP.nmconnection`)
+- [ ] The Pi's Tailscale hostname / IP
 
-## Phase 1 — Pi boots (10–15 min)
+**Go/no-go for tonight:** MacBook SSHs into the Pi over Tailscale from any
+network. Power-cycle the Pi and confirm school WiFi profile + Tailscale
+both auto-come-up.
 
-If flashing now, in Raspberry Pi Imager pick **Raspberry Pi OS Lite (64-bit)**
-and use the imager's "Edit settings" panel:
-- hostname: `rtk-base`
-- user: `pi` + password
-- enable SSH
-- optionally preconfigure your lab WiFi (saves the ethernet cable in step 1.1)
+## Phase 1 — Pi online at the lab (5 min)
 
-1.1. Insert microSD, ethernet (or trust preconfigured WiFi), power on the Pi.
+1.1. Power on the Pi. It autoconnects to school WiFi (Phase 0.2) and
+Tailscale comes up automatically.
 
-1.2. SSH in:
+1.2. SSH from the MacBook over Tailscale:
 ```
-ssh pi@rtk-base.local       # mDNS, usually works on macOS
-# fallback: nmap -p 22 192.168.1.0/24  to find the IP
+ssh pi@<pi-tailscale-hostname>
 ```
 
-1.3. Confirm internet: `ping -c 2 8.8.8.8`.
+1.3. Confirm: `ping -c 2 8.8.8.8`.
 
-**Go/no-go:** SSH'd in, internet works.
+**Go/no-go:** SSH'd in. (You haven't touched LIMO_AP yet — that's Phase 2.)
 
 ## Phase 2 — Pi joins LIMO_AP with static IP `.170` (10 min)
 
@@ -121,44 +157,37 @@ groups | grep dialout       # confirm
 `loaded; enabled; vendor preset: enabled`. It will **not** be `active` yet
 because the F9P isn't plugged in — that's correct.
 
-## Phase 4 — Configure base F9P in u-center (one-time, 15 min)
+## Phase 4 — Sanity-check the base F9P (5 min)
 
-Do this on the **MacBook** for the first-time config. The Pi doesn't need
-u-center; once the F9P's settings are saved to flash, they survive every
-future power-on.
+The F9P is already configured as a basestation from prior use. This phase
+is a quick "did anything get reset" check — not a re-config.
 
-4.1. Plug the F9P into the MacBook. u-center → Receiver → Connection →
-pick the USB device, baud 38400. You should see NMEA/UBX traffic in the
-packet console.
+4.1. Plug the F9P into the Pi over USB. Verify the udev symlink came up
+(`ls -l /dev/f9p_base` — see Phase 5 for the full check).
 
-4.2. **TMODE3 → Survey-In** (View → Configuration View → TMODE3):
-- Mode: **Survey-in**
-- Minimum observation time: **60 s**
-- Required position accuracy: **5.000 m**
-- Send.
+4.2. Quickest sanity check **without u-center**: start the broadcaster
+and look at the journal:
+```
+sudo systemctl start rtk-base
+journalctl -u rtk-base -f
+```
 
-(Coarse Survey-In is fine — venue corners are arbitrary map clicks
-anyway per [feedback_rtk_and_venue](../../.claude/projects/-Users-hyeon-yongjeong-code-H-infinity/memory/feedback_rtk_and_venue.md).
-Tighten to Fixed-mode later when V1 reproducibility matters.)
+If the stored config is intact, within ~10 s of survey-in completing
+you'll see lines like:
+```
+[status] alive=True clients=0 ... rtcm=yes types=[1005, 1077, 1087, 1097, 1127, 1230]
+```
 
-4.3. **Enable RTCM3 output on the USB port** (Configuration View → MSG, one
-at a time; for each, click Send after setting USB rate = 1):
-- `F5-05` (RTCM3 1005 — stationary RTK reference station ARP)
-- `F5-4D` (1077 — GPS MSM7)
-- `F5-57` (1087 — GLONASS MSM7)
-- `F5-61` (1097 — Galileo MSM7)
-- `F5-7F` (1127 — BeiDou MSM7)
-- `F5-E6` (1230 — GLONASS code-phase biases)
+The presence of `rtcm=yes` with that type set is proof TMODE3 + RTCM3
+output are still configured. No u-center needed.
 
-4.4. **Save to flash** (Configuration View → CFG):
-- Action: **Save current configuration**
-- Devices: tick **BBR** and **Flash** (and **I2C-EEPROM** if available)
-- Send. Then **power-cycle the F9P** (unplug + replug USB) and verify
-  TMODE3 still reads Survey-In after the power cycle.
+4.3. **If `rtcm=no` persists past survey-in time** (~10 min), the F9P's
+stored config has been lost (rare — maybe long power outage, maybe someone
+else used it). Plug it into the MacBook and re-run the u-center steps
+documented in [tools/rtk_base/README.md](../tools/rtk_base/README.md)
+under "Configure the base F9P".
 
-**Go/no-go:** TMODE3 reads Survey-In after a power cycle; RTCM3 messages
-visible in u-center's packet console while connected outdoors / near a
-window with sky.
+**Go/no-go:** `rtcm=yes` with all six message types in the Pi journal.
 
 ## Phase 5 — End-to-end bench test (20 min)
 
@@ -277,7 +306,7 @@ an external antenna on the Pi — buy when needed, not pre-emptively.
 | Pi can't see LIMO_AP | SSID/PW wrong; or LIMO_AP not actually up (NUC dispatcher needs a USB tether before it brings LIMO_AP up) |
 | Pi gets a different IP than `.170` | Another device claimed it. `arp -a` on the NUC. Power-cycle the offender or reset its DHCP lease. |
 | `/dev/f9p_base` missing | udev rule didn't fire. `udevadm test /sys/class/tty/ttyACM0` and look for the SYMLINK line. Confirm vendor:product = `1546:01a9` (`lsusb`). |
-| `rtcm=no` in the Pi journal | Base survey-in not complete (poor sky), or the F9P config got lost (re-do Phase 4 and verify save-to-flash). |
+| `rtcm=no` in the Pi journal | Base survey-in not complete (poor sky), or the F9P stored config has been wiped — re-config via u-center using the steps in [tools/rtk_base/README.md](../tools/rtk_base/README.md) "Configure the base F9P". |
 | `quality=1` on the rover forever | Pi journal shows `rtcm=yes` but rover isn't reaching the Pi: check rover-side `RTCM: STALE` (`netstat -an \| grep 2101` on the Pi to see if the NUC even connected). |
 | Power bank dies mid-soak | Spec-check the bank (10 000 mAh should give 10 h on Pi 4 + F9P; if it dies in 3 h, the bank is the problem, not the broadcaster). |
 

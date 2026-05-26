@@ -53,10 +53,29 @@ verifying in between.
           ~/agilex_ws/src/limo_path_follower
   ```
 
-## SSH pattern
+## SSH / rsync / sync
 
-`ssh` will not accept a password on argv; `sshpass` is not installed. Use
-`expect` (already permission-granted for this repo):
+SSH and rsync to the NUC are **passwordless via Tailscale SSH** — plain
+`ssh agilex@agilex-nuc12wski7 '<cmd>'` and `rsync` work with no password and no
+`expect`. Add `-o BatchMode=yes` to fail fast rather than hang if Tailscale auth
+is ever unavailable.
+
+To sync the repo, prefer the wrapper (`tools/sync/sync.sh`):
+
+```bash
+tools/sync/sync.sh push   # laptop code/docs -> NUC  (laptop is canonical)
+tools/sync/sync.sh pull   # NUC run artifacts ("Experiment Data/") -> laptop
+tools/sync/sync.sh push-dry | pull-dry    # rsync --dry-run preview first
+```
+
+Direction of truth: code/docs only ever go **laptop → NUC**; run artifacts
+(rosbags + sidecars under `Experiment Data/`, gitignored) only ever come
+**NUC → laptop**. Push is additive (no `--delete`) so NUC-unique files survive.
+This is the interim mechanism; the long-term plan is a shared git remote both
+machines push/pull for code, plus this tool for the large artifacts.
+
+**Fallback** (only if Tailscale SSH is down): `sshpass` is not installed and the
+agilex password lives in `DOC/network_topology.md`; pass it via `expect`:
 
 ```bash
 expect -c '
@@ -66,30 +85,10 @@ expect { -re "(P|p)assword:" { send "PASSWORD\r"; exp_continue } eof }
 '
 ```
 
-For anything non-trivial, write a script to `/tmp/foo.sh` on the laptop,
-rsync it, then `bash /tmp/foo.sh` over ssh. Avoids quoting hell. Do **not**
-use `set -u` in such scripts — `/opt/ros/humble/setup.bash` references unset
+For anything non-trivial over the fallback, write a script to `/tmp/foo.sh`,
+rsync it, then `bash /tmp/foo.sh` over ssh (avoids quoting hell). Do **not** use
+`set -u` in such NUC scripts — `/opt/ros/humble/setup.bash` references unset
 variables and will abort.
-
-## Rsync pattern
-
-Laptop → NUC, working-tree mirror (no `--delete` unless you are certain the
-NUC has nothing unique):
-
-```bash
-expect -c '
-set timeout 120
-spawn rsync -avz \
-  --exclude=.git --exclude=.DS_Store --exclude=__pycache__ --exclude=*.pyc \
-  --exclude=.specstory --exclude=.vscode \
-  --exclude=build --exclude=install --exclude=log --exclude=.pytest_cache \
-  /Users/hyeon-yongjeong/code/H-infinity/ \
-  agilex@agilex-nuc12wski7:/home/agilex/H-infinity/
-expect { -re "(P|p)assword:" { send "PASSWORD\r"; exp_continue } eof }
-'
-```
-
-Prefer `--dry-run` first to confirm the change set before pushing.
 
 ## Build & run
 

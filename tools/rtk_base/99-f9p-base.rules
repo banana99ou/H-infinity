@@ -1,0 +1,15 @@
+# udev rule for the RTK base F9P on the Raspberry Pi.
+#
+# Creates the stable symlink /dev/f9p_base pointing at whatever ttyACM* the
+# u-blox ZED-F9P enumerates as. Mirrors the pattern used on the NUC for the
+# rover's helical F9P (/dev/f9p_helical).
+#
+# u-blox ZED-F9P USB IDs:
+#   idVendor=1546 (u-blox AG)
+#   idProduct=01a9 (u-blox GNSS receiver)
+#
+# If you ever plug a SECOND u-blox receiver into the Pi (e.g. a rover during
+# bench testing), both will match this rule. In that case, add a serial-number
+# match too: ATTRS{serial}=="..." — find it with `udevadm info -a -n /dev/ttyACM0`.
+
+SUBSYSTEM=="tty", ATTRS{idVendor}=="1546", ATTRS{idProduct}=="01a9", SYMLINK+="f9p_base", MODE="0660", GROUP="dialout"

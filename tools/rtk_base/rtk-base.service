@@ -1,0 +1,42 @@
+[Unit]
+Description=RTK Base — RTCM3 TCP broadcaster for ZED-F9P
+Documentation=file:///home/pi/H-infinity/tools/rtk_base/README.md
+# Wait for udev to create the F9P symlink and for WiFi (LIMO_AP) to be up.
+After=network-online.target dev-f9p_base.device
+Wants=network-online.target dev-f9p_base.device
+# Don't churn forever if something is permanently wrong (e.g. bad config).
+# These belong in [Unit], not [Service], in modern systemd.
+StartLimitIntervalSec=300
+StartLimitBurst=10
+
+[Service]
+Type=simple
+User=pi
+Group=pi
+# `pi` must be in the `dialout` group to open /dev/f9p_base; install.sh handles
+# that. SupplementaryGroups= here as a belt-and-braces guarantee.
+SupplementaryGroups=dialout
+
+WorkingDirectory=/home/pi/H-infinity/tools/rtk_base
+ExecStart=/usr/bin/python3 /home/pi/H-infinity/tools/rtk_base/rtcm_server.py \
+    --serial /dev/f9p_base \
+    --baud 115200 \
+    --host 0.0.0.0 \
+    --port 2101 \
+    --log-level INFO
+
+Restart=always
+RestartSec=5
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=rtk-base
+
+# Mild hardening — the broadcaster has no business touching most of the FS.
+ProtectSystem=full
+ProtectHome=read-only
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

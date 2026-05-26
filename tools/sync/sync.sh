@@ -33,14 +33,29 @@ CODE_EXCLUDES=(
   --exclude="$ARTIFACTS/"            # never push artifacts up
 )
 
-usage() { echo "usage: $0 {push|pull|push-dry|pull-dry}"; exit 2; }
+ART_PATH="$LAPTOP_ROOT/$ARTIFACTS"
+
+# The artifact folder is its OWN local-only git repo (separate from the code
+# repo, which gitignores it). It tracks run-artifact history without git-LFS and
+# without bloating the code repo, and never gets a remote / never pushes (a
+# pre-push hook blocks it). See `init-artifacts`.
+_artifacts_commit() {  # $1 = commit message; no-op unless the repo has changes
+  [ -d "$ART_PATH/.git" ] || return 0
+  git -C "$ART_PATH" add -A
+  if ! git -C "$ART_PATH" diff --cached --quiet; then
+    git -C "$ART_PATH" commit -q -m "$1"
+    echo "[sync] artifact repo: committed '$1'"
+  fi
+}
+
+usage() { echo "usage: $0 {push|pull|push-dry|pull-dry|init-artifacts}"; exit 2; }
 
 DRY=""
 cmd="${1:-}"
 case "$cmd" in
   push-dry) cmd=push; DRY="--dry-run" ;;
   pull-dry) cmd=pull; DRY="--dry-run" ;;
-  push|pull) ;;
+  push|pull|init-artifacts) ;;
   *) usage ;;
 esac
 
@@ -60,6 +75,38 @@ case "$cmd" in
     # (the local path is a single quoted arg and needs no escaping).
     rsync -avz $DRY "${SSH_E[@]}" \
       "$NUC:$NUC_ROOT/${ARTIFACTS// /\\ }/" "$LAPTOP_ROOT/$ARTIFACTS/"
+    # Track artifact history in the folder's own local-only repo (if init'd).
+    [ -n "$DRY" ] || _artifacts_commit "pull $(date -u +%FT%TZ): artifacts from NUC"
+    ;;
+  init-artifacts)
+    echo "[sync] init local-only artifact archive at: $ART_PATH"
+    mkdir -p "$ART_PATH"
+    if [ -d "$ART_PATH/.git" ]; then
+      echo "[sync] artifact repo already initialized."
+    else
+      git -C "$ART_PATH" init -q
+      hook="$ART_PATH/.git/hooks/pre-push"
+      printf '%s\n' '#!/bin/sh' \
+        'echo "Refusing to push: local-only run-artifact archive (never upload run data off-site)." >&2' \
+        'exit 1' > "$hook"
+      chmod +x "$hook"
+      if [ ! -f "$ART_PATH/README.md" ]; then
+        cat > "$ART_PATH/README.md" <<'EOF'
+# Experiment Data — local-only artifact archive
+
+rosbags + per-leg sidecar JSON from the robot. This is its OWN git repo,
+separate from the H-infinity code repo (which gitignores this folder). It tracks
+run-artifact history locally WITHOUT git-LFS and without bloating the code repo,
+and it NEVER gets a remote / is NEVER pushed (a pre-push hook blocks it).
+
+Populated by `tools/sync/sync.sh pull` (NUC -> laptop), which auto-commits new
+artifacts here. Do not add a git remote.
+EOF
+      fi
+      git -C "$ART_PATH" add -A
+      git -C "$ART_PATH" commit -q -m "init local-only artifact archive"
+      echo "[sync] initialized: no remote, push blocked by pre-push hook."
+    fi
     ;;
 esac
 echo "[sync] done."

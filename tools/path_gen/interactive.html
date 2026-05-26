@@ -258,16 +258,17 @@
       Live RTK: <span class="dot" id="rtk-dot"></span><span id="rtk-state">--</span>
     </div>
     <div class="row" style="margin-top:6px;">
-      <button id="btn-venue-pin" class="primary">Pin corner (live RTK)</button>
+      <button id="btn-venue-pin" class="primary">Add corner (click map)</button>
       <button id="btn-venue-clear-corners">Clear corners</button>
     </div>
     <div class="small" id="venue-corner-state">corners: 0 / 4</div>
+    <div class="small" id="venue-place-hint" style="color:#6cf;"></div>
     <label style="margin-top:6px;">safety margin (m)
       <span class="pill" id="venue-margin-val">0.50</span>
       <input type="range" id="venue-margin" min="0.0" max="2.0" step="0.05" value="0.50">
     </label>
     <div class="row" style="margin-top:6px;">
-      <button id="btn-venue-add-excl">Add exclusion (live RTK)</button>
+      <button id="btn-venue-add-excl">Add exclusion (click map)</button>
       <button id="btn-venue-clear-excl">Clear exclusions</button>
     </div>
     <label style="margin-top:4px;">exclusion radius (m)
@@ -276,8 +277,8 @@
     </label>
     <div class="small" id="venue-excl-state">exclusions: 0</div>
     <div class="row" style="margin-top:6px;">
-      <button id="btn-venue-add-start">Add start pin (live RTK)</button>
-      <button id="btn-venue-add-end">Add end pin (live RTK)</button>
+      <button id="btn-venue-add-start">Add start pin (click map)</button>
+      <button id="btn-venue-add-end">Add end pin (click map)</button>
     </div>
     <div class="row" style="margin-top:6px;">
       <button id="btn-venue-clear-pins">Clear start/end pins</button>
@@ -290,9 +291,12 @@
       <button id="btn-venue-export" class="primary">Export venue JSON</button>
     </div>
     <div class="small">
-      Pin actions capture the live <code>/gps_rtk_f9p_helical/gps/fix</code> at click.
-      Drag start/end dots to move; drag the cyan tip to set heading. Inset polygon =
-      corners minus margin; curves must fit it and clear all exclusions.
+      Pick a mode, then click anywhere on the map to drop a corner / exclusion /
+      pin at that point (arbitrary — no RTK fix needed). The robot's live RTK dot
+      also renders on the map, so you can drive it along the edge afterward to
+      confirm the area makes sense. Drag start/end dots to move; drag the cyan tip
+      to set heading. Inset polygon = corners minus margin; curves must fit it and
+      clear all exclusions.
     </div>
 
     <h3>Basemap</h3>
@@ -967,8 +971,8 @@ function subscribeAll() {
   // FIXED/FLOAT is NOT distinguishable from NavSatFix.status on this F9P
   // (it reads -1/0 even when the driver reports RTK). The authoritative
   // signal is the driver's rtk_status string, e.g.
-  //   "FIX: RTK FIXED (quality=4, sats=..., ...)".  (hw-confirmed 2026-05-26
-  //   on the live graph; literal quality=4 still pending an open-sky FIXED.)
+  //   "FIX: RTK FIXED (quality=4, ...)". quality=4 = FIXED per the NMEA GGA
+  //   standard + driver fix_quality_to_desc(). (hw-confirmed 2026-05-26.)
   topicRtkStatus = new ROSLIB.Topic({
     ros, name: '/gps_rtk_f9p_helical/gps/rtk_status',
     messageType: 'std_msgs/msg/String'
@@ -1169,10 +1173,9 @@ let lastRtkFix = { lat: null, lon: null, status: null, t: 0 };
 let lastRtkStatus = { quality: null, raw: '', t: 0 };
 let topicRtkStatus = null;
 
-// Quality int that denotes RTK FIXED on the F9P (driver fix_quality_to_desc:
-// 4 = "RTK FIXED", 5 = "FLOAT"). hw-confirmed: rtk_status is the right source
-// and carries a "quality=N" token; the literal 4 still wants an open-sky FIXED
-// to confirm end-to-end. See DOC/gap_analysis.md Part C #3.
+// Quality int that denotes RTK FIXED (NMEA GGA standard + driver
+// fix_quality_to_desc: 4 = "RTK FIXED", 5 = "RTK FLOAT"). Authoritative.
+// See DOC/gap_analysis.md Part C #3.
 const RTK_FIXED_QUALITY = 4;
 
 function onRtkStatus(msg) {
@@ -1453,14 +1456,53 @@ function nextPinId(kind) {
   return kind === 'start' ? `S${++venueStartCount}` : `E${++venueEndCount}`;
 }
 
-$('btn-venue-pin').onclick = () => {
-  if (venue.corners.length >= 4) { alert('already have 4 corners — clear first to re-pin'); return; }
-  const f = captureRtkOrAlert('pin corner');
-  if (!f) return;
-  venue.corners.push({ lat: f.lat, lon: f.lon });
+// Click-to-place: pick a mode, then click anywhere on the map to drop the item
+// at that arbitrary lat/lon. Corners are chosen on the map, NOT captured from a
+// live RTK fix. (The robot's live RTK dot still renders via robotMarker, so the
+// area can be confirmed later by driving the robot along the edge.)
+let venuePlaceMode = null;  // null | 'corner' | 'exclusion' | 'start' | 'end'
+const VENUE_PLACE_BTN = {
+  corner: 'btn-venue-pin', exclusion: 'btn-venue-add-excl',
+  start: 'btn-venue-add-start', end: 'btn-venue-add-end',
+};
+function venueHintText() {
+  return venuePlaceMode
+    ? `click the map to place a ${venuePlaceMode}` +
+      (venuePlaceMode === 'corner' ? ` (${venue.corners.length}/4)` : '') +
+      ' — click the button again to stop'
+    : '';
+}
+function setVenuePlaceMode(mode) {
+  venuePlaceMode = (venuePlaceMode === mode) ? null : mode;
+  Object.values(VENUE_PLACE_BTN).forEach(id => { $(id).style.outline = ''; });
+  if (venuePlaceMode) $(VENUE_PLACE_BTN[venuePlaceMode]).style.outline = '2px solid #6cf';
+  map.getContainer().style.cursor = venuePlaceMode ? 'crosshair' : '';
+  $('venue-place-hint').textContent = venueHintText();
+}
+function venuePlaceAt(latlng) {
+  const lat = latlng.lat, lon = latlng.lng;
+  if (venuePlaceMode === 'corner') {
+    if (venue.corners.length >= 4) { alert('already have 4 corners — clear first'); return; }
+    venue.corners.push({ lat, lon });
+    if (venue.corners.length >= 4) { setVenuePlaceMode(null); }
+  } else if (venuePlaceMode === 'exclusion') {
+    venue.exclusions.push({ kind: 'circle', lat, lon, radius_m: parseFloat($('venue-excl-r').value) });
+  } else if (venuePlaceMode === 'start') {
+    venue.start_pins.push({ id: nextPinId('start'), lat, lon, heading_deg: parseFloat($('bearing').value) });
+  } else if (venuePlaceMode === 'end') {
+    venue.end_pins.push({ id: nextPinId('end'), lat, lon, heading_deg: parseFloat($('bearing').value) });
+  } else { return; }
+  drawVenue();
+  $('venue-place-hint').textContent = venueHintText();
+}
+map.on('click', (e) => { if (venuePlaceMode) venuePlaceAt(e.latlng); });
+
+$('btn-venue-pin').onclick = () => setVenuePlaceMode('corner');
+$('btn-venue-clear-corners').onclick = () => {
+  venue.corners = [];
+  if (venuePlaceMode === 'corner') $('venue-place-hint').textContent = venueHintText();
   drawVenue();
 };
-$('btn-venue-clear-corners').onclick = () => { venue.corners = []; drawVenue(); };
 $('venue-margin').oninput = (e) => {
   venue.safety_margin_m = parseFloat(e.target.value);
   $('venue-margin-val').textContent = venue.safety_margin_m.toFixed(2);
@@ -1469,25 +1511,10 @@ $('venue-margin').oninput = (e) => {
 $('venue-excl-r').oninput = (e) => {
   $('venue-excl-r-val').textContent = parseFloat(e.target.value).toFixed(2);
 };
-$('btn-venue-add-excl').onclick = () => {
-  const f = captureRtkOrAlert('add exclusion');
-  if (!f) return;
-  venue.exclusions.push({ kind: 'circle', lat: f.lat, lon: f.lon, radius_m: parseFloat($('venue-excl-r').value) });
-  drawVenue();
-};
+$('btn-venue-add-excl').onclick = () => setVenuePlaceMode('exclusion');
 $('btn-venue-clear-excl').onclick = () => { venue.exclusions = []; drawVenue(); };
-$('btn-venue-add-start').onclick = () => {
-  const f = captureRtkOrAlert('add start pin');
-  if (!f) return;
-  venue.start_pins.push({ id: nextPinId('start'), lat: f.lat, lon: f.lon, heading_deg: parseFloat($('bearing').value) });
-  drawVenue();
-};
-$('btn-venue-add-end').onclick = () => {
-  const f = captureRtkOrAlert('add end pin');
-  if (!f) return;
-  venue.end_pins.push({ id: nextPinId('end'), lat: f.lat, lon: f.lon, heading_deg: parseFloat($('bearing').value) });
-  drawVenue();
-};
+$('btn-venue-add-start').onclick = () => setVenuePlaceMode('start');
+$('btn-venue-add-end').onclick = () => setVenuePlaceMode('end');
 $('btn-venue-clear-pins').onclick = () => { venue.start_pins = []; venue.end_pins = []; venueStartCount = 0; venueEndCount = 0; drawVenue(); };
 $('btn-venue-validate').onclick = () => {
   const r = validateCurveAgainstVenue();

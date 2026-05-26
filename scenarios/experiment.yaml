@@ -34,10 +34,13 @@ matrix:
 repetitions: 10
 
 gating:
-  # Battery is reported in VOLTS on /limo_status.battery_voltage (hw-confirmed:
-  # ~12.0 V healthy). %->V mapping is an open item; these align with preflight's
-  # warn/halt (10.8/10.5). TODO(hw-verify): confirm the volt thresholds.
-  battery_volts_warn: 11.0
+  # Battery is VOLTS on /limo_status.battery_voltage (hw-confirmed ~12.0 V).
+  # M2 wants alert@30% / halt@20% SoC. Mapped linearly over the 3S Li-ion range
+  # (full 12.6 V, low-voltage floor ~10.0 V, span 2.6 V):
+  #   30% -> 10.0 + 0.30*2.6 = 10.78 V ;  20% -> 10.0 + 0.20*2.6 = 10.52 V
+  # => 10.8 / 10.5, which also matches preflight. (No vendor min/max found in
+  # the repo or limo_ros2 source; revise if a measured discharge curve differs.)
+  battery_volts_warn: 10.8
   battery_volts_halt: 10.5
   # Per-run acceptance: RTK FIXED (quality=4) for >= this % of the run window
   # (system_spec §5 "FIXED for >= Y%"). TODO(hw-verify): confirm Y.

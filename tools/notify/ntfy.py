@@ -32,11 +32,11 @@ DEFAULT_SERVER = "https://ntfy.sh"
 # battery telemetry on the platform is /limo_status.battery_voltage (float64 VOLTS,
 # observed ~12.0 V healthy). The %->V mapping for this LiPo pack is not yet
 # characterised, so we gate on raw volts. Defaults below align with the spirit of
-# tools/preflight/preflight.sh (which warns <10.8 V, fails <10.5 V); the brief
-# specifies warn=11.0 / halt=10.5 as the conservative runtime defaults.
-# TODO(hw-tune): resolve the %->V mapping (and reconcile preflight's 10.8 warn vs the
-#   11.0 warn here) once a discharge curve for the pack is measured on the robot.
-DEFAULT_BATT_WARN = 11.0
+# tools/preflight/preflight.sh (warns <10.8 V, fails <10.5 V). M2 is "alert@30% /
+# halt@20%"; mapped over the 3S Li-ion range (full 12.6 V, low-voltage floor
+# ~10.0 V) that is 10.8 / 10.5 V -- matching preflight. Revise if a measured
+# discharge curve for the pack says otherwise.
+DEFAULT_BATT_WARN = 10.8
 DEFAULT_BATT_HALT = 10.5
 
 

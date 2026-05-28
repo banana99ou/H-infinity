@@ -45,12 +45,19 @@ parent frame, it would need the same R(-yaw0) rotation applied to its linear
 component — guarded by TODO below.)
 """
 
+import json
 import math
 
 import rclpy
 from rclpy.node import Node
+from rclpy.qos import (
+    QoSProfile,
+    QoSDurabilityPolicy,
+    QoSReliabilityPolicy,
+    QoSHistoryPolicy,
+)
 from nav_msgs.msg import Odometry
-from std_msgs.msg import Bool
+from std_msgs.msg import Bool, String
 
 
 def _yaw_from_quaternion(q):
@@ -98,6 +105,26 @@ class OdomZeroNode(Node):
         self.pub_odom = self.create_publisher(
             Odometry, '/wheel/odom_zeroed', 10)
 
+        # Reset-confirmation feedback (closes the open-loop gap that bit on the
+        # 2026-05-27 B1 bring-up: the sequencer used to advance to BAG_START
+        # after a fixed settle window regardless of whether the reset had
+        # actually latched). Latched so the sequencer's subscription sees the
+        # latest state immediately. Payload schema:
+        #   {"has_reset": bool,
+        #    "origin": {"x": x0, "y": y0, "yaw": yaw0} | null,
+        #    "stamp": <ros time seconds, float> | null}
+        latched_qos = QoSProfile(
+            depth=1,
+            history=QoSHistoryPolicy.KEEP_LAST,
+            reliability=QoSReliabilityPolicy.RELIABLE,
+            durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
+        )
+        self.pub_status = self.create_publisher(
+            String, '/odom_zero/status', latched_qos)
+        # Seed the latched topic with the pre-reset state so a fresh sequencer
+        # subscription doesn't hang waiting for the first message.
+        self._publish_status()
+
         self.get_logger().info(
             'odom_zero_node started. Republishing /wheel/odom -> '
             '/wheel/odom_zeroed (identity offset until first '
@@ -128,6 +155,7 @@ class OdomZeroNode(Node):
             f'Odom origin latched at raw pose '
             f'(x={self._x0:.3f}, y={self._y0:.3f}, yaw={self._yaw0:.4f} rad). '
             f'/wheel/odom_zeroed will read (0, 0, 0) here.')
+        self._publish_status()
 
     def _odom_cb(self, msg: Odometry):
         """Re-anchor the raw pose by the latched SE(2) offset and republish."""
@@ -179,6 +207,32 @@ class OdomZeroNode(Node):
             out.twist.covariance = msg.twist.covariance
 
         self.pub_odom.publish(out)
+
+    # ------------------------------------------------------------------
+    # Status
+    # ------------------------------------------------------------------
+
+    def _publish_status(self):
+        """Publish current latch state on /odom_zero/status (latched topic).
+
+        Carries a ros-time stamp so the sequencer can confirm a latch happened
+        AFTER it commanded the reset, closing the open-loop gap.
+        """
+        if self._has_reset:
+            payload = {
+                'has_reset': True,
+                'origin': {
+                    'x': float(self._x0),
+                    'y': float(self._y0),
+                    'yaw': float(self._yaw0),
+                },
+                'stamp': float(self.get_clock().now().nanoseconds) * 1e-9,
+            }
+        else:
+            payload = {'has_reset': False, 'origin': None, 'stamp': None}
+        m = String()
+        m.data = json.dumps(payload)
+        self.pub_status.publish(m)
 
 
 def main(args=None):

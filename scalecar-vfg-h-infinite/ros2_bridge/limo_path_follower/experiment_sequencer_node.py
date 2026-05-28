@@ -228,6 +228,15 @@ class ExperimentSequencer(Node):
         # RTK-loss tracking (F2/F3).
         self._rtk_lost_since = None
 
+        # Odom-zero confirmation (closes the open-loop reset gap from the
+        # 2026-05-27 B1 bring-up). _odom_reset_command_t is the ros-time when
+        # we last published /odom_zero/reset True; we advance to BAG_START
+        # only after /odom_zero/status reports has_reset with a stamp at or
+        # after that time. Cleared on entry to ODOM_RESET.
+        self._odom_zero_status = None
+        self._odom_reset_sent = False
+        self._odom_reset_command_t = None
+
         # -- ROS interfaces ---------------------------------------------
         from rclpy.qos import (
             QoSProfile, QoSDurabilityPolicy, QoSReliabilityPolicy, QoSHistoryPolicy,
@@ -253,6 +262,10 @@ class ExperimentSequencer(Node):
         self.create_subscription(Bool, "/estop", self._on_estop, 10)
         self.create_subscription(
             String, "/gps_rtk_f9p_helical/gps/rtk_status", self._on_rtk, 10)
+        # Odom-zero latch confirmation -- latched so we see the current state on
+        # subscribe even if the overlay has been up since before us.
+        self.create_subscription(
+            String, "/odom_zero/status", self._on_odom_zero_status, latched)
         # /limo_status is limo_msgs/msg/LimoStatus; import defensively so a
         # missing message package degrades to "battery unknown" rather than a
         # construction crash.
@@ -449,6 +462,16 @@ class ExperimentSequencer(Node):
         except Exception:
             pass
 
+    def _on_odom_zero_status(self, msg):
+        try:
+            self._odom_zero_status = json.loads(msg.data) or {}
+        except (ValueError, TypeError):
+            pass
+
+    def _ros_now_s(self):
+        """Current ROS time as float seconds (matches odom_zero_node's stamp)."""
+        return float(self.get_clock().now().nanoseconds) * 1e-9
+
     # ==================================================================
     # Orchestrator helpers + C6 exclusivity
     # ==================================================================
@@ -551,6 +574,10 @@ class ExperimentSequencer(Node):
     def _enter(self, phase):
         if phase != self.phase:
             self.get_logger().info(f"phase {self.phase.value} -> {phase.value}")
+            # Per-phase one-shot flags reset on entry.
+            if phase == Phase.ODOM_RESET:
+                self._odom_reset_sent = False
+                self._odom_reset_command_t = None
         self.phase = phase
         self._phase_entered = time.monotonic()
 
@@ -747,12 +774,44 @@ class ExperimentSequencer(Node):
             if self._in_phase_s() > self._reposition_timeout:
                 self._fail_leg("odom_zero failed to start")
             return
-        m = Bool()
-        m.data = True
-        self.pub_odom_reset.publish(m)
-        # Give the overlay a moment to latch the new origin before recording.
-        if self._in_phase_s() > self._settle_s:
+
+        # Send the reset True once on first tick of this phase entry. Closing
+        # the loop on /odom_zero/status (below) means we no longer spam-publish
+        # True every tick -- which previously could re-latch the origin on a
+        # creeping robot.
+        if not self._odom_reset_sent:
+            self._odom_reset_command_t = self._ros_now_s()
+            m = Bool()
+            m.data = True
+            self.pub_odom_reset.publish(m)
+            self._odom_reset_sent = True
+            return
+
+        # Wait for /odom_zero/status to confirm a latch AT OR AFTER our command.
+        # The stamp field is ros-time seconds matching _ros_now_s(); requiring
+        # the stamp to be >= command time is what makes this closed-loop --
+        # the latched topic's seed message (stamp=null, pre-reset) and any
+        # stale prior-leg latch (stamp < command_t) both fail the check.
+        s = self._odom_zero_status or {}
+        if (s.get("has_reset") is True
+                and s.get("stamp") is not None
+                and float(s["stamp"]) >= float(self._odom_reset_command_t)):
+            origin = s.get("origin") or {}
+            self.get_logger().info(
+                f"odom_zero latch confirmed at "
+                f"(x={origin.get('x'):.3f}, y={origin.get('y'):.3f}, "
+                f"yaw={origin.get('yaw'):.4f} rad).")
             self._enter(Phase.BAG_START)
+            return
+
+        # Previous behaviour: advance after settle_s regardless. That masked a
+        # dropped-reset failure mode (overlay stays at identity offset, follower
+        # lunges to origin). Now: fail the leg if no confirmation in settle_s,
+        # let O4 auto-retry redo it from PREFLIGHT.
+        if self._in_phase_s() > self._settle_s:
+            self._fail_leg(
+                f"odom_zero reset not confirmed within {self._settle_s:.1f}s "
+                "(no /odom_zero/status latch with stamp >= command time)")
 
     def _tick_bag_start(self):
         cell = self._cur_cell()

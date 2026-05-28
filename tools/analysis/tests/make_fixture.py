@@ -163,6 +163,8 @@ def make(out_dir, rtk_bad=False, controller="lpv-hinf", R=0.5, v=0.5,
     n_rtk = 0
     with Writer(out_dir, version=8) as w:
         c_odom = w.add_connection("/wheel/odom", Odometry.__msgtype__, typestore=TS)
+        c_odomz = w.add_connection("/wheel/odom_zeroed", Odometry.__msgtype__,
+                                   typestore=TS)
         c_fix = w.add_connection("/gps_rtk_f9p_helical/gps/fix",
                                  NavSatFix.__msgtype__, typestore=TS)
         c_rtks = w.add_connection("/gps_rtk_f9p_helical/gps/rtk_status",
@@ -197,6 +199,11 @@ def make(out_dir, rtk_bad=False, controller="lpv-hinf", R=0.5, v=0.5,
             oyaw = yaw + err_amp * ramp * kappa + rng.normal(0, 0.002)
             w.write(c_odom, tns, TS.serialize_cdr(_odom(t, ox, oy, oyaw, v),
                                                   Odometry.__msgtype__))
+            # Re-anchored stream the controller actually tracked. In this
+            # fixture the driven pose is already origin-anchored, so the zeroed
+            # stream mirrors odom; run_eval prefers this for odom-belief.
+            w.write(c_odomz, tns, TS.serialize_cdr(_odom(t, ox, oy, oyaw, v),
+                                                   Odometry.__msgtype__))
             # status telemetry (e_psi ~ 0 since on-path)
             w.write(c_stat, tns, TS.serialize_cdr(
                 _status_array(ox, oy, oyaw, v, s, total, kappa, abs(kappa) * v,

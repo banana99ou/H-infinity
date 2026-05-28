@@ -35,6 +35,8 @@ chk "rtk_truth rms_e_d ~ 0 (round-trip)" \
   "python3 -c \"import json;d=json.load(open('$WORK/single.metrics.json'));import sys;sys.exit(0 if d['metrics']['rtk_truth']['rms_e_d']<1e-6 else 1)\""
 chk "cell_params passed through" \
   "python3 -c \"import json;d=json.load(open('$WORK/single.metrics.json'));import sys;sys.exit(0 if d.get('cell_params') else 1)\""
+chk "odom-belief sourced from /wheel/odom_zeroed" \
+  "python3 -c \"import json;d=json.load(open('$WORK/single.metrics.json'));import sys;sys.exit(0 if d.get('odom_belief_source')=='/wheel/odom_zeroed' else 1)\""
 
 echo "== 3. manifest + qc (RTK mode) =="
 python3 tools/analysis/manifest.py "$WORK/bagroot" --out-dir "$WORK/d" >/dev/null 2>&1

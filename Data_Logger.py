@@ -52,6 +52,11 @@ TOPICS = [
     "/cmd_vel",
     "/cmd_vel_raw",
     "/wheel/odom",
+    # The follower is launched with -r /wheel/odom:=/wheel/odom_zeroed
+    # (orchestrator PROCS), so this re-anchored stream is what the controller
+    # actually tracked. Bag BOTH: raw for the GNSS/odom comparison, zeroed for
+    # the odom-belief metric (run_eval prefers this when present).
+    "/wheel/odom_zeroed",
     "/imu",
     "/estop",
     # --- Path-follower interface (D1; produced by T1) ---

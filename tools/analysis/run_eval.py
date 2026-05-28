@@ -8,7 +8,9 @@ the analytic reference path from the sidecar ``path_recipe`` (the *same*
 mapping the follower used at drive time), recomputes cross-track / heading
 error against that reference, and emits ``compute_metrics()`` **twice**:
 
-  * **odom-belief**  — trajectory from ``/wheel/odom`` (what the controller saw)
+  * **odom-belief**  — trajectory from ``/wheel/odom_zeroed`` (the re-anchored
+                       stream the controller actually tracked), falling back to
+                       raw ``/wheel/odom`` only when the zeroed stream is absent
   * **RTK-truth**    — trajectory from ``/gps_rtk_f9p_helical/gps/fix``
                        projected to the venue-local frame (ground truth)
 
@@ -78,6 +80,11 @@ except Exception as exc:  # pragma: no cover - defensive
 
 # Topic names (the recorded set — see Data_Logger.py TOPICS / the T7 contract).
 TOPIC_ODOM = "/wheel/odom"
+# What the controller actually tracked: the orchestrator launches the follower
+# with -r /wheel/odom:=/wheel/odom_zeroed. odom-belief metrics MUST use this
+# stream when present; raw /wheel/odom is a different (un-anchored) frame and
+# scoring it against the origin-anchored analytic path is meaningless.
+TOPIC_ODOM_ZEROED = "/wheel/odom_zeroed"
 TOPIC_RTK_FIX = "/gps_rtk_f9p_helical/gps/fix"
 TOPIC_RTK_STATUS = "/gps_rtk_f9p_helical/gps/rtk_status"
 TOPIC_PIX_FIX = "/pixhawk/global_position/raw/fix"
@@ -207,6 +214,7 @@ def read_bag(bag_dir):
 
     out = {
         TOPIC_ODOM: None,
+        TOPIC_ODOM_ZEROED: None,
         TOPIC_RTK_FIX: None,
         TOPIC_RTK_STATUS: None,
         TOPIC_PIX_FIX: None,
@@ -218,6 +226,7 @@ def read_bag(bag_dir):
     }
     # Accumulators
     odom = {"stamp": [], "x": [], "y": [], "yaw": [], "v": []}
+    odom_zeroed = {"stamp": [], "x": [], "y": [], "yaw": [], "v": []}
     rtk = {"stamp": [], "lat": [], "lon": [], "alt": [], "status": []}
     rtk_status = {"stamp": [], "quality": []}
     pix = {"stamp": [], "lat": [], "lon": [], "alt": []}
@@ -243,6 +252,14 @@ def read_bag(bag_dir):
                 odom["y"].append(p.y)
                 odom["yaw"].append(_yaw_from_quat(q.x, q.y, q.z, q.w))
                 odom["v"].append(msg.twist.twist.linear.x)
+            elif topic == TOPIC_ODOM_ZEROED:
+                p = msg.pose.pose.position
+                q = msg.pose.pose.orientation
+                odom_zeroed["stamp"].append(t)
+                odom_zeroed["x"].append(p.x)
+                odom_zeroed["y"].append(p.y)
+                odom_zeroed["yaw"].append(_yaw_from_quat(q.x, q.y, q.z, q.w))
+                odom_zeroed["v"].append(msg.twist.twist.linear.x)
             elif topic == TOPIC_RTK_FIX:
                 rtk["stamp"].append(t)
                 rtk["lat"].append(msg.latitude)
@@ -290,6 +307,7 @@ def read_bag(bag_dir):
         return {k: np.asarray(v, dtype=float) for k, v in d.items()}
 
     out[TOPIC_ODOM] = _np(odom)
+    out[TOPIC_ODOM_ZEROED] = _np(odom_zeroed)
     out[TOPIC_RTK_FIX] = _np(rtk)
     out[TOPIC_RTK_STATUS] = _np(rtk_status)
     out[TOPIC_PIX_FIX] = _np(pix)
@@ -299,6 +317,20 @@ def read_bag(bag_dir):
     out[TOPIC_CMD_VEL_RAW] = _np(cmd_raw)
     out[TOPIC_ESTOP] = _np(estop)
     return out
+
+
+def odom_belief_source(bag):
+    """Pick the odom stream the controller actually tracked.
+
+    Prefer ``/wheel/odom_zeroed`` (the re-anchored stream the follower is
+    remapped onto); fall back to raw ``/wheel/odom`` for manual/indoor bags
+    recorded without the odom-zeroing overlay. Returns ``(arr_or_None, label)``
+    where label is the topic name used (for provenance / warnings).
+    """
+    zeroed = bag.get(TOPIC_ODOM_ZEROED)
+    if zeroed is not None:
+        return zeroed, TOPIC_ODOM_ZEROED
+    return bag.get(TOPIC_ODOM), TOPIC_ODOM
 
 
 def fixed_mask_for(fix_stamps, rtk_status, fixed_quality=RTK_FIXED_QUALITY):
@@ -609,10 +641,15 @@ def evaluate(bag_dir, sidecar, t_transient=2.0, k_e=3.0):
     }
 
     # ---- odom-belief ----------------------------------------------------
-    odom = bag[TOPIC_ODOM]
+    odom, odom_src = odom_belief_source(bag)
+    result["odom_belief_source"] = odom_src
+    if odom_src == TOPIC_ODOM and bag.get(TOPIC_ODOM_ZEROED) is None:
+        result["warnings"].append(
+            "no /wheel/odom_zeroed in bag; odom-belief scored against raw "
+            "/wheel/odom (correct only for runs without the odom-zeroing overlay)")
     if odom is None:
         result["warnings"].append(
-            f"no {TOPIC_ODOM} messages in bag; odom-belief metrics skipped")
+            "no odom messages in bag; odom-belief metrics skipped")
         result["metrics"]["odom_belief"] = None
     else:
         sr_odom = build_sim_result(
@@ -721,7 +758,8 @@ def build_per_sample_frame(bag_dir, sidecar, k_e=3.0, bag=None):
                       "leg": sidecar.get("leg"),
                       "analytic_total_length_m": float(path.total_length)}}
 
-    odom = bag[TOPIC_ODOM]
+    odom, odom_src = odom_belief_source(bag)
+    frame["meta"]["odom_belief_source"] = odom_src
     if odom is not None:
         e_d, e_psi, kappa, rho, s_star, psi_des = errors_along_path(
             path, odom["x"], odom["y"], odom["yaw"], k_e=eff_k_e)

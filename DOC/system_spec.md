@@ -55,7 +55,7 @@ standalone blackbox (RTK correction source); ignored.
 
 - **L1** Wheel odom is the **only** control feedback during a recorded run (ADR-01).
 - **L2** **GPS-RTK** (`/gps_rtk_f9p_helical`) lat/lon + fix quality **recorded in every run bag** as the sole ground truth.
-- **L3** **Reset odom to (0,0,0)** at a known physical point before each recorded run, **without disturbing the RTK stack**.
+- **L3** **Reset odom to (0,0,0)** at a known physical point before each recorded run, **with closed-loop confirmation** on `/odom_zero/status` before driving, **without disturbing the RTK stack**. The analytic reference path is anchored at this reset pose with +x along the heading at reset (the "path frame"); the same frame `/wheel/odom_zeroed` exposes to the follower.
 - **L4** RTK usable for **between-run** repositioning only — never inside a recorded run.
 - **L5** **Regular GPS** (`/pixhawk/.../fix`, `…/satellites`, `…/gpsstatus/gps1/raw`) recorded alongside every run for the professor's separate dataset extension; not used for control, gating, or this paper's metrics.
 
@@ -86,7 +86,7 @@ a hole). Usable space is the periphery around the island; curves and turnarounds
 ### 3.7 Recording & data management
 - **D1** Record a **bag per leg** with the full required topic set (§4).
 - **D2** **Deterministic** output directory layout + run-ID, pairable with external exports.
-- **D3** **Per-leg sidecar JSON**: cell params, path recipe, venue + pin IDs, RTK fix summary, classification, wallclock, git commit, controller tuning.
+- **D3** **Per-leg sidecar JSON**: cell params, path recipe, venue + pin IDs, **`venue.path_frame_anchor`** (start-pin pose `{lat, lon, heading_deg, pin_id}`; null for turnarounds / manual bags), RTK fix summary, classification, wallclock, git commit, controller tuning.
 - **D4** Per-run **pass/fail classification** per §5 criteria.
 
 ### 3.8 Monitoring & alerting
@@ -121,15 +121,20 @@ a hole). Usable space is the periphery around the island; curves and turnarounds
 | `/path_follower/done` | `std_msgs/Bool` (latched) | follower → sequencer | crisp completion edge (O3) |
 | `cmd_vel_raw` → `/cmd_vel` | `geometry_msgs/Twist` | controller/reposition → estop → base | sole actuation path (C3) |
 | `/estop`, `/estop_trigger` | `std_msgs/Bool` | estop ↔ * | latched safety (C4) |
-| `/wheel/odom` (raw) / zeroed | `nav_msgs/Odometry` | base → overlay → follower | control feedback + reset (L1,L3) |
-| `/odom_zero/reset` | `std_msgs/Bool` | sequencer → overlay | zero odom (L3) |
+| `/wheel/odom` | `nav_msgs/Odometry` | base → overlay / bag | raw wheel odom (recorded as L1 reference; not the control input) |
+| `/wheel/odom_zeroed` | `nav_msgs/Odometry` | overlay → follower / bag | re-anchored control feedback in the per-leg path frame (L1,L3) |
+| `/odom_zero/reset` | `std_msgs/Bool` | sequencer → overlay | command odom zero (L3) |
+| `/odom_zero/status` | `std_msgs/String` (JSON, latched, transient-local) | overlay → sequencer | reset-latch confirmation `{has_reset, origin{x,y,yaw}, stamp}` (L3 closed-loop) |
 | `/gps_rtk_f9p_helical/gps/{fix,nmea,rtk_status}` | `NavSatFix` / `String` | GNSS → * | reposition + sole ground truth + RTK-FIXED gate (L2,L4,R1,M1) |
 | `/pixhawk/global_position/raw/{fix,satellites}`, `/pixhawk/gpsstatus/gps1/raw` | MAVROS GPS | GNSS → bag | regular GPS, recorded for the prof's separate dataset (L5); no role here |
 | `/reposition/{goto,status}` | JSON / status | sequencer ↔ reposition | go-to-pose (R1,R2) |
 | `/orchestrator/{start,kill,status}` | `std_msgs/String` | sequencer ↔ supervisor | process control (O5) |
 | battery / `motion_mode` source | TBD (`/limo_status`?) | base → preflight/sequencer | gating (M1,M2) — **verify on robot** |
 
-**Required bag topic set (D1):** `/wheel/odom`, `/cmd_vel`, `/cmd_vel_raw`, `/estop`,
+**Required bag topic set (D1):** `/wheel/odom` (raw L1 reference),
+`/wheel/odom_zeroed` (the stream the follower actually tracks; required for the
+odom-belief metric — without it the odom-belief column has a frame mismatch
+against the analytic reference path), `/cmd_vel`, `/cmd_vel_raw`, `/estop`,
 `/reference_path`, `/path_follower/status`, `/path_follower/done`,
 `/gps_rtk_f9p_helical/gps/{fix,nmea,rtk_status}` (ground truth),
 `/pixhawk/global_position/raw/{fix,satellites}`, `/pixhawk/gpsstatus/gps1/raw` (regular GPS,

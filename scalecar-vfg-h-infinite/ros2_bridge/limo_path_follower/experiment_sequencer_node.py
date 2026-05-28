@@ -1118,6 +1118,23 @@ class ExperimentSequencer(Node):
                 "end_utc": bag_info.get("end_utc"),
                 "duration_s": bag_info.get("duration_s"),
             }
+            # Per-leg path-frame anchor: the start pin where odom was zeroed.
+            # A_TO_B starts at pin A; B_TO_A starts at pin B. Turnarounds are
+            # operational glue (anchor undefined here) -> leave None and let
+            # run_eval fall back to venue-local with a warning.
+            anchor_pin = None
+            if self.leg == Leg.A_TO_B:
+                anchor_pin = self._pin_A
+            elif self.leg == Leg.B_TO_A:
+                anchor_pin = self._pin_B
+            path_frame_anchor = None
+            if anchor_pin is not None:
+                path_frame_anchor = {
+                    "pin_id": anchor_pin.get("id"),
+                    "lat": float(anchor_pin["lat"]),
+                    "lon": float(anchor_pin["lon"]),
+                    "heading_deg": float(anchor_pin.get("heading_deg", 0.0)),
+                }
             sidecar = Data_Logger.build_sidecar(
                 run_id=self.run_id,
                 cell_id=cell["cell_id"],
@@ -1142,6 +1159,7 @@ class ExperimentSequencer(Node):
                 },
                 bag_path=self._leg_bag_path,
                 topics=Data_Logger.TOPICS,
+                path_frame_anchor=path_frame_anchor,
             )
             Data_Logger.write_sidecar(self._leg_bag_path, sidecar)
         except Exception as exc:

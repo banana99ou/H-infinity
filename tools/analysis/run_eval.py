@@ -399,6 +399,62 @@ def project_rtk_to_local(lat, lon, anchor_spec):
     return x, y, yaw, anchor
 
 
+def transform_to_path_frame(x, y, yaw, venue_anchor, path_frame_anchor):
+    """Re-anchor a venue-local trajectory into the per-leg path frame.
+
+    The analytic reference path is anchored at the start-pin pose with +x along
+    the start heading (the same frame odom_zero_node bakes into /wheel/odom_zeroed
+    at the reset moment). To score an RTK-truth trajectory against that path,
+    project RTK to venue-local first (project_rtk_to_local) and then apply the
+    same SE(2) re-anchor odom_zero applies on the wheel side:
+        P' = R(-anchor_yaw_local) * (P - anchor_local)
+
+    `path_frame_anchor` is the leg's start pin: {lat, lon, heading_deg}. The
+    compass-to-local-yaw conversion mirrors reposition_node._bearing_deg_to_local_yaw:
+        anchor_yaw_local = radians(venue_anchor.bearing_deg - heading_deg)
+
+    Returns (x', y', yaw') arrays. If `path_frame_anchor` is None this is a
+    pass-through (legacy venue-local behaviour, kept for old bags).
+
+    NOTE: the anchor here is the SCHEDULED pin pose, not the actual RTK fix at
+    /odom_zero/reset time. For paper-grade precision the live RTK fix at reset
+    is more accurate (reposition_node arrives within pos_tol_m = 0.15 m of the
+    pin, so the pin-anchor introduces a sub-decimeter frame offset). The cleaner
+    upgrade is to capture the live RTK fix in /odom_zero/status and surface that
+    through the sidecar -- left as a follow-up.
+    """
+    if path_frame_anchor is None:
+        return x, y, yaw
+
+    import path_overlay as po
+
+    a_lat = float(path_frame_anchor["lat"])
+    a_lon = float(path_frame_anchor["lon"])
+    a_hdg_deg = float(path_frame_anchor["heading_deg"])
+
+    axy = po.latlon_to_local(np.array([[a_lat, a_lon]]), venue_anchor)
+    ax, ay = float(axy[0, 0]), float(axy[0, 1])
+
+    anchor_yaw_local = math.radians(venue_anchor.bearing_deg - a_hdg_deg)
+    anchor_yaw_local = math.atan2(
+        math.sin(anchor_yaw_local), math.cos(anchor_yaw_local))
+
+    c = math.cos(anchor_yaw_local)
+    s = math.sin(anchor_yaw_local)
+
+    x_arr = np.asarray(x, float)
+    y_arr = np.asarray(y, float)
+    yaw_arr = np.asarray(yaw, float)
+
+    dx = x_arr - ax
+    dy = y_arr - ay
+    x_p = c * dx + s * dy
+    y_p = -s * dx + c * dy
+    diff = yaw_arr - anchor_yaw_local
+    yaw_p = np.arctan2(np.sin(diff), np.cos(diff))
+    return x_p, y_p, yaw_p
+
+
 def _course_over_ground(x, y):
     """Heading from forward differences of an (x, y) track [rad]."""
     n = len(x)
@@ -620,6 +676,11 @@ def evaluate(bag_dir, sidecar, t_transient=2.0, k_e=3.0):
     eff_k_e = float(ctrl_tuning.get("k_e", k_e))
     venue = sidecar.get("venue", {}) or {}
     anchor_spec = venue.get("anchor")  # optional {lat0, lon0, bearing_deg}
+    # Per-leg path-frame anchor (start pin pose, see _write_sidecar). Without
+    # it RTK-truth would score against the fixed venue frame -- offset from the
+    # analytic path's start-pin frame by tens of meters, the same class of bug
+    # the odom-belief side had before /wheel/odom_zeroed was bagged.
+    path_frame_anchor = venue.get("path_frame_anchor")
 
     path = build_path_from_recipe(recipe, r_min_default=r_min)
 
@@ -688,6 +749,9 @@ def evaluate(bag_dir, sidecar, t_transient=2.0, k_e=3.0):
                     "falls back to all fixes (metrics unreliable).")
         x, y, yaw, anchor = project_rtk_to_local(
             rtk["lat"], rtk["lon"], anchor_spec)
+        # Re-anchor venue-local -> per-leg path frame using the start-pin pose
+        # carried in the sidecar. Pass-through if absent (old bags).
+        x, y, yaw = transform_to_path_frame(x, y, yaw, anchor, path_frame_anchor)
         # RTK has no native body velocity; approximate from successive fixes.
         v = _speed_from_track(rtk["stamp"], x, y)
         sr_rtk = build_sim_result(
@@ -701,6 +765,13 @@ def evaluate(bag_dir, sidecar, t_transient=2.0, k_e=3.0):
             "bearing_deg": anchor.bearing_deg,
             "from_sidecar": anchor_spec is not None,
         }
+        result["path_frame_anchor"] = (
+            None if path_frame_anchor is None else dict(path_frame_anchor))
+        if path_frame_anchor is None:
+            result["warnings"].append(
+                "no venue.path_frame_anchor in sidecar; RTK-truth scored "
+                "against the venue frame, not the per-leg path frame "
+                "(metrics may carry a fixed SE(2) offset)")
         if anchor_spec is None:
             result["warnings"].append(
                 "no venue.anchor in sidecar; used hardcoded rooftop anchor "
@@ -747,6 +818,7 @@ def build_per_sample_frame(bag_dir, sidecar, k_e=3.0, bag=None):
     eff_k_e = float(ctrl_tuning.get("k_e", k_e))
     venue = sidecar.get("venue", {}) or {}
     anchor_spec = venue.get("anchor")
+    path_frame_anchor = venue.get("path_frame_anchor")
     path = build_path_from_recipe(recipe, r_min_default=r_min)
 
     if bag is None:
@@ -787,6 +859,7 @@ def build_per_sample_frame(bag_dir, sidecar, k_e=3.0, bag=None):
         if mask is not None and int(np.sum(mask)) >= 2:
             r = {k: v[mask] for k, v in rtk.items()}
         x, y, yaw, _anchor = project_rtk_to_local(r["lat"], r["lon"], anchor_spec)
+        x, y, yaw = transform_to_path_frame(x, y, yaw, _anchor, path_frame_anchor)
         e_d, e_psi, kappa, rho, s_star, psi_des = errors_along_path(
             path, x, y, yaw, k_e=eff_k_e)
         t = r["stamp"] - r["stamp"][0] if len(r["stamp"]) else r["stamp"]

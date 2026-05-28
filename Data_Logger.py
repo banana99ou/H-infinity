@@ -287,6 +287,7 @@ def build_sidecar(
     bag_path: Optional[str] = None,
     topics: Optional[Sequence[str]] = None,
     git_commit: Optional[str] = None,
+    path_frame_anchor: Optional[Dict[str, Any]] = None,
     extra: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Assemble the D3 sidecar dict. Pure (no I/O) so it is easy to unit-test.
@@ -294,6 +295,11 @@ def build_sidecar(
     Field set is the D3 list in system_spec.md §3.7:
       cell params, path recipe, venue + pin IDs, RTK fix summary,
       classification, wallclock, git commit, controller tuning.
+
+    ``path_frame_anchor`` (optional) carries the per-leg start-pin pose
+    ``{lat, lon, heading_deg, pin_id}`` so run_eval can re-anchor RTK-truth
+    into the same frame as the analytic reference path. None for turnarounds
+    and manual bags.
     """
     sidecar: Dict[str, Any] = {
         "schema_version": SIDECAR_SCHEMA_VERSION,
@@ -308,6 +314,11 @@ def build_sidecar(
             "venue_id": venue_id,
             "start_pin_id": start_pin_id,
             "end_pin_id": end_pin_id,
+            # Per-leg path-frame anchor (start-pin pose) -- run_eval re-anchors
+            # RTK-truth into this frame so its metrics align with the analytic
+            # reference, the same way /wheel/odom_zeroed does on the wheel side.
+            # None for turnarounds / manual bags without a known pin pose.
+            "path_frame_anchor": path_frame_anchor,
         },
         "rtk_summary": rtk_summary,
         "classification": classification,

@@ -77,6 +77,38 @@ infrastructure — reuse them, do not re-implement.
   F9P RTK pipeline. The external FitTogether OHCOACH Cell is a standalone
   blackbox logging to its own SD card — see `network_topology.md`.
 
+### Run-artifact analysis & backup (project tooling, not legacy)
+
+The automatic per-leg pipeline: when the sequencer reaches `STOP_LEG` it (1)
+stops the bag, (2) classifies the outcome (D4), (3) writes a sidecar, then (4)
+fires the backup — all unattended. Offline, the analysis tools turn the archived
+bags into a dataset + metrics.
+
+- `tools/sync/push_artifact.sh` — runs on the NUC; fired detached by the
+  sequencer (`_archive_leg`) after the bag + sidecar are finalized. Pushes the
+  bag to **MacBook (priority) → NAS → local repo**, rate-limited (`--bwlimit`) +
+  `nice`/`ionice` so it never disturbs the next leg. `.git` excluded; each target
+  is its own **local-only git archive** (pre-push hook blocks upload; never
+  GitHub, no LFS). Has connect-retries (Tailscale flap), `accept-new` host keys,
+  and passes the spaced `Experiment Data` path raw (macOS rsync 2.6.9 rejects
+  `-s`). Targets come from `scenarios/experiment.yaml` `artifact_sync`.
+  *Verified end-to-end NUC→Mac+NAS 2026-05-26.*
+- `tools/sync/sync.sh` — interim repo sync: `push` (laptop→NUC code, additive),
+  `pull` (NUC→laptop artifacts), `init-artifacts` (make `Experiment Data/` a
+  local-only repo). Direction of truth: code only laptop→NUC; artifacts only
+  NUC→laptop.
+- `tools/analysis/` — offline bag→dataset pipeline: `manifest.py` (index legs),
+  `qc.py` (quality gates), `run_eval.py` (per-run metrics), `aggregate.py`
+  (cross-run rollup), `build_dataset.py` + `export.py` (dataset emit),
+  `make_sidecar.py` (sidecar for manual/indoor bags). Tests + fixtures under
+  `tools/analysis/tests/`.
+
+Backup vs. code paths are deliberately separate: **code** flows laptop→GitHub
+(+ Syncthing to the NAS at `/mnt/raid0/main/code`); **artifacts** flow only via
+the direct rsync above. `Experiment Data` is in the Syncthing `.stignore` on both
+Mac and NAS so the two mechanisms never double-write. See `network_topology.md`
+for transports and `memory`/sync notes for the routing rationale.
+
 ### Legacy / superseded (`legacy/`)
 - `legacy/run_scenarios_from_files.py` — INI-driven scenario runner with
   topic/RTK-gated preflight and bag start/stop. Being superseded by the
@@ -103,3 +135,23 @@ flowchart LR
 
 The authoritative interface contract (topic names, types, directions) is
 `system_spec.md §4`; this diagram is the orientation view.
+
+### Post-run: automatic analysis + backup
+
+What happens after each leg ends, unattended (see the script inventory above):
+
+```mermaid
+flowchart LR
+    stopLeg["sequencer STOP_LEG"] --> bag["bag (Experiment Data/)"]
+    stopLeg --> classify["D4 classify + sidecar"]
+    classify --> bag
+    bag --> push["push_artifact.sh (detached)"]
+    push -->|priority| mac["MacBook archive"]
+    push --> nas["NAS archive (/mnt/raid0/main/code)"]
+    push --> local["robot local archive"]
+    bag -.offline.-> analysis["manifest → qc → run_eval → aggregate → dataset"]
+```
+
+Live path (classify/sidecar/push) runs on the robot per leg; the offline
+analysis (`tools/analysis/`) runs against the archived bags to emit the dataset
++ metrics.

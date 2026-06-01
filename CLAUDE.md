@@ -170,4 +170,4 @@ read that first.
   upstream drops diff cleanly (see commits `f7a34a2` and `b577541` for the
   pattern).
 - `DOC/system_spec.md` is the locked spec: if reality and the sheet disagree,
-  fix the sheet first (per its own header). Don't silently diverge from it.
+  Flag it and notify the user. Don't silently diverge from it.

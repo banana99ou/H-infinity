@@ -63,6 +63,22 @@
   details { margin-top: 6px; }
   summary { cursor: pointer; font-size: 12px; color: #9fd; }
 
+  /* E-stop latched banner — shown only when /estop publishes true. */
+  .estop-banner {
+    background: #c11; color: #fff; padding: 8px 10px; border-radius: 4px;
+    font-weight: 800; font-size: 13px; text-align: center;
+    margin: 0 0 8px 0; letter-spacing: 1px;
+    border: 2px solid #f44; box-shadow: 0 0 10px rgba(255,0,0,0.4);
+    display: none;
+  }
+  .estop-banner.latched { display: block; }
+
+  /* Compact map legend rows. */
+  .legend-row { font-size: 11px; margin: 3px 0; display: flex; align-items: center; gap: 6px; }
+  .legend-swatch { width: 14px; height: 14px; border-radius: 50%; border: 1px solid #000; flex: 0 0 14px; }
+  .legend-swatch.poly { border-radius: 0; background: none; border-width: 2px; }
+  .legend-swatch.dashed { border-radius: 0; background: none; border-style: dashed; border-width: 2px; }
+
   /* ------- Teleop floating panel ------- */
   #teleop-panel {
     position: fixed; top: 12px; left: 12px; z-index: 9000;
@@ -157,6 +173,7 @@
   <div id="panel">
     <h2>LIMO Battle Station</h2>
 
+    <div id="estop-banner" class="estop-banner">&#9888; WHEELS DISABLED &mdash; E-STOP LATCHED</div>
     <button id="estop-btn" class="estop">E-STOP</button>
     <div class="small" id="estop-state">state: unknown (not connected)</div>
 
@@ -170,45 +187,20 @@
     </div>
     <div class="stat" style="margin-top:6px;">
       <span class="dot" id="conn-dot"></span><span id="conn-state">disconnected</span><br>
-      <span class="dot" id="odom-dot"></span>odom: <span id="odom-rate">--</span><br>
-      <span class="dot" id="status-dot"></span>follower: <span id="status-rate">--</span>
+      <span class="dot" id="odom-dot"></span>odom_zeroed: <span id="odom-rate">--</span><br>
+      <span class="dot" id="status-dot"></span>follower: <span id="status-rate">--</span><br>
+      <span class="dot" id="batt-dot"></span>battery: <span id="batt-state">--</span>
     </div>
 
-    <h3>Stack</h3>
-    <div class="stat" id="stack-panel">(connect first)</div>
-
-    <h3>Run control</h3>
-    <div class="row">
-      <button id="btn-push" class="primary">Push &amp; Run</button>
-      <button id="btn-pause">Pause</button>
-      <button id="btn-resume">Resume</button>
+    <h3>RTK &amp; GPS</h3>
+    <div class="stat">
+      <span class="dot" id="rtk-dot"></span>RTK: <span id="rtk-state">--</span>
     </div>
-    <div class="row" style="margin-top:6px;">
-      <button id="btn-stop">Stop scenario</button>
-      <button id="btn-recenter">Recenter map on robot</button>
+    <div class="small">
+      Magenta dot = RTK FIXED truth; amber = FLOAT/other. Orange dot = Pixhawk
+      raw GPS. Divergence between the two reveals base-survey or correction
+      issues. Blue dot = controller's odom-zeroed belief.
     </div>
-    <div class="row" style="margin-top:6px;">
-      <button id="btn-teleop">Toggle keyboard teleop</button>
-    </div>
-    <div class="small" id="push-state">no path pushed</div>
-
-    <h3>Path start pose (odom)</h3>
-    <div class="row">
-      <label style="flex:1">x (m)<input type="number" id="anchor-x" step="0.05" value="0"></label>
-      <label style="flex:1">y (m)<input type="number" id="anchor-y" step="0.05" value="0"></label>
-      <label style="flex:1">yaw (&deg;)<input type="number" id="anchor-th" step="1" value="0"></label>
-    </div>
-    <div class="row" style="margin-top:6px;">
-      <button id="btn-anchor-snap" class="primary">Snap to robot pose</button>
-      <button id="btn-anchor-reset">Reset (0,0,0)</button>
-    </div>
-    <div class="small">Cyan dot+arrow on map: drag the dot to translate, drag the tip to rotate. Path is published transformed by this pose.</div>
-
-    <label style="margin-top:10px;">target speed (m/s)
-      <span class="pill" id="vspeed-val">0.30</span>
-      <input type="range" id="vspeed" min="0.0" max="2.0" step="0.05" value="0.30">
-    </label>
-    <div class="small" id="vspeed-state">(set after connect)</div>
 
     <h3>Telemetry</h3>
     <div class="stat" id="telemetry">(waiting for /path_follower/status)</div>
@@ -216,12 +208,10 @@
 
     <!-- ============================================================
          T10 — Experiment batch progress + pause/resume (M5, F5).
-         Modular block: subscribes /experiment/status, publishes
-         /experiment/cmd. All ids prefixed `exp-`; JS funcs `exp*`.
-         Abort also fires the existing /estop_trigger path (toggleEstop's
-         topicEstop). Sits alongside the venue/stack blocks untouched.
+         Sequencer is the canonical autonomous-run UI. Pause/Resume here
+         talk to /experiment/cmd, NOT /estop_trigger.
          ============================================================ -->
-    <h3>Experiment</h3>
+    <h3>Experiment (autonomous run)</h3>
     <div class="stat" style="margin-bottom:4px;">
       <span class="dot" id="exp-dot"></span>sequencer: <span id="exp-rate">--</span>
     </div>
@@ -242,49 +232,10 @@
       the batch <i>and</i> latches the E-stop (<code>/estop_trigger</code>).
     </div>
 
-    <details>
-      <summary>Anchor &amp; track geometry</summary>
-      <label>lat <input type="number" id="lat" step="0.000001" value="37.61174497"></label>
-      <label>lon <input type="number" id="lon" step="0.000001" value="126.99429177"></label>
-      <label>bearing (deg E of N) <span class="pill" id="bearing_val">42.0</span>
-        <input type="range" id="bearing" min="0" max="360" step="0.5" value="42">
-      </label>
-      <label>track long (m) <input type="number" id="L_long" step="0.1" value="42"></label>
-      <label>track short (m) <input type="number" id="L_short" step="0.1" value="10"></label>
-    </details>
-
-    <h3>Path family</h3>
-    <select id="family">
-      <option value="indoor_s" selected>indoor S-curve (3x1.2 m)</option>
-      <option value="indoor_loop">indoor straight (2 m)</option>
-      <option value="oval">oval (rooftop lap)</option>
-      <option value="line">line</option>
-      <option value="slalom">slalom</option>
-      <option value="sinusoid">sinusoid</option>
-      <option value="step">step curvature</option>
-    </select>
-    <div id="params"></div>
-
-    <h3>Stats</h3>
-    <div class="stat" id="stats"></div>
-
-    <h3>Export</h3>
-    <div class="row">
-      <button id="btn-geojson">GeoJSON</button>
-      <button id="btn-rospath">ROS JSON</button>
-      <button id="btn-copy">Copy x,y</button>
-    </div>
-    <textarea id="export_text" placeholder="exported text appears here" readonly></textarea>
-
     <!-- ============================================================
-         T5 — Venue / working-area editor (V1-V4). Modular block:
-         all venue state lives in the `venue` object and venue* funcs;
-         a later merge (T10 batch-progress) can sit alongside untouched.
+         T5 — Venue / working-area editor (V1-V4).
          ============================================================ -->
     <h3>Venue / working area</h3>
-    <div class="small">
-      Live RTK: <span class="dot" id="rtk-dot"></span><span id="rtk-state">--</span>
-    </div>
     <div class="row" style="margin-top:6px;">
       <button id="btn-venue-pin" class="primary">Add corner (click map)</button>
       <button id="btn-venue-clear-corners">Clear corners</button>
@@ -320,25 +271,119 @@
     </div>
     <div class="small">
       Pick a mode, then click anywhere on the map to drop a corner / exclusion /
-      pin at that point (arbitrary — no RTK fix needed). The robot's live RTK dot
-      also renders on the map, so you can drive it along the edge afterward to
-      confirm the area makes sense. Drag start/end dots to move; drag the cyan tip
-      to set heading. Inset polygon = corners minus margin; curves must fit it and
-      clear all exclusions.
+      pin. Drag start/end dots to move; drag the cyan tip to set heading. Inset
+      polygon = corners minus margin; curves must fit it and clear exclusions.
     </div>
 
-    <h3>Basemap</h3>
-    <select id="basemap">
-      <option value="osm" selected>OpenStreetMap</option>
-      <option value="google">Google Satellite</option>
-      <option value="google_hybrid">Google Hybrid</option>
-      <option value="esri">Esri World Imagery</option>
-    </select>
-
-    <div class="small" style="margin-top: 12px;">
-      Local frame: origin at right-bottom, +x along long axis (bearing), +y left of +x.<br>
-      Controller envelope: R_min &gt; 0.5 m, |kappa|*v &le; 5, open path.
+    <h3>Manual control</h3>
+    <div class="row">
+      <button id="btn-stop">Stop scenario</button>
+      <button id="btn-recenter">Recenter map on robot</button>
     </div>
+    <div class="row" style="margin-top:6px;">
+      <button id="btn-teleop">Toggle keyboard teleop</button>
+    </div>
+    <div class="small">
+      For autonomous runs use the Experiment panel above. The big E-STOP latches
+      motion immediately; Stop scenario also clears the latched <code>/reference_path</code>.
+    </div>
+
+    <h3>Map</h3>
+    <label>basemap
+      <select id="basemap">
+        <option value="osm" selected>OpenStreetMap</option>
+        <option value="google">Google Satellite</option>
+        <option value="google_hybrid">Google Hybrid</option>
+        <option value="esri">Esri World Imagery</option>
+      </select>
+    </label>
+    <details style="margin-top:6px;">
+      <summary>Map legend</summary>
+      <div class="legend-row"><span class="legend-swatch" style="background:#39f"></span>controller belief (<code>/wheel/odom_zeroed</code>)</div>
+      <div class="legend-row"><span class="legend-swatch" style="background:#e91e63"></span>RTK FIXED (magenta)</div>
+      <div class="legend-row"><span class="legend-swatch" style="background:#ffc107"></span>RTK FLOAT / other (amber)</div>
+      <div class="legend-row"><span class="legend-swatch" style="background:#ff9800"></span>Pixhawk raw GPS (orange)</div>
+      <div class="legend-row"><span class="legend-swatch" style="background:#0ff"></span>ad-hoc path anchor (cyan + arrow)</div>
+      <div class="legend-row"><span class="legend-swatch" style="background:#0f0"></span>ad-hoc curve start (lime)</div>
+      <div class="legend-row"><span class="legend-swatch" style="background:#f00"></span>ad-hoc curve end (red)</div>
+      <div class="legend-row"><span class="legend-swatch poly" style="border-color:#ff0"></span>venue corners (yellow polygon)</div>
+      <div class="legend-row"><span class="legend-swatch dashed" style="border-color:#0f0"></span>venue inset = corners &minus; margin (green dashed)</div>
+      <div class="legend-row"><span class="legend-swatch" style="background:#0f8"></span>venue start pin (+arrow = heading)</div>
+      <div class="legend-row"><span class="legend-swatch" style="background:#f80"></span>venue end pin (+arrow = heading)</div>
+      <div class="legend-row"><span class="legend-swatch" style="background:#f33"></span>exclusion zone (red disc)</div>
+    </details>
+
+    <details id="adhoc-details" style="margin-top:10px;">
+      <summary>Ad-hoc curve (legacy)</summary>
+      <div class="small" style="margin:4px 0 8px 0;">
+        Pre-sequencer flow: design a curve in the browser, publish it directly
+        to <code>/reference_path</code>, run. Used for smoke tests, not the
+        official matrix runs. Map shows a yellow dashed rooftop rectangle and
+        cyan path-anchor while this section is open.
+      </div>
+
+      <h3 style="margin-top:8px;">Path start pose (odom)</h3>
+      <div class="row">
+        <label style="flex:1">x (m)<input type="number" id="anchor-x" step="0.05" value="0"></label>
+        <label style="flex:1">y (m)<input type="number" id="anchor-y" step="0.05" value="0"></label>
+        <label style="flex:1">yaw (&deg;)<input type="number" id="anchor-th" step="1" value="0"></label>
+      </div>
+      <div class="row" style="margin-top:6px;">
+        <button id="btn-anchor-snap" class="primary">Snap to robot pose</button>
+        <button id="btn-anchor-reset">Reset (0,0,0)</button>
+      </div>
+
+      <label style="margin-top:10px;">target speed (m/s)
+        <span class="pill" id="vspeed-val">0.30</span>
+        <input type="range" id="vspeed" min="0.0" max="2.0" step="0.05" value="0.30">
+      </label>
+      <div class="small" id="vspeed-state">(set after connect)</div>
+
+      <h3 style="margin-top:10px;">Anchor &amp; track geometry</h3>
+      <label>lat <input type="number" id="lat" step="0.000001" value="37.61174497"></label>
+      <label>lon <input type="number" id="lon" step="0.000001" value="126.99429177"></label>
+      <label>bearing (deg E of N) <span class="pill" id="bearing_val">42.0</span>
+        <input type="range" id="bearing" min="0" max="360" step="0.5" value="42">
+      </label>
+      <label>track long (m) <input type="number" id="L_long" step="0.1" value="42"></label>
+      <label>track short (m) <input type="number" id="L_short" step="0.1" value="10"></label>
+
+      <h3 style="margin-top:10px;">Path family</h3>
+      <select id="family">
+        <option value="indoor_s" selected>indoor S-curve (3x1.2 m)</option>
+        <option value="indoor_loop">indoor straight (2 m)</option>
+        <option value="oval">oval (rooftop lap)</option>
+        <option value="line">line</option>
+        <option value="slalom">slalom</option>
+        <option value="sinusoid">sinusoid</option>
+        <option value="step">step curvature</option>
+      </select>
+      <div id="params"></div>
+
+      <h3 style="margin-top:10px;">Stats</h3>
+      <div class="stat" id="stats"></div>
+
+      <h3 style="margin-top:10px;">Push to follower</h3>
+      <button id="btn-push" class="primary" style="width:100%;">Push &amp; Run</button>
+      <div class="small" id="push-state">no path pushed</div>
+
+      <h3 style="margin-top:10px;">Export</h3>
+      <div class="row">
+        <button id="btn-geojson">GeoJSON</button>
+        <button id="btn-rospath">ROS JSON</button>
+        <button id="btn-copy">Copy x,y</button>
+      </div>
+      <textarea id="export_text" placeholder="exported text appears here" readonly></textarea>
+    </details>
+
+    <details id="stack-details" style="margin-top:10px;">
+      <summary>Stack debug (manual start/kill)</summary>
+      <div class="small" style="margin:4px 0 8px 0;">
+        Predates the sequencer. The orchestrator now manages stack state during
+        autonomous runs; only reach here when nothing else can bring a node back.
+      </div>
+      <div class="stat" id="stack-panel">(connect first)</div>
+    </details>
   </div>
 </div>
 
@@ -579,6 +624,7 @@ function buildParamUI(family) {
   paramsDiv.innerHTML = '';
   currentParams = {};
   const defs = PARAM_DEFS[family];
+  if (!defs) return;  // unknown family from a stale localStorage entry
   defs.forEach(d => {
     currentParams[d.name] = d.def;
     const lbl = document.createElement('label');
@@ -628,6 +674,7 @@ $('basemap').onchange = (e) => {
 
 let pathLayer = null, trackPoly = null, anchorMarker = null, oppMarker = null;
 let startMarker = null, endMarker = null, robotMarker = null, robotHeadingLine = null;
+let rtkMarker = null, gpsRawMarker = null;
 let pathAnchorPosMarker = null, pathAnchorTipMarker = null, pathAnchorLine = null;
 
 // Pose at which the path's local origin is anchored in the odom frame.
@@ -657,6 +704,33 @@ function redraw() {
   const Llong = parseFloat($('L_long').value);
   const Lshort = parseFloat($('L_short').value);
   $('bearing_val').textContent = bearing.toFixed(1);
+
+  // Ad-hoc curve / rooftop-rectangle / cyan anchor only render when the
+  // legacy details block is open. Venue + blue robot dot use lat0/lon0/bearing
+  // independently of that, so we still update window._state below.
+  const adhocOpen = !!($('adhoc-details') && $('adhoc-details').open);
+  if (!adhocOpen) {
+    if (pathLayer)           { map.removeLayer(pathLayer);           pathLayer = null; }
+    if (trackPoly)           { map.removeLayer(trackPoly);           trackPoly = null; }
+    if (startMarker)         { map.removeLayer(startMarker);         startMarker = null; }
+    if (endMarker)           { map.removeLayer(endMarker);           endMarker = null; }
+    if (anchorMarker)        { map.removeLayer(anchorMarker);        anchorMarker = null; }
+    if (oppMarker)           { map.removeLayer(oppMarker);           oppMarker = null; }
+    if (pathAnchorPosMarker) { map.removeLayer(pathAnchorPosMarker); pathAnchorPosMarker = null; }
+    if (pathAnchorTipMarker) { map.removeLayer(pathAnchorTipMarker); pathAnchorTipMarker = null; }
+    if (pathAnchorLine)      { map.removeLayer(pathAnchorLine);      pathAnchorLine = null; }
+    $('stats').innerHTML = '';
+    // Keep last-known family/params in _state so persistCurve doesn't
+    // poison localStorage with an unknown family that crashes
+    // buildParamUI on the next reload.
+    window._state = {
+      family: $('family').value, params: { ...currentParams },
+      lat0, lon0, bearing, Llong, Lshort,
+      pts: [], pathLL: [], trackLL: [], anchor: { ...pathAnchor },
+    };
+    if (typeof drawVenue === 'function') drawVenue();
+    return;
+  }
 
   const family = $('family').value;
   const ptsLocal = genPath(family, currentParams, Llong, Lshort);
@@ -885,7 +959,8 @@ let ros = null;
 let topicEstop = null, topicEstopState = null, topicRefPath = null, topicReset = null;
 let topicOdom = null, topicStatus = null;
 let topicOrchStart = null, topicOrchKill = null, topicOrchStatus = null;
-let topicRtkFix = null;
+let topicRtkFix = null, topicPixhawkFix = null;
+let topicLimoStatus = null;                      // /limo_status (battery, motion mode)
 let topicExpStatus = null, topicExpCmd = null;   // T10 — /experiment/{status,cmd}
 let setParamsService = null;
 let lastOdomTime = 0, lastStatusTime = 0, odomCount = 0, statusCount = 0;
@@ -908,11 +983,23 @@ function setConnUI(connected) {
     setDot('odom-dot', null);
     setDot('status-dot', null);
     setDot('exp-dot', null);
+    setDot('batt-dot', null);
+    setDot('rtk-dot', null);
     $('odom-rate').textContent = '--';
     $('status-rate').textContent = '--';
     $('exp-rate').textContent = '--';
+    $('batt-state').textContent = '--';
+    $('rtk-state').textContent = '--';
     lastExpTime = 0; expCount = 0;
+    // Don't let cached RTK/GPS positions and status persist past disconnect —
+    // a fresh connect should start blank rather than mislead with stale dots.
+    lastRtkFix = { lat: null, lon: null, status: null, t: 0 };
+    lastRtkStatus = { quality: null, rtcm_state: null, fwd_age_s: null, raw: '', t: 0 };
+    if (rtkMarker)    { map.removeLayer(rtkMarker);    rtkMarker = null; }
+    if (gpsRawMarker) { map.removeLayer(gpsRawMarker); gpsRawMarker = null; }
     $('estop-state').textContent = 'state: unknown (not connected)';
+    const _banner = $('estop-banner');
+    if (_banner) _banner.classList.remove('latched');
     $('stack-panel').innerHTML = '(connect first)';
     $('vspeed-state').textContent = '(set after connect)';
   } else {
@@ -952,14 +1039,17 @@ function subscribeAll() {
   topicEstopState.subscribe((msg) => {
     estopActive = !!msg.data;
     const btn = $('estop-btn');
+    const banner = $('estop-banner');
     if (estopActive) {
       btn.textContent = 'CLEAR E-STOP';
       btn.classList.add('armed');
       $('estop-state').textContent = 'state: STOPPED (latched)';
+      if (banner) banner.classList.add('latched');
     } else {
       btn.textContent = 'E-STOP';
       btn.classList.remove('armed');
       $('estop-state').textContent = 'state: motion allowed';
+      if (banner) banner.classList.remove('latched');
     }
   });
 
@@ -972,8 +1062,13 @@ function subscribeAll() {
     ros, name: '/path_follower/reset', messageType: 'std_msgs/Bool'
   });
 
+  // The follower runs with a launch-time remap /wheel/odom:=/wheel/odom_zeroed
+  // (orchestrator_node.py:58). The blue robot dot represents the controller's
+  // belief, so it must subscribe to the same frame the controller actually
+  // consumes — otherwise the dot drifts off the path once odom_zero latches
+  // a fresh origin at leg-start.
   topicOdom = new ROSLIB.Topic({
-    ros, name: '/wheel/odom', messageType: 'nav_msgs/Odometry'
+    ros, name: '/wheel/odom_zeroed', messageType: 'nav_msgs/Odometry'
   });
   topicOdom.subscribe(onOdom);
 
@@ -1011,6 +1106,21 @@ function subscribeAll() {
     messageType: 'std_msgs/msg/String'
   });
   topicRtkStatus.subscribe(onRtkStatus);
+
+  // Regular Pixhawk GPS (L5) — second marker on the map alongside RTK,
+  // so divergence between RTK truth and regular GPS is visible.
+  topicPixhawkFix = new ROSLIB.Topic({
+    ros, name: '/pixhawk/global_position/raw/fix',
+    messageType: 'sensor_msgs/msg/NavSatFix'
+  });
+  topicPixhawkFix.subscribe(onPixhawkFix);
+
+  // LIMO chassis status — battery_voltage is the canonical signal preflight
+  // checks (warn 10.8V, halt 10.5V per scenarios/*.yaml gating).
+  topicLimoStatus = new ROSLIB.Topic({
+    ros, name: '/limo_status', messageType: 'limo_msgs/msg/LimoStatus'
+  });
+  topicLimoStatus.subscribe(onLimoStatus);
 
   // T10 — Experiment sequencer (T6 contract). Status is std_msgs/String JSON;
   // command is std_msgs/String JSON {action:'pause'|'resume'|'abort'|'skip'}.
@@ -1107,7 +1217,7 @@ function onStatus(msg) {
     `&kappa;: ${kappa.toFixed(3)} 1/m &nbsp; <span class="${rho_class}">&rho;: ${rho.toFixed(2)}</span><br>` +
     `e&psi;: ${(e_psi*180/Math.PI).toFixed(1)}&deg; &nbsp; &delta;: ${(delta_cmd*180/Math.PI).toFixed(1)}&deg;`;
 
-  // Also feed odom-derived robot marker if /wheel/odom is silent.
+  // Also feed odom-derived robot marker if /wheel/odom_zeroed is silent.
   if (Date.now() - lastOdomTime > 2000) drawRobot(x, y, yaw);
 }
 
@@ -1153,9 +1263,6 @@ function pushAndRun() {
   // Auto-clear E-stop so the robot moves immediately.
   if (topicEstop) topicEstop.publish(new ROSLIB.Message({ data: false }));
 }
-
-function pause()  { if (topicEstop) topicEstop.publish(new ROSLIB.Message({ data: true  })); }
-function resume() { if (topicEstop) topicEstop.publish(new ROSLIB.Message({ data: false })); }
 
 function stopScenario() {
   // Latch E-stop for safety, reset the running follower's loaded path,
@@ -1287,8 +1394,8 @@ function expAbort() {
 // (which stays -1/0 on this F9P even under RTK) — see onRtkStatus below.
 let lastRtkFix = { lat: null, lon: null, status: null, t: 0 };
 
-// Latest parsed RTK quality from the rtk_status string topic.
-let lastRtkStatus = { quality: null, raw: '', t: 0 };
+// Latest parsed RTK quality + RTCM chain health from the rtk_status string.
+let lastRtkStatus = { quality: null, rtcm_state: null, fwd_age_s: null, raw: '', t: 0 };
 let topicRtkStatus = null;
 
 // Quality int that denotes RTK FIXED (NMEA GGA standard + driver
@@ -1297,12 +1404,31 @@ let topicRtkStatus = null;
 const RTK_FIXED_QUALITY = 4;
 
 function onRtkStatus(msg) {
-  const m = /quality=(\d+)/.exec(msg.data || '');
+  const raw = msg.data || '';
+  const mq = /quality=(\d+)/.exec(raw);
+  // Driver string also carries the end-to-end RTCM chain health:
+  //   "RTCM: OK (bytes=N, fwd_age=Xs, net_age=Ys)"  — chain alive
+  //   "RTCM: STALE (bytes=N, fwd_age=Xs, net_age=Ys)" — socket wedged
+  // fwd_age = seconds since the rover last forwarded an RTCM frame to the
+  // local F9P. This is the canonical surfacing of the stale-socket bug
+  // (recurred 3x in the May-29 field session).
+  const mRtcm = /RTCM:\s*(OK|STALE)/.exec(raw);
+  const mAge = /fwd_age=([\d.]+)s/.exec(raw);
   lastRtkStatus = {
-    quality: m ? parseInt(m[1], 10) : null,
-    raw: msg.data || '',
+    quality: mq ? parseInt(mq[1], 10) : null,
+    rtcm_state: mRtcm ? mRtcm[1] : null,
+    fwd_age_s: mAge ? parseFloat(mAge[1]) : null,
+    raw,
     t: Date.now(),
   };
+}
+
+// Human-friendly age formatting: seconds → "1.4s" / "12s" / "3.2h".
+function fmtAge(s) {
+  if (s == null || !isFinite(s)) return '?';
+  if (s < 60) return s.toFixed(1) + 's';
+  if (s < 3600) return Math.round(s/60) + 'm';
+  return (s/3600).toFixed(1) + 'h';
 }
 
 function rtkIsFixed() {
@@ -1335,9 +1461,63 @@ function onRtkFix(msg) {
   const fresh = (Date.now() - lastRtkFix.t) < 2000;
   setDot('rtk-dot', (fresh && rtkIsFixed()) ? 'ok' : 'bad');
   const q = (lastRtkStatus.quality !== null) ? lastRtkStatus.quality : '?';
-  const label = rtkIsFixed() ? 'FIXED' : `not FIXED (quality=${q})`;
-  $('rtk-state').textContent =
-    `${lastRtkFix.lat.toFixed(8)}, ${lastRtkFix.lon.toFixed(8)} — ${label}`;
+  const fixLabel = rtkIsFixed() ? 'FIXED' : `not FIXED (quality=${q})`;
+  // RTCM chain health: surfaced from the rover-side rtk_status string.
+  // OK = base+network+rover socket all healthy. STALE = stale-socket bug
+  // (or basestation down). Stale with fwd_age>3s usually needs the
+  // workaround `kill <pid>` of the rover GPS-RTK pub node.
+  let rtcmLabel = '';
+  if (lastRtkStatus.rtcm_state) {
+    const ageStr = fmtAge(lastRtkStatus.fwd_age_s);
+    const cls = lastRtkStatus.rtcm_state === 'OK' ? 'ok' : 'err';
+    rtcmLabel = ` <span class="${cls}">RTCM ${lastRtkStatus.rtcm_state} (${ageStr})</span>`;
+  }
+  $('rtk-state').innerHTML =
+    `${lastRtkFix.lat.toFixed(8)}, ${lastRtkFix.lon.toFixed(8)} — ${fixLabel}${rtcmLabel}`;
+
+  // Render RTK position as a magenta (FIXED) or amber (FLOAT/other) circle.
+  // Plots from raw lat/lon — independent of the odom-projected `robotMarker`,
+  // so divergence reveals odom drift / wrong path-frame anchor.
+  if (msg.latitude !== 0 || msg.longitude !== 0) {
+    const ll = [msg.latitude, msg.longitude];
+    const fillColor = rtkIsFixed() ? '#e91e63' : '#ffc107';
+    if (!rtkMarker) {
+      rtkMarker = L.circleMarker(ll, {
+        radius: 7, color: '#000', fillColor, fillOpacity: 1, weight: 2,
+      }).addTo(map).bindTooltip('RTK fix');
+    } else {
+      rtkMarker.setLatLng(ll);
+      rtkMarker.setStyle({ fillColor });
+    }
+  }
+}
+
+// Preflight gating from scenarios/*.yaml: warn at 10.8V, halt at 10.5V.
+const BATT_WARN_V = 10.8;
+const BATT_HALT_V = 10.5;
+
+function onLimoStatus(msg) {
+  const v = msg.battery_voltage;
+  if (v == null || !isFinite(v)) return;
+  const el = $('batt-state');
+  if (!el) return;
+  let cls = 'ok';
+  if (v <= BATT_HALT_V) cls = 'err';
+  else if (v <= BATT_WARN_V) cls = 'warn';
+  el.innerHTML = `<span class="${cls}">${v.toFixed(2)} V</span>`;
+  setDot('batt-dot', cls);
+}
+
+function onPixhawkFix(msg) {
+  if (msg.latitude === 0 && msg.longitude === 0) return;
+  const ll = [msg.latitude, msg.longitude];
+  if (!gpsRawMarker) {
+    gpsRawMarker = L.circleMarker(ll, {
+      radius: 7, color: '#000', fillColor: '#ff9800', fillOpacity: 1, weight: 2,
+    }).addTo(map).bindTooltip('Pixhawk GPS (regular)');
+  } else {
+    gpsRawMarker.setLatLng(ll);
+  }
 }
 
 function rtkFresh() { return lastRtkFix.lat !== null && (Date.now() - lastRtkFix.t) < 3000; }
@@ -1718,6 +1898,11 @@ window.addEventListener('keydown', (e) => {
 });
 
 // ---------------- Wire-up ----------------
+// Toggling the ad-hoc <details> shows/hides the curve preview + rooftop
+// rectangle + cyan anchor on the map. redraw() reads the open state.
+const _adhocDetailsEl = $('adhoc-details');
+if (_adhocDetailsEl) _adhocDetailsEl.addEventListener('toggle', redraw);
+
 ['lat','lon','bearing','L_long','L_short','family'].forEach(id => {
   $(id).addEventListener('input', () => {
     if (id === 'family') buildParamUI($('family').value);
@@ -1730,12 +1915,14 @@ $('btn-rospath').onclick = exportRosPath;
 $('btn-copy').onclick = copyLocal;
 $('btn-connect').onclick = connect;
 $('btn-disconnect').onclick = disconnect;
-$('btn-push').onclick = pushAndRun;
-$('btn-pause').onclick = pause;
-$('btn-resume').onclick = resume;
+// btn-push lives in the ad-hoc-curve <details> block; rebound below the
+// reorg so a missing element doesn't throw. The Experiment panel's Pause/
+// Resume buttons are wired further down — they talk to /experiment/cmd
+// rather than slamming E-stop.
 $('btn-stop').onclick = stopScenario;
 $('btn-recenter').onclick = recenterOnRobot;
 $('btn-teleop').onclick = toggleTeleopPanel;
+const btnPushEl = $('btn-push'); if (btnPushEl) btnPushEl.onclick = pushAndRun;
 
 // T10 — experiment sequencer command buttons
 $('exp-btn-pause').onclick  = expPause;
@@ -1755,7 +1942,7 @@ $('exp-btn-abort').onclick  = expAbort;
 });
 $('btn-anchor-snap').onclick = () => {
   if (!lastRobotOdom.t || (Date.now() - lastRobotOdom.t > 3000)) {
-    alert('no recent robot odom (need /wheel/odom flowing)');
+    alert('no recent robot odom (need /wheel/odom_zeroed flowing)');
     return;
   }
   pathAnchor.x = lastRobotOdom.x;
@@ -1953,9 +2140,17 @@ paramsDiv.querySelectorAll('input[type=range]').forEach(inp => {
   inp.addEventListener('input', persistCurve);
 });
 
-// fit map to track on first paint
+// Fit the map on first paint to whatever's most useful: ad-hoc rectangle if
+// the user opened the legacy details, else the venue corners, else the robot,
+// else the lat/lon inputs. trackPoly is null when ad-hoc starts closed (the
+// default), so the pre-reorg unconditional fitBounds was a no-op on most
+// sessions and the map sat at the hardcoded rooftop default.
 setTimeout(() => {
-  if (trackPoly) map.fitBounds(trackPoly.getBounds().pad(0.5));
+  if (trackPoly) { map.fitBounds(trackPoly.getBounds().pad(0.5)); return; }
+  if (venueRectLayer) { map.fitBounds(venueRectLayer.getBounds().pad(0.5)); return; }
+  if (robotMarker) { map.setView(robotMarker.getLatLng(), Math.max(map.getZoom(), 20)); return; }
+  const lat0 = parseFloat($('lat').value), lon0 = parseFloat($('lon').value);
+  if (isFinite(lat0) && isFinite(lon0)) map.setView([lat0, lon0], 20);
 }, 200);
 </script>
 </body>

@@ -122,7 +122,9 @@ def _status_array(x, y, yaw, v, s_star, total_len, kappa, rho, e_psi, delta_cmd)
 
 
 def make(out_dir, rtk_bad=False, controller="lpv-hinf", R=0.5, v=0.5,
-         rep=0, leg="AtoB", family="step", err_amp=None):
+         rep=0, leg="AtoB", family="step", err_amp=None,
+         estop_fired=False, odom_gap=False, missing_topic=None,
+         sidecar_pass_mismatch=False):
     # Controller/R-dependent lateral tracking error so the aggregate stats have
     # real signal: PID worse than LPV, both worse as R shrinks (mimics the sim
     # crossover). The synthetic drive follows the path offset by this error.
@@ -161,24 +163,24 @@ def make(out_dir, rtk_bad=False, controller="lpv-hinf", R=0.5, v=0.5,
 
     n_fixed = 0
     n_rtk = 0
+    missing = {missing_topic} if missing_topic else set()
     with Writer(out_dir, version=8) as w:
-        c_odom = w.add_connection("/wheel/odom", Odometry.__msgtype__, typestore=TS)
-        c_odomz = w.add_connection("/wheel/odom_zeroed", Odometry.__msgtype__,
-                                   typestore=TS)
-        c_fix = w.add_connection("/gps_rtk_f9p_helical/gps/fix",
-                                 NavSatFix.__msgtype__, typestore=TS)
-        c_rtks = w.add_connection("/gps_rtk_f9p_helical/gps/rtk_status",
-                                  String.__msgtype__, typestore=TS)
-        c_pix = w.add_connection("/pixhawk/global_position/raw/fix",
-                                 NavSatFix.__msgtype__, typestore=TS)
-        c_stat = w.add_connection("/path_follower/status",
-                                  Float32MultiArray.__msgtype__, typestore=TS)
-        c_tim = w.add_connection("/path_follower/timing",
-                                 Float32.__msgtype__, typestore=TS)
-        c_done = w.add_connection("/path_follower/done", Bool.__msgtype__, typestore=TS)
-        c_cmd = w.add_connection("/cmd_vel", Twist.__msgtype__, typestore=TS)
-        c_cmdr = w.add_connection("/cmd_vel_raw", Twist.__msgtype__, typestore=TS)
-        c_estop = w.add_connection("/estop", Bool.__msgtype__, typestore=TS)
+        def add(topic, msgtype):
+            if topic in missing:
+                return None
+            return w.add_connection(topic, msgtype, typestore=TS)
+
+        c_odom = add("/wheel/odom", Odometry.__msgtype__)
+        c_odomz = add("/wheel/odom_zeroed", Odometry.__msgtype__)
+        c_fix = add("/gps_rtk_f9p_helical/gps/fix", NavSatFix.__msgtype__)
+        c_rtks = add("/gps_rtk_f9p_helical/gps/rtk_status", String.__msgtype__)
+        c_pix = add("/pixhawk/global_position/raw/fix", NavSatFix.__msgtype__)
+        c_stat = add("/path_follower/status", Float32MultiArray.__msgtype__)
+        c_tim = add("/path_follower/timing", Float32.__msgtype__)
+        c_done = add("/path_follower/done", Bool.__msgtype__)
+        c_cmd = add("/cmd_vel", Twist.__msgtype__)
+        c_cmdr = add("/cmd_vel_raw", Twist.__msgtype__)
+        c_estop = add("/estop", Bool.__msgtype__)
 
         rng = np.random.default_rng(0)
         for i in range(n):
@@ -197,47 +199,60 @@ def make(out_dir, rtk_bad=False, controller="lpv-hinf", R=0.5, v=0.5,
             ox = drive[0] + rng.normal(0, 0.005)
             oy = drive[1] + rng.normal(0, 0.005)
             oyaw = yaw + err_amp * ramp * kappa + rng.normal(0, 0.002)
-            w.write(c_odom, tns, TS.serialize_cdr(_odom(t, ox, oy, oyaw, v),
-                                                  Odometry.__msgtype__))
+            in_gap = odom_gap and (n // 3 <= i <= n // 3 + int(rate * 1.0))
+            if c_odom is not None and not in_gap:
+                w.write(c_odom, tns, TS.serialize_cdr(_odom(t, ox, oy, oyaw, v),
+                                                      Odometry.__msgtype__))
             # Re-anchored stream the controller actually tracked. In this
             # fixture the driven pose is already origin-anchored, so the zeroed
             # stream mirrors odom; run_eval prefers this for odom-belief.
-            w.write(c_odomz, tns, TS.serialize_cdr(_odom(t, ox, oy, oyaw, v),
-                                                   Odometry.__msgtype__))
+            if c_odomz is not None:
+                w.write(c_odomz, tns, TS.serialize_cdr(_odom(t, ox, oy, oyaw, v),
+                                                       Odometry.__msgtype__))
             # status telemetry (e_psi ~ 0 since on-path)
-            w.write(c_stat, tns, TS.serialize_cdr(
-                _status_array(ox, oy, oyaw, v, s, total, kappa, abs(kappa) * v,
-                              0.0, math.atan(0.2 * kappa)),
-                Float32MultiArray.__msgtype__))
-            w.write(c_tim, tns, TS.serialize_cdr(
-                Float32(data=np.float32(0.43 + rng.normal(0, 0.02))),
-                Float32.__msgtype__))
+            if c_stat is not None:
+                w.write(c_stat, tns, TS.serialize_cdr(
+                    _status_array(ox, oy, oyaw, v, s, total, kappa, abs(kappa) * v,
+                                  0.0, math.atan(0.2 * kappa)),
+                    Float32MultiArray.__msgtype__))
+            if c_tim is not None:
+                w.write(c_tim, tns, TS.serialize_cdr(
+                    Float32(data=np.float32(0.43 + rng.normal(0, 0.02))),
+                    Float32.__msgtype__))
             omega = v * math.tan(math.atan(0.2 * kappa)) / 0.2
             tw = Twist(linear=Vector3(x=v, y=0.0, z=0.0),
                        angular=Vector3(x=0.0, y=0.0, z=float(omega)))
-            w.write(c_cmd, tns, TS.serialize_cdr(tw, Twist.__msgtype__))
-            w.write(c_cmdr, tns, TS.serialize_cdr(tw, Twist.__msgtype__))
-            w.write(c_estop, tns, TS.serialize_cdr(Bool(data=False),
-                                                   Bool.__msgtype__))
+            if c_cmd is not None:
+                w.write(c_cmd, tns, TS.serialize_cdr(tw, Twist.__msgtype__))
+            if c_cmdr is not None:
+                w.write(c_cmdr, tns, TS.serialize_cdr(tw, Twist.__msgtype__))
+            if c_estop is not None:
+                fired = estop_fired and i == max(1, n // 2)
+                w.write(c_estop, tns, TS.serialize_cdr(Bool(data=bool(fired)),
+                                                       Bool.__msgtype__))
             # RTK at 5 Hz (every 4th control step)
             if i % 4 == 0:
                 lat, lon = po.local_to_latlon(np.array([drive]), anchor)[0]
-                w.write(c_fix, tns, TS.serialize_cdr(
-                    _navsatfix(t, lat, lon, quality), NavSatFix.__msgtype__))
-                w.write(c_rtks, tns, TS.serialize_cdr(
-                    String(data=_rtk_status_str(quality, lat, lon)),
-                    String.__msgtype__))
+                if c_fix is not None:
+                    w.write(c_fix, tns, TS.serialize_cdr(
+                        _navsatfix(t, lat, lon, quality), NavSatFix.__msgtype__))
+                if c_rtks is not None:
+                    w.write(c_rtks, tns, TS.serialize_cdr(
+                        String(data=_rtk_status_str(quality, lat, lon)),
+                        String.__msgtype__))
                 # regular GPS: noisier, lat/lon only (the L5 product)
-                w.write(c_pix, tns, TS.serialize_cdr(
-                    _navsatfix(t, lat + rng.normal(0, 1e-5),
-                               lon + rng.normal(0, 1e-5), 1),
-                    NavSatFix.__msgtype__))
+                if c_pix is not None:
+                    w.write(c_pix, tns, TS.serialize_cdr(
+                        _navsatfix(t, lat + rng.normal(0, 1e-5),
+                                   lon + rng.normal(0, 1e-5), 1),
+                        NavSatFix.__msgtype__))
                 n_rtk += 1
                 if quality == 4:
                     n_fixed += 1
         # latched done at end
-        w.write(c_done, int((t0 + n * dt) * 1e9),
-                TS.serialize_cdr(Bool(data=True), Bool.__msgtype__))
+        if c_done is not None:
+            w.write(c_done, int((t0 + n * dt) * 1e9),
+                    TS.serialize_cdr(Bool(data=True), Bool.__msgtype__))
 
     rtag = f"{R:g}".replace(".", "p")
     vtag = f"{v:g}".replace(".", "p")
@@ -256,7 +271,10 @@ def make(out_dir, rtk_bad=False, controller="lpv-hinf", R=0.5, v=0.5,
                              "bearing_deg": po.BEARING_DEG}},
         "rtk_summary": {"fixed_samples": n_fixed, "total_samples": n_rtk,
                         "fixed_pct": (100.0 * n_fixed / n_rtk) if n_rtk else 0.0},
-        "classification": {"pass": (not rtk_bad), "reasons": []},
+        "classification": {
+            "pass": (True if sidecar_pass_mismatch else (not rtk_bad and not estop_fired and not odom_gap and not missing_topic)),
+            "reasons": [],
+        },
         "wallclock": {"start_utc": datetime.now(timezone.utc).isoformat(),
                       "duration_s": round(T, 3)},
         "controller_tuning": {"controller_type": controller, "k_e": 3.0,
@@ -302,6 +320,14 @@ def main(argv=None):
                     help="write quality=1 status so qc fails the RTK gate")
     ap.add_argument("--clean", action="store_true",
                     help="zero tracking error (drive exactly on-path)")
+    ap.add_argument("--estop-fired", action="store_true",
+                    help="write one /estop true sample so qc fails the leg")
+    ap.add_argument("--odom-gap", action="store_true",
+                    help="drop raw /wheel/odom for >1s so qc fails continuity")
+    ap.add_argument("--missing-topic", default=None,
+                    help="omit one topic from the bag, e.g. /path_follower/done")
+    ap.add_argument("--sidecar-pass-mismatch", action="store_true",
+                    help="force sidecar classification pass even for a bad leg")
     ap.add_argument("--batch", metavar="ROOT", default=None,
                     help="generate a small matrix of legs under ROOT instead")
     args = ap.parse_args(argv)
@@ -310,7 +336,11 @@ def main(argv=None):
         print(f"wrote {len(bags)} legs under {args.batch}")
         return 0
     bag, sidecar = make(args.out_dir, rtk_bad=args.rtk_bad,
-                        err_amp=(0.0 if args.clean else None))
+                        err_amp=(0.0 if args.clean else None),
+                        estop_fired=args.estop_fired,
+                        odom_gap=args.odom_gap,
+                        missing_topic=args.missing_topic,
+                        sidecar_pass_mismatch=args.sidecar_pass_mismatch)
     print(bag)
     print(sidecar)
     return 0

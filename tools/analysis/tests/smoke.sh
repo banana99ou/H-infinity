@@ -51,7 +51,20 @@ python3 tools/analysis/qc.py "$WORK" --no-rtk-gate --out-dir "$WORK/d_indoor" >/
 chk "bad-RTK leg usable under --no-rtk-gate" \
   "python3 -c \"import json,glob;u=json.load(open('$WORK/d_indoor/usable_legs.json'));import sys;sys.exit(0 if any('badrtk' in p for p in u) else 1)\""
 
-echo "== 5. build_dataset (RTK mode, full driver) =="
+echo "== 5. qc rejects targeted bad legs =="
+python3 tools/analysis/tests/make_fixture.py "$WORK/estop_bad" --estop-fired >/dev/null 2>&1
+python3 tools/analysis/tests/make_fixture.py "$WORK/gap_bad" --odom-gap >/dev/null 2>&1
+python3 tools/analysis/tests/make_fixture.py "$WORK/missing_done" --missing-topic /path_follower/done >/dev/null 2>&1
+python3 tools/analysis/qc.py "$WORK" --out-dir "$WORK/d_bad" >/dev/null 2>&1
+chk "estop fixture rejected" \
+  "python3 -c \"import csv,sys; rows=list(csv.DictReader(open('$WORK/d_bad/qc.csv'))); sys.exit(0 if any('estop_bad' in r['bag_dir'] and 'estop_fired' in r['reasons'] for r in rows) else 1)\""
+chk "odom-gap fixture rejected" \
+  "python3 -c \"import csv,sys; rows=list(csv.DictReader(open('$WORK/d_bad/qc.csv'))); sys.exit(0 if any('gap_bad' in r['bag_dir'] and 'odom_gap' in r['reasons'] for r in rows) else 1)\""
+python3 tools/analysis/manifest.py "$WORK" --out-dir "$WORK/d_bad_manifest" >/dev/null 2>&1
+chk "missing required topic visible in manifest" \
+  "python3 -c \"import csv,sys; rows=list(csv.DictReader(open('$WORK/d_bad_manifest/manifest.csv'))); sys.exit(0 if any('missing_done' in r['bag_dir'] and '/path_follower/done' in r['missing_topics'] for r in rows) else 1)\""
+
+echo "== 6. build_dataset (RTK mode, full driver) =="
 python3 tools/analysis/build_dataset.py "$WORK/bagroot" --out "$WORK/ds" >/dev/null 2>&1
 chk "raw/ layer pointer"                "[ -f '$WORK/ds/raw/SOURCE.txt' ]"
 chk "derived headline figure"           "[ -f '$WORK/ds/derived/headline_v1_step.png' ]"
@@ -63,7 +76,7 @@ chk "data dictionary"                   "[ -f '$WORK/ds/extracted/data_dictionar
 chk "Wilcoxon ran in stats.json" \
   "python3 -c \"import json;s=json.load(open('$WORK/ds/derived/stats.json'));import sys;sys.exit(0 if s['slices']['v1_step']['wilcoxon_lpv_vs_pid']['ok'] else 1)\""
 
-echo "== 6. build_dataset (indoor / odom-belief) =="
+echo "== 7. build_dataset (indoor / odom-belief) =="
 python3 tools/analysis/build_dataset.py "$WORK/bagroot" --out "$WORK/ds_indoor" --no-rtk-gate >/dev/null 2>&1
 chk "indoor headline figure"            "[ -f '$WORK/ds_indoor/derived/headline_v1_step.png' ]"
 

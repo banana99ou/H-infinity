@@ -103,17 +103,77 @@ In rough priority order:
      - Add a `/rtk_base/health` topic or ntfy push on `alive` transitions
        (M1/F2 in `DOC/system_spec.md`). Right now the journal is the only
        signal that the base is alive.
+     - **Rover RTK node stale-socket / no-reconnect bug** (observed
+       2026-05-29 field session). When `GPS-RTK_ROS2_pub_node.py` is started
+       before the Pi is reachable at `10.42.0.170:2101` (Pi still on
+       KMU_WiFi, or LIMO_AP briefly down due to phone-hotspot heat-drop),
+       the node enters a stale-TCP state: gets a brief burst of bytes, the
+       socket dies, and it never reconnects. Rover reports
+       `RTCM: STALE (fwd_age=...)` indefinitely; `quality` stays at 1
+       even after the Pi reaches the right IP. Temp workaround that worked
+       in the field: `kill <pid>` the running node, then restart with
+       `python3 /home/agilex/agilex_ws/GPS-RTK_ROS2_pub_node.py
+       --ros-args -r __ns:=/gps_rtk_f9p_helical`. Long-term fix in
+       `GPS-RTK_ROS2_pub_node.py` around the TCP socket setup: enable
+       `SO_KEEPALIVE` with short intervals; add a watchdog that closes +
+       reopens the socket if no bytes arrive for >N seconds; reconnect loop
+       with exponential backoff on initial failure too (so starting before
+       Pi is ready is recoverable). Pairs naturally with the existing
+       follow-up to drop the `10.42.0.170` hardcode.
+     - **`LIMO+MAVROS+RTK_Node_Launcher.launch.py` missing
+       `respawn=True`** for the GPS-RTK node. When the rover RTK process
+       dies (whether from the workaround above or anything else), the
+       launcher does not restart it — `ros2 node list` simply loses the
+       node and manual `python3 ...` is required. Add
+       `respawn=True, respawn_delay=2.0` to the `Node()` entry for
+       `GPS-RTK_ROS2_pub_node.py` in the launch description.
+     - **Field-survey workflow gap (slow TTFF after tripod move)**: the
+       base F9P resumes a stored TMODE3 position from BBR/flash on
+       power-up. If the tripod has been physically moved since the stored
+       survey (e.g. yesterday's bench location → today's field location),
+       the base broadcasts a stale reference position in RTCM 1005 and
+       carrier-phase ambiguity resolution takes much longer than it
+       should — the rover can plateau at `quality=5` (FLOAT) for minutes
+       before climbing to 4 (FIXED), or get stuck. Add either (a) a
+       u-center SOP to force a fresh survey-in at each new venue, (b)
+       switch base to TMODE3=2 Fixed-mode with venue-known coordinates,
+       or **(c, user-preferred 2026-05-29) a startup-time UBX-CFG-TMODE3
+       sweep in `rtcm_server.py` that re-arms survey on each (re)boot**
+       — `--re-survey-on-boot` flag, ~30 lines of UBX-CFG-VALSET to
+       disable then re-enable Survey-In with min_dur=60s acc_limit=5m.
+       Observed at the 2026-05-29 field test: 1 → 2 → 5 in ~4 seconds,
+       stuck at 5 for ~9 minutes, then climbed to 4. ~9 min TTFF after
+       a tripod move is unacceptable for the matrix-run workflow.
 
 4. **Battle-station GPS view (per ADR-01 §"What we DO use GPS for").**
    Add to `interactive.html`:
    - Subscribe to `/gps_rtk_f9p_helical/gps/fix` (NavSatFix) and
      `.../rtk_status`
+   - Subscribe to `/pixhawk/global_position/raw/fix` (regular GPS, L5).
+     User explicitly asked 2026-05-29 to see **both RTK and regular GPS
+     positions simultaneously** on the map so divergence is visible.
    - Big colored fix-quality bar: RTK FIX (green) / RTK FLOAT (yellow) /
      3D (orange) / NO FIX (red)
-   - Magenta circle marker on the Leaflet map at the GPS lat/lon (distinct
-     from the blue odom-projected marker, so drift is visible)
+   - Magenta circle marker on the Leaflet map at the RTK lat/lon (distinct
+     from the blue odom-projected marker, so drift is visible).
+   - Distinct marker (different color, e.g. orange) at the regular-GPS
+     lat/lon for the dual-view above.
    - NTRIP correction-age display
    - Refuse Push&Run when fix < FLOAT (configurable threshold)
+   - **Open bug (2026-05-29 field session):** the existing **blue
+     odom-projected marker** appears on the wrong side of a campus
+     building and may not be updating. User report: "GPS location on
+     webui seems to be wrong … blue dot on the other side of the
+     building. and it could be not moving." Provisional hypothesis: same
+     family as the [[project_odom_belief_frame_bug]] we fixed 2026-05-27 —
+     the projection probably consumes raw `/wheel/odom` against a
+     stale session anchor in the JS, so today's robot is plotted on
+     yesterday's frame, shifted by the inter-session origin delta.
+     Confirm by (a) checking which topic the marker subscribes to in
+     `interactive.html` (raw vs `/wheel/odom_zeroed`); (b) checking the
+     map anchor logic (hardcoded LL or pulled from somewhere); (c) at
+     the next field session, drive the LIMO a few meters and see whether
+     the dot moves at all.
 
 5. **Rosbag recording from the battle station.** Add a "Record run" button
    that starts/stops `ros2 bag record` for the minimum dataset
@@ -328,6 +388,23 @@ symlink). Read that before setting up a new robot.
   during testing. Cause not confirmed: possibly orphaned test processes, or
   the duplicate `path_follower_pkg` directories already present in
   `~/agilex_ws/src/`. Investigate before running alongside `limo_bringup`.
+
+- [ ] **`Data_Logger.py` ExternalShutdownException leaks an orphan `ros2 bag
+  record`** (observed 2026-05-29 field session). When the parent
+  `Data_Logger.py` Python process receives SIGINT, `rclpy` raises
+  `ExternalShutdownException` from inside `rclpy.spin_once()`. The `main()`
+  function only catches `KeyboardInterrupt` (line ~462), so the cleanup
+  path — sending SIGINT to the `ros2 bag record` subprocess (`proc`) and
+  the post-shutdown rename / metadata-rewrite — is never executed. Result:
+  the bag's `db3` keeps growing under an orphan recorder (PPID=1), there is
+  no `metadata.yaml` until that orphan is hand-killed, and the bag directory
+  remains stuck with the `_DURATION_PLACEHOLDER` name even after the
+  operator "stops" the logger. Fix: catch `ExternalShutdownException` in
+  the same except branch as `KeyboardInterrupt` (or use a `try/finally`
+  that always SIGINTs `proc` and runs the rename block), and propagate the
+  signal to the subprocess explicitly. Repro: `kill -SIGINT <Data_Logger
+  PID>` while it's recording; observe `ps -ef | grep 'ros2 bag record'`
+  still alive with PPID=1.
 
 ## Optional / Later
 

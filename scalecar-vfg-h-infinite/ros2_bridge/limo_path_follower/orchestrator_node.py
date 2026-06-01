@@ -18,6 +18,7 @@ import os
 import shlex
 import signal
 import subprocess
+from datetime import datetime, timezone
 
 import rclpy
 from rclpy.node import Node
@@ -68,6 +69,9 @@ PROCS = {
     'sequencer': [
         'ros2', 'run', 'limo_path_follower', 'experiment_sequencer_node',
     ],
+    'ops': [
+        'ros2', 'run', 'limo_path_follower', 'ops_node',
+    ],
 }
 
 EXCLUSIVE = {'base_vanilla', 'base_gnss'}
@@ -88,6 +92,16 @@ class OrchestratorNode(Node):
 
         self.children = {}  # name -> Popen (alive or dead)
         self.log_files = {}  # name -> open file handle
+        self.meta = {
+            name: {
+                'pid': None,
+                'last_exit_code': None,
+                'last_started_at': None,
+                'last_stopped_at': None,
+                'intentional_stop_reason': None,
+            }
+            for name in PROCS
+        }
 
         self.create_subscription(String, '/orchestrator/start', self._on_start, 10)
         self.create_subscription(String, '/orchestrator/kill', self._on_kill, 10)
@@ -117,7 +131,7 @@ class OrchestratorNode(Node):
                 if ex != name and self._alive(ex):
                     self.get_logger().info(
                         f"start: stopping exclusive '{ex}' before starting '{name}'")
-                    self._kill_one(ex)
+                    self._kill_one(ex, reason=f"exclusive switch to {name}")
 
         cmd = PROCS[name]
         cmd_str = ' '.join(shlex.quote(a) for a in cmd)
@@ -141,6 +155,13 @@ class OrchestratorNode(Node):
 
         self.children[name] = p
         self.log_files[name] = log
+        self.meta[name].update({
+            'pid': p.pid,
+            'last_exit_code': None,
+            'last_started_at': _utc_now(),
+            'last_stopped_at': None,
+            'intentional_stop_reason': None,
+        })
         self.get_logger().info(f"start: spawned '{name}' (pid {p.pid}); log {log_path}")
         self._publish_status()
 
@@ -149,7 +170,7 @@ class OrchestratorNode(Node):
         if name not in PROCS:
             self.get_logger().warn(f"kill: unknown name '{name}'")
             return
-        self._kill_one(name)
+        self._kill_one(name, reason='operator kill')
         self._publish_status()
 
     # ------------------------------------------------------------------
@@ -160,11 +181,13 @@ class OrchestratorNode(Node):
         p = self.children.get(name)
         return p is not None and p.poll() is None
 
-    def _kill_one(self, name):
+    def _kill_one(self, name, reason='orchestrator stop'):
         p = self.children.get(name)
         if p is None or p.poll() is not None:
+            self._record_exit(name, reason=reason)
             self._close_log(name)
             return
+        self.meta[name]['intentional_stop_reason'] = reason
         try:
             os.killpg(os.getpgid(p.pid), signal.SIGTERM)
         except (ProcessLookupError, PermissionError) as exc:
@@ -182,6 +205,7 @@ class OrchestratorNode(Node):
             except subprocess.TimeoutExpired:
                 pass
         self._close_log(name)
+        self._record_exit(name, reason=reason)
         self.get_logger().info(f"kill: '{name}' stopped")
 
     def _close_log(self, name):
@@ -193,7 +217,21 @@ class OrchestratorNode(Node):
                 pass
 
     def _publish_status(self):
-        state = {name: self._alive(name) for name in PROCS}
+        detail = {}
+        state = {}
+        for name in PROCS:
+            running = self._alive(name)
+            if not running:
+                self._record_exit(name)
+            state[name] = running
+            meta = dict(self.meta.get(name, {}))
+            meta.update({
+                'running': running,
+                'pid': meta.get('pid'),
+                'log_tail': self._log_tail(name),
+            })
+            detail[name] = meta
+        state['_detail'] = detail
         msg = String()
         msg.data = json.dumps(state)
         self.pub_status.publish(msg)
@@ -201,7 +239,41 @@ class OrchestratorNode(Node):
     def shutdown(self):
         self.get_logger().info('Orchestrator shutting down — killing all children')
         for name in list(self.children):
-            self._kill_one(name)
+            self._kill_one(name, reason='orchestrator shutdown')
+
+    def _record_exit(self, name, reason=None):
+        p = self.children.get(name)
+        if p is None:
+            return
+        rc = p.poll()
+        if rc is None:
+            return
+        meta = self.meta[name]
+        meta['pid'] = p.pid
+        meta['last_exit_code'] = rc
+        if meta.get('last_stopped_at') is None:
+            meta['last_stopped_at'] = _utc_now()
+        if reason and meta.get('intentional_stop_reason') is None:
+            meta['intentional_stop_reason'] = reason
+
+    def _log_tail(self, name, max_lines=8, max_chars=1200):
+        path = os.path.join(LOG_DIR, f'{name}.log')
+        f = self.log_files.get(name)
+        if f is not None:
+            try:
+                f.flush()
+            except Exception:
+                pass
+        try:
+            with open(path, 'r', encoding='utf-8', errors='replace') as fh:
+                lines = fh.readlines()[-max_lines:]
+        except OSError:
+            return ''
+        return ''.join(lines)[-max_chars:]
+
+
+def _utc_now():
+    return datetime.now(timezone.utc).isoformat()
 
 
 def main(args=None):

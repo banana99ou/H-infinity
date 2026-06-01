@@ -6,8 +6,9 @@ i.e., replacing the MacBook role for unattended operation. Written
 **2026-05-26** for the next-session deploy.
 
 What this runbook **assumes is already true**:
-- The base F9P has TMODE3 (Survey-In) and RTCM3 output saved to its flash
-  from prior basestation use. Phase 4 only sanity-checks this.
+- The base F9P has RTCM3 output saved to its flash from prior basestation use.
+  The Pi broadcaster forces TMODE3 Survey-In on every service start, so boot is
+  a new survey and stale fixed/survey coordinates are not trusted.
 - The Pi already has Raspberry Pi OS Bookworm. Phase 1 is just "power on
   and SSH" — no imager step.
 

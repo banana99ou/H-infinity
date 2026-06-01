@@ -24,6 +24,7 @@ setup(
             'odom_zero_node = limo_path_follower.odom_zero_node:main',
             'reposition_node = limo_path_follower.reposition_node:main',
             'experiment_sequencer_node = limo_path_follower.experiment_sequencer_node:main',
+            'ops_node = limo_path_follower.ops_node:main',
         ],
     },
 )

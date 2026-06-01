@@ -100,6 +100,11 @@ nc <pi-ip> 2101 | xxd | head         # should see 0xD3 RTCM3 frames
 The F9P needs to be told "you are a base, broadcast RTCM3." Do this once with
 u-center on a laptop before you mount the F9P on the tripod. Save to flash.
 
+The Pi broadcaster also sends UBX-CFG-TMODE3 Survey-In every time
+`rtk-base.service` starts. Boot is treated as a new tripod setup: any stale
+fixed/survey position in F9P flash or battery-backed RAM is overwritten in the
+receiver's active config before RTCM bytes are broadcast to the rover.
+
 Suggested config:
 
 - **TMODE3 = Survey-In** (1). Min duration 60 s, position accuracy 5.0 m.
@@ -107,7 +112,8 @@ Suggested config:
     that position and starts broadcasting. Within-session RTK is FIXED-capable
     even though the absolute frame jumps a few cm to ~1 m each session.
   - To switch to a fixed surveyed position later (V1 in `DOC/system_spec.md`),
-    re-program TMODE3 to "Fixed mode" with the surveyed lat/lon.
+    the service default must also change; otherwise boot will intentionally
+    force a fresh Survey-In.
 - **RTCM3 output on the USB port**, types 1005, 1077, 1087, 1097, 1127, 1230
   at 1 Hz. (Driver-side `GPS-RTK_ROS2_pub_node.py` is type-agnostic; this set
   is what the rover wants for full multi-constellation correction.)
@@ -124,8 +130,10 @@ Reference: https://docs.holybro.com/gps-and-rtk-system/zed-f9p-h-rtk-series/port
 1. Power the Pi (plug in the USB power bank).
 2. Pi auto-joins LIMO_AP (provided the LIMO is up first — the Pi can't find
    the AP otherwise). systemd starts rtk-base.service automatically.
-3. Wait for survey-in. Logs will show RTCM messages starting to flow once
-   the F9P locks its base position. Expect ~1 min in good open sky.
+3. Wait for the boot-time survey-in. Logs first show
+   `[ubx] forcing TMODE3 Survey-In on boot`, then RTCM messages start to flow
+   once the F9P locks its current antenna position. Expect ~1 min in good
+   open sky.
 4. From the battle station, start `base_gnss`. The NUC's
    GPS-RTK_ROS2_pub_node.py will connect to <pi-ip>:2101 and start forwarding
    RTCM3 into the rover. /gps_rtk_f9p_helical/gps/rtk_status should show

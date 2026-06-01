@@ -333,13 +333,21 @@ def odom_belief_source(bag):
     return bag.get(TOPIC_ODOM), TOPIC_ODOM
 
 
-def fixed_mask_for(fix_stamps, rtk_status, fixed_quality=RTK_FIXED_QUALITY):
+def fixed_mask_for(fix_stamps, rtk_status, fixed_quality=RTK_FIXED_QUALITY,
+                   max_dt=None):
     """Boolean mask over fix_stamps: True where the nearest rtk_status is FIXED.
 
     The rtk_status String topic carries the authoritative fix quality; match
     each NavSatFix sample to the temporally-nearest rtk_status sample. If there
     is no rtk_status topic at all, returns None (caller falls back to using
     every fix, as before).
+
+    ``max_dt`` (seconds, optional): when set, a fix whose nearest rtk_status
+    sample is more than ``max_dt`` away in time is treated as **not FIXED**
+    (conservative) — guards against sparse/stale status mislabelling a fix as
+    FIXED from a temporally-distant sample. Default ``None`` keeps the legacy
+    nearest-neighbour behaviour (no time guard) so existing callers are
+    unchanged; the threshold is a deliberate choice the caller must opt into.
     """
     if rtk_status is None or len(rtk_status.get("stamp", [])) == 0:
         return None
@@ -354,7 +362,10 @@ def fixed_mask_for(fix_stamps, rtk_status, fixed_quality=RTK_FIXED_QUALITY):
     left = np.clip(idx - 1, 0, len(qs) - 1)
     pick = np.where(np.abs(qs[idx] - fix_stamps) <= np.abs(fix_stamps - qs[left]),
                     idx, left)
-    return qv[pick] == fixed_quality
+    mask = qv[pick] == fixed_quality
+    if max_dt is not None:
+        mask = mask & (np.abs(qs[pick] - fix_stamps) <= float(max_dt))
+    return mask
 
 
 def _yaw_from_quat(x, y, z, w):

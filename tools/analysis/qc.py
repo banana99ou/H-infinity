@@ -123,6 +123,13 @@ def qc_leg(leg, target_len_v, rtk_pct_min, length_tol, gap_tol,
     t0, t1 = _window(bag)
     duration = (t1 - t0) if t0 is not None else None
 
+    # 0) Run window. If neither odom nor status carries >=2 samples the window
+    # can't be inferred: the length check is skipped and RTK%/estop fall back to
+    # the whole bag. A leg that degenerate is junk — fail it loudly rather than
+    # let it slip through on partial checks.
+    if t0 is None:
+        reasons.append("no_run_window")
+
     # 1) RTK FIXED % (skipped at GPS-denied venues via --no-rtk-gate)
     pct, n_rtk = rtk_fixed_pct(bag, t0, t1)
     if not no_rtk_gate:

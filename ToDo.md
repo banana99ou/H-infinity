@@ -406,6 +406,106 @@ symlink). Read that before setting up a new robot.
   PID>` while it's recording; observe `ps -ef | grep 'ros2 bag record'`
   still alive with PPID=1.
 
+## Test coverage backlog (audit 2026-06-01)
+
+Full-suite coverage audit + first remediation pass. **Trusted baseline:** the
+vendored vfg math layer (`scalecar-vfg-h-infinite/tests/` — controllers / paths /
+simulation) is well-tested (tight numerical tolerances, closed-loop perf specs);
+leave it alone. Everything below concerns the ROS nodes and the laptop analysis
+pipeline.
+
+**Done this pass** — laptop-verified, `python3 tools/qc/run_qc.py laptop` green
+(76 unit tests + smoke 22/22):
+
+- [x] `tests/qc/conftest.py` — discovery no longer depends on the run_qc
+  PYTHONPATH wrapper (bare `python3 -m pytest tests/qc` works).
+- [x] Tier-1 pipeline characterization tests: `test_qc_gating.py`,
+  `test_run_eval_metrics.py`, `test_aggregate_stats.py`, `test_manifest_cells.py`
+  — pin RTK%/estop/odom-gap/window, the e_d/e_psi metric core, fixed-mask,
+  Wilcoxon pairing, CTI walk, `cell_key` rounding, completeness counts.
+- [x] Tier-2: rewrote the `/cmd_vel` safety contract to an AST positive check
+  (controllers publish `cmd_vel_raw`, never `cmd_vel`); extended geometry +
+  RTK-status edge cases.
+- [x] ros-sim tier established (`tools/qc/ros/`, skips off-NUC).
+
+**Done 2026-06-02 — Tier-B sequencer fault-injection harness (NUC `ros-sim`):**
+
+- [x] `tools/qc/ros/sequencer_harness.py` + `test_sequencer_sim.py` — 8 tests
+  drive the REAL `experiment_sequencer_node` (subprocess on an isolated
+  `ROS_DOMAIN_ID`) against one mock node impersonating orchestrator /
+  reposition / odom_zero / RTK / estop / battery over the topic contracts. No
+  hardware, no possible motion (real movers never launched). `run_qc.py ros-sim`
+  → 16 passed (8 new + 8 odom_zero); laptop SKIPs. Covers: happy-path → DONE,
+  F2 RTK pause + auto-resume, reposition + preflight reason propagation
+  (P0 #4/#5), C6 exclusivity, autostart-off arming (P0 #10), F4 breaker,
+  run-timeout leg-fail.
+- [!] **Finding (deploy):** the installed colcon package was STALE — it predated
+  the `start`/`arm` action and `autostart=False`. `ros2 run` uses the install,
+  not the rsync'd source, so those fixes were never running on the robot.
+  Rebuilt (`colcon build --packages-select limo_path_follower`). Do a rebuild +
+  re-verify sweep before the next field trip; other written-but-unbuilt node
+  fixes may exist.
+- [!] **Finding (unattended):** only the F2 RTK-loss pause auto-resumes
+  (`experiment_sequencer_node.py:990`). Battery-halt (M2) and circuit-breaker
+  (F4, `:649`) pauses wait for an operator `resume`. With smoke's
+  `circuit_breaker_k: 1` (`scenarios/smoke.yaml:26`) one failed leg halts the
+  whole batch — fine for a 1-cell smoke; raise `k` for a stage-2 walk-away
+  matrix.
+
+**Fixed — real bug the suite caught:**
+
+- [x] `tools/ops/limo_ops.py` `ORCH_NAMES` was missing `"ops"` — drift vs
+  `orchestrator_node.PROCS`, which manages the real `ops_node` entry point
+  (`setup.py:27`). `test_orchestrator_process_names_match_cli_facade` was RED;
+  synced (`ops` is not motion-capable, so not added to the refuse-set) → green.
+
+**Suspected analysis-pipeline bugs — behavior pinned with tests:**
+
+- [x] **#1 `run_eval.fixed_mask_for` had no time tolerance**
+  (`tools/analysis/run_eval.py:336`). Added opt-in `max_dt` (default `None` =
+  legacy behaviour). Sparse `rtk_status` could label a fix FIXED from a
+  temporally-distant sample → corrupts RTK-truth ground truth. **Still TODO:**
+  wire a conservative `max_dt` into `evaluate()` (both `fixed_mask_for` call
+  sites) once a threshold is chosen against real bags. Sev: Med.
+- [x] **#2 `qc._window` degenerate fallback** (`tools/analysis/qc.py:47`). Added a
+  `no_run_window` QC reason so a bag with <2 odom/status samples fails loudly
+  instead of slipping through on whole-bag RTK%/estop with the length check
+  silently skipped. Sev: Low–Med. (smoke.sh still green.)
+- [ ] **#3 silent frame-provenance fallbacks** — `run_eval.odom_belief_source`
+  (`run_eval.py:322`) silently uses raw `/wheel/odom` when `odom_zeroed` is
+  absent; `transform_to_path_frame` is a pass-through when `path_frame_anchor is
+  None`; hardcoded rooftop anchor when `venue.anchor` absent. Behaviour **pinned
+  by tests; fix not applied** — proposal: surface the chosen odom source + anchor
+  provenance into `qc.csv`/manifest and add a QC reason when an RTK bag lacks the
+  per-leg `path_frame_anchor`, so a leg scored in the wrong frame is visible.
+  Sev: Med.
+
+**Remaining gaps — ROS node safety logic (NUC-gated, `ros-sim` tier):** every
+safety gate is still untested. Needs the sourced NUC (`run_qc.py ros-sim`), or
+extraction of the pure kernels into rclpy-free modules **inside the package**
+(note: `tools/qc/common.py` is laptop-side and not importable by the installed
+node, so a kernel must live under `limo_path_follower/`, e.g. a new `se2.py` /
+`experiment_matrix.py`, with the node rewired to import it — a production change
+that requires a colcon rebuild + on-robot verify, per the dev cycle).
+
+- [ ] `odom_zero` SE(2) re-anchor `P'=R(-yaw0)(P-O)` (inline in `_odom_cb`) —
+  extract + unit test (identity at reset, known rotation/translation). The
+  building-block helpers are already covered in
+  `tools/qc/ros/test_odom_zero_helpers.py`.
+- [~] `experiment_sequencer_node`: COVERED at integration level by the Tier-B
+  sim harness (see "Done 2026-06-02" above) — F4 breaker, F2 RTK-loss,
+  C6 mover-exclusivity, L3 odom-zero confirmation, reposition + preflight
+  failure-reason propagation, autostart-off arming, run-timeout leg-fail.
+  **Still open:** `_build_cells`/`_cell_id` determinism + `_classify` (D4
+  multi-condition pass) as Tier-A rclpy-free unit kernels; M2 battery-halt has
+  no dedicated low-battery test yet.
+- [ ] `path_follower_node`: odom-timeout halt (0.5 s → zero), steering clip
+  `[-0.5, 0.5]`, kinematics `omega = v·tan(δ)/L`.
+- [ ] `reposition_node`: `_plan_clear` composition (area + exclusion), RTK
+  quality gate, 3-point-turn decision.
+- [ ] `estop_cli.py`: ping-failure threshold (10 misses → latch) + the
+  `cmd_vel_raw → cmd_vel` filter (the last motion gate).
+
 ## Optional / Later
 
 - [ ] Fold the controller node into a unified launch flow after manual

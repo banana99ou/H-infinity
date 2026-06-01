@@ -39,6 +39,7 @@ import argparse
 import logging
 import random
 import socket
+import struct
 import threading
 import time
 from dataclasses import dataclass, field
@@ -56,6 +57,15 @@ TCP_PORT_DEFAULT = 2101
 SERIAL_REOPEN_BACKOFF_S = 2.0
 RTCM_STALE_S = 5.0
 STATUS_PRINT_INTERVAL_S = 5.0
+
+SURVEY_IN_MIN_DURATION_S_DEFAULT = 60
+SURVEY_IN_ACC_LIMIT_M_DEFAULT = 5.0
+
+UBX_SYNC_1 = 0xB5
+UBX_SYNC_2 = 0x62
+UBX_CLASS_CFG = 0x06
+UBX_ID_CFG_TMODE3 = 0x71
+UBX_TMODE3_MODE_SURVEY_IN = 1
 
 log = logging.getLogger("rtcm_server")
 
@@ -204,6 +214,31 @@ class SerialManager:
                 log.warning("[serial] read error: %s — reopening", e)
                 self._reopen()
 
+    def write(self, data: bytes) -> None:
+        while True:
+            try:
+                with self._lock:
+                    if self._ser is None:
+                        raise serial.SerialException("serial not open")
+                    self._ser.write(data)
+                    self._ser.flush()
+                return
+            except serial.SerialException as e:
+                log.warning("[serial] write error: %s — reopening", e)
+                self._reopen()
+
+    def reset_input_buffer(self) -> None:
+        while True:
+            try:
+                with self._lock:
+                    if self._ser is None:
+                        raise serial.SerialException("serial not open")
+                    self._ser.reset_input_buffer()
+                return
+            except serial.SerialException as e:
+                log.warning("[serial] input-buffer reset error: %s — reopening", e)
+                self._reopen()
+
     def close(self) -> None:
         with self._lock:
             if self._ser is not None:
@@ -212,6 +247,54 @@ class SerialManager:
                 except Exception:  # noqa: BLE001
                     pass
                 self._ser = None
+
+
+# ---------------- UBX config ----------------
+
+def _ubx_checksum(data: bytes) -> bytes:
+    ck_a = 0
+    ck_b = 0
+    for b in data:
+        ck_a = (ck_a + b) & 0xFF
+        ck_b = (ck_b + ck_a) & 0xFF
+    return bytes((ck_a, ck_b))
+
+
+def _ubx_frame(msg_class: int, msg_id: int, payload: bytes) -> bytes:
+    header = struct.pack("<BBH", msg_class, msg_id, len(payload))
+    return bytes((UBX_SYNC_1, UBX_SYNC_2)) + header + payload + _ubx_checksum(header + payload)
+
+
+def build_tmode3_survey_in(min_duration_s: int, acc_limit_m: float) -> bytes:
+    """Build UBX-CFG-TMODE3 that forces Survey-In in volatile receiver config."""
+    acc_limit_0p1mm = int(round(acc_limit_m * 10000.0))
+    payload = struct.pack(
+        "<BBHiiibbbBIIIII",
+        0,  # version
+        0,  # reserved1
+        UBX_TMODE3_MODE_SURVEY_IN,
+        0, 0, 0,  # ECEF/LLH fields ignored in Survey-In mode
+        0, 0, 0,  # high-precision coordinate bytes ignored in Survey-In mode
+        0,  # reserved2
+        0,  # fixed position accuracy ignored in Survey-In mode
+        int(min_duration_s),
+        acc_limit_0p1mm,
+        0, 0,  # reserved3
+    )
+    return _ubx_frame(UBX_CLASS_CFG, UBX_ID_CFG_TMODE3, payload)
+
+
+def force_survey_in_on_boot(ser: SerialManager, min_duration_s: int,
+                            acc_limit_m: float) -> None:
+    """Make this service startup a fresh base survey, even if F9P flash/BBR is stale."""
+    log.info(
+        "[ubx] forcing TMODE3 Survey-In on boot: min_duration=%ds acc_limit=%.2fm",
+        min_duration_s, acc_limit_m,
+    )
+    ser.reset_input_buffer()
+    ser.write(build_tmode3_survey_in(min_duration_s, acc_limit_m))
+    time.sleep(0.2)
+    ser.reset_input_buffer()
 
 
 # ---------------- Threads ----------------
@@ -447,6 +530,16 @@ def main() -> int:
                         help="demo: payload length in bytes (default: 80)")
     parser.add_argument("--demo-no-nmea", action="store_true",
                         help="demo: don't also emit fake NMEA")
+    parser.add_argument("--survey-min-duration-s", type=int,
+                        default=SURVEY_IN_MIN_DURATION_S_DEFAULT,
+                        help=("base boot Survey-In minimum duration in seconds "
+                              f"(default: {SURVEY_IN_MIN_DURATION_S_DEFAULT})"))
+    parser.add_argument("--survey-acc-limit-m", type=float,
+                        default=SURVEY_IN_ACC_LIMIT_M_DEFAULT,
+                        help=("base boot Survey-In accuracy limit in meters "
+                              f"(default: {SURVEY_IN_ACC_LIMIT_M_DEFAULT})"))
+    parser.add_argument("--no-force-survey-in", action="store_true",
+                        help="do not force TMODE3 Survey-In on startup")
     parser.add_argument("--log-level", default="INFO",
                         choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     args = parser.parse_args()
@@ -467,6 +560,14 @@ def main() -> int:
         ).start()
     else:
         ser = SerialManager(args.serial, args.baud)
+        if args.no_force_survey_in:
+            log.warning("[ubx] not forcing Survey-In on boot (--no-force-survey-in)")
+        else:
+            force_survey_in_on_boot(
+                ser,
+                min_duration_s=args.survey_min_duration_s,
+                acc_limit_m=args.survey_acc_limit_m,
+            )
         threading.Thread(
             target=serial_reader, args=(ser, st, stop), daemon=True,
         ).start()

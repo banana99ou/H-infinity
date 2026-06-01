@@ -115,6 +115,8 @@ def generate_launch_description():
                     "-r", "__ns:=/gps_rtk_f9p_helical",
                 ],
                 output="screen",
+                respawn=True,
+                respawn_delay=2.0,
             ),
         ]
     )

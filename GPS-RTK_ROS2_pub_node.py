@@ -55,6 +55,16 @@ TCP_PORT = 2101
 
 STATUS_PRINT_INTERVAL = 1.0   # seconds
 RTCM_STALE_SECONDS = 5.0      # consider RTCM stale after this
+RTCM_RECONNECT_AFTER_STALE_SECONDS = 15.0
+RTCM_SOCKET_TIMEOUT_SECONDS = 5.0
+RTCM_CONNECT_TIMEOUT_SECONDS = 10.0
+RTCM_CONNECT_RETRY_BASE_SECONDS = 2.0
+RTCM_CONNECT_RETRY_MAX_SECONDS = 30.0
+RTCM_RECONNECT_COOLDOWN_SECONDS = 1.0
+
+TCP_KEEPIDLE_SECONDS = 10
+TCP_KEEPINTVL_SECONDS = 5
+TCP_KEEPCNT = 3
 
 # Debugging (set True temporarily when diagnosing RTCM "stale")
 DEBUG_RTCM = False
@@ -327,15 +337,40 @@ class HelicalGpsNode(Node):
 
 # -------------- THREADS --------------
 
+def configure_tcp_keepalive(sock: socket.socket):
+    """Enable TCP keepalive with short probes when the platform exposes knobs."""
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+
+    keepalive_options = (
+        ("TCP_KEEPIDLE", TCP_KEEPIDLE_SECONDS),
+        ("TCP_KEEPALIVE", TCP_KEEPIDLE_SECONDS),  # macOS name for idle time
+        ("TCP_KEEPINTVL", TCP_KEEPINTVL_SECONDS),
+        ("TCP_KEEPCNT", TCP_KEEPCNT),
+    )
+    for opt_name, value in keepalive_options:
+        opt = getattr(socket, opt_name, None)
+        if opt is None:
+            continue
+        try:
+            sock.setsockopt(socket.IPPROTO_TCP, opt, value)
+        except OSError as e:
+            print(f"[RTCM] TCP keepalive option {opt_name} unsupported: {e}")
+
+
 def rtcm_forwarder(ser_mgr: SerialManager, rtcm_status: RTCMStatus, stop_event: threading.Event):
     """Connect to your TCP RTCM broadcaster and pump bytes into F9P."""
+    retry_delay = RTCM_CONNECT_RETRY_BASE_SECONDS
+
     while not stop_event.is_set():
         try:
             print(f"[RTCM] Connecting to {TCP_HOST}:{TCP_PORT} ...")
-            with socket.create_connection((TCP_HOST, TCP_PORT), timeout=10) as sock:
-                sock.settimeout(5.0)
+            with socket.create_connection((TCP_HOST, TCP_PORT), timeout=RTCM_CONNECT_TIMEOUT_SECONDS) as sock:
+                configure_tcp_keepalive(sock)
+                sock.settimeout(RTCM_SOCKET_TIMEOUT_SECONDS)
+                connected_at = time.time()
                 print("[RTCM] Connected. Receiving RTCM3 and forwarding to F9P...")
                 rtcm_status.reconnects += 1
+                retry_delay = RTCM_CONNECT_RETRY_BASE_SECONDS
 
                 while not stop_event.is_set():
                     try:
@@ -370,10 +405,11 @@ def rtcm_forwarder(ser_mgr: SerialManager, rtcm_status: RTCMStatus, stop_event: 
                                     f"reconnects={rtcm_status.reconnects}"
                                 )
                     except socket.timeout:
-                        # No data in this interval; just loop
                         rtcm_status.socket_timeouts += 1
+                        now = time.time()
+                        last_activity = max(rtcm_status.last_net_rx_time, connected_at)
+                        stale_for = now - last_activity
                         if DEBUG_RTCM:
-                            now = time.time()
                             if (now - rtcm_status._last_debug_print_time) >= DEBUG_RTCM_PRINT_INTERVAL:
                                 rtcm_status._last_debug_print_time = now
                                 age = (now - rtcm_status.last_rx_time) if rtcm_status.last_rx_time > 0 else float("inf")
@@ -381,12 +417,22 @@ def rtcm_forwarder(ser_mgr: SerialManager, rtcm_status: RTCMStatus, stop_event: 
                                 print(
                                     "[RTCM][DBG] socket timeout "
                                     f"(fwd_age={age:.1f}s, net_age={net_age:.1f}s, "
+                                    f"stale_for={stale_for:.1f}s, "
                                     f"timeouts={rtcm_status.socket_timeouts})"
                                 )
+                        if stale_for >= RTCM_RECONNECT_AFTER_STALE_SECONDS:
+                            print(
+                                "[RTCM] No RTCM bytes for "
+                                f"{stale_for:.1f}s; reconnecting TCP socket."
+                            )
+                            break
                         continue
+                if not stop_event.is_set():
+                    time.sleep(RTCM_RECONNECT_COOLDOWN_SECONDS)
         except (socket.error, OSError) as e:
-            print(f"[RTCM] Connection error: {e}. Retrying in 5s...")
-            time.sleep(5)
+            print(f"[RTCM] Connection error: {e}. Retrying in {retry_delay:.1f}s...")
+            time.sleep(retry_delay)
+            retry_delay = min(retry_delay * 2.0, RTCM_CONNECT_RETRY_MAX_SECONDS)
 
 
 def nmea_reader(ser_mgr: SerialManager, gnss_status: GNSSStatus, node: HelicalGpsNode, stop_event: threading.Event):

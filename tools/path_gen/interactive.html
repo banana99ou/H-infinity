@@ -170,7 +170,7 @@
     </div>
     <div class="stat" style="margin-top:6px;">
       <span class="dot" id="conn-dot"></span><span id="conn-state">disconnected</span><br>
-      <span class="dot" id="odom-dot"></span>odom: <span id="odom-rate">--</span><br>
+      <span class="dot" id="odom-dot"></span>odom_zeroed: <span id="odom-rate">--</span><br>
       <span class="dot" id="status-dot"></span>follower: <span id="status-rate">--</span>
     </div>
 
@@ -192,7 +192,7 @@
     </div>
     <div class="small" id="push-state">no path pushed</div>
 
-    <h3>Path start pose (odom)</h3>
+    <h3>Path start pose (controller frame)</h3>
     <div class="row">
       <label style="flex:1">x (m)<input type="number" id="anchor-x" step="0.05" value="0"></label>
       <label style="flex:1">y (m)<input type="number" id="anchor-y" step="0.05" value="0"></label>
@@ -633,7 +633,7 @@ let pathAnchorPosMarker = null, pathAnchorTipMarker = null, pathAnchorLine = nul
 // Pose at which the path's local origin is anchored in the odom frame.
 // path[0] will be published at (x, y) with tangent theta (radians, CCW from +x).
 let pathAnchor = { x: 0, y: 0, theta: 0 };
-// Live robot odom for the "Snap to robot" button.
+// Live controller-frame odom for the "Snap to robot" button.
 let lastRobotOdom = { x: 0, y: 0, theta: 0, t: 0 };
 
 function applyPathAnchor(pts, a) {
@@ -890,6 +890,7 @@ let topicExpStatus = null, topicExpCmd = null;   // T10 — /experiment/{status,
 let setParamsService = null;
 let lastOdomTime = 0, lastStatusTime = 0, odomCount = 0, statusCount = 0;
 let lastExpTime = 0, expCount = 0;                // T10 — sequencer freshness
+let latestExpStatus = null;
 let odomRateTimer = null;
 let estopActive = null;
 
@@ -973,7 +974,7 @@ function subscribeAll() {
   });
 
   topicOdom = new ROSLIB.Topic({
-    ros, name: '/wheel/odom', messageType: 'nav_msgs/Odometry'
+    ros, name: '/wheel/odom_zeroed', messageType: 'nav_msgs/Odometry'
   });
   topicOdom.subscribe(onOdom);
 
@@ -1036,16 +1037,31 @@ const STACK_LABELS = {
   base_vanilla: 'limo_base (vanilla)',
   base_gnss:    'limo_base + GNSS',
   estop:        'estop_cli',
+  odom_zero:    'odom_zero_node',
   follower:     'path_follower_node',
+  reposition:   'reposition_node',
+  sequencer:    'experiment_sequencer_node',
+  ops:          'ops_node',
 };
 function onOrchStatus(msg) {
   let state;
   try { state = JSON.parse(msg.data); } catch (e) { return; }
+  const detail = state._detail || {};
   const rows = Object.keys(STACK_LABELS).map(name => {
     const alive = !!state[name];
-    const dot = alive ? '<span class="dot ok"></span>' : '<span class="dot bad"></span>';
+    const meta = detail[name] || {};
+    const expectedOff =
+      !alive && name === 'follower' && latestExpStatus &&
+      latestExpStatus.cmd_owner === 'reposition';
+    const dotClass = alive ? 'ok' : (expectedOff ? 'warn' : 'bad');
+    const suffix = expectedOff ? ' <span class="warn">(reposition owns motion)</span>' : '';
+    const pid = meta.pid != null ? ` pid=${meta.pid}` : '';
+    const rc = meta.last_exit_code != null ? ` rc=${meta.last_exit_code}` : '';
+    const reason = meta.intentional_stop_reason ? ` ${meta.intentional_stop_reason}` : '';
+    const title = `${STACK_LABELS[name]}${pid}${rc}${reason}`;
+    const dot = `<span class="dot ${dotClass}"></span>`;
     return `<div style="display:flex;align-items:center;gap:6px;margin:3px 0;">
-      ${dot}<span style="flex:1">${STACK_LABELS[name]}</span>
+      ${dot}<span style="flex:1" title="${title.replace(/"/g, '&quot;')}">${STACK_LABELS[name]}${suffix}</span>
       <button data-orch-start="${name}" style="padding:2px 6px;font-size:11px;">start</button>
       <button data-orch-kill="${name}" style="padding:2px 6px;font-size:11px;">kill</button>
     </div>`;
@@ -1107,7 +1123,7 @@ function onStatus(msg) {
     `&kappa;: ${kappa.toFixed(3)} 1/m &nbsp; <span class="${rho_class}">&rho;: ${rho.toFixed(2)}</span><br>` +
     `e&psi;: ${(e_psi*180/Math.PI).toFixed(1)}&deg; &nbsp; &delta;: ${(delta_cmd*180/Math.PI).toFixed(1)}&deg;`;
 
-  // Also feed odom-derived robot marker if /wheel/odom is silent.
+  // Also feed controller-frame robot marker if /wheel/odom_zeroed is silent.
   if (Date.now() - lastOdomTime > 2000) drawRobot(x, y, yaw);
 }
 
@@ -1227,6 +1243,7 @@ function onExpStatus(msg) {
     $('exp-progress').innerHTML = '<span class="err">bad /experiment/status JSON</span>';
     return;
   }
+  latestExpStatus = d;
 
   const idx   = Number(d.cell_index);
   const total = Number(d.n_cells);
@@ -1379,6 +1396,36 @@ function orderCCW(poly) {
   const cy = poly.reduce((s,p)=>s+p[1],0)/poly.length;
   return [...poly].sort((a,b)=>Math.atan2(a[1]-cy,a[0]-cx)-Math.atan2(b[1]-cy,b[0]-cx));
 }
+function normalizedVenueCorners() {
+  const { lat0, lon0, bearing } = venueAnchor();
+  const pts = venue.corners.map(c => ({
+    src: c,
+    xy: latlonToLocalXY(c.lat, c.lon, lat0, lon0, bearing),
+  }));
+  if (pts.length < 3) return venue.corners.map(c => ({ lat: c.lat, lon: c.lon }));
+  const cx = pts.reduce((s,p)=>s+p.xy[0],0)/pts.length;
+  const cy = pts.reduce((s,p)=>s+p.xy[1],0)/pts.length;
+  return pts
+    .sort((a,b)=>Math.atan2(a.xy[1]-cy,a.xy[0]-cx)-Math.atan2(b.xy[1]-cy,b.xy[0]-cx))
+    .map(p => ({ lat: p.src.lat, lon: p.src.lon }));
+}
+function segmentsIntersect(a, b, c, d) {
+  const ccw = (p, q, r) => (r[1]-p[1])*(q[0]-p[0]) > (q[1]-p[1])*(r[0]-p[0]);
+  return (ccw(a,c,d) !== ccw(b,c,d)) && (ccw(a,b,c) !== ccw(a,b,d));
+}
+function clickOrderSelfIntersects() {
+  const pts = cornersLocalXY();
+  if (pts.length < 4) return false;
+  for (let i=0; i<pts.length; i++) {
+    const a = pts[i], b = pts[(i+1)%pts.length];
+    for (let j=i+1; j<pts.length; j++) {
+      if (Math.abs(i-j) <= 1 || (i === 0 && j === pts.length-1)) continue;
+      const c = pts[j], d = pts[(j+1)%pts.length];
+      if (segmentsIntersect(a, b, c, d)) return true;
+    }
+  }
+  return false;
+}
 function insetPolygonXY(margin) {
   if (venue.corners.length < 3) return [];
   const poly = orderCCW(cornersLocalXY());
@@ -1496,7 +1543,9 @@ function drawVenue() {
   venue.end_pins.forEach(p => drawPin({ ...p, _kind: 'end' }, '#f80'));
 
   // Update readouts.
-  $('venue-corner-state').textContent = `corners: ${venue.corners.length} / 4`;
+  const crossing = clickOrderSelfIntersects();
+  $('venue-corner-state').textContent =
+    `corners: ${venue.corners.length} / 4${crossing ? ' — click order crosses; export normalized' : ''}`;
   $('venue-excl-state').textContent = `exclusions: ${venue.exclusions.length}`;
   $('venue-pin-state').textContent = `pins: ${venue.start_pins.length} start / ${venue.end_pins.length} end`;
 }
@@ -1540,10 +1589,12 @@ function bindVenuePinDrag(posMarker, tipMarker, ref) {
 
 // ---- Export / load ----
 function venueToJSON() {
+  const clickOrder = venue.corners.map(c => ({ lat: c.lat, lon: c.lon }));
   return {
     name: venue.name,
     frame: venue.frame,
-    corners_wgs84: venue.corners.map(c => ({ lat: c.lat, lon: c.lon })),
+    corners_wgs84: normalizedVenueCorners(),
+    corners_click_order_wgs84: clickOrder,
     safety_margin_m: venue.safety_margin_m,
     exclusions: venue.exclusions.map(e => ({ kind: 'circle', lat: e.lat, lon: e.lon, radius_m: e.radius_m })),
     start_pins: venue.start_pins.map(p => ({ id: p.id, lat: p.lat, lon: p.lon, heading_deg: p.heading_deg })),
@@ -1755,7 +1806,7 @@ $('exp-btn-abort').onclick  = expAbort;
 });
 $('btn-anchor-snap').onclick = () => {
   if (!lastRobotOdom.t || (Date.now() - lastRobotOdom.t > 3000)) {
-    alert('no recent robot odom (need /wheel/odom flowing)');
+    alert('no recent robot odom (need /wheel/odom_zeroed flowing)');
     return;
   }
   pathAnchor.x = lastRobotOdom.x;

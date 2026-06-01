@@ -30,12 +30,14 @@ try:
     import rclpy  # pyright: ignore[reportMissingImports]
     from rclpy.node import Node  # pyright: ignore[reportMissingImports]
     from rclpy._rclpy_pybind11 import RCLError  # pyright: ignore[reportMissingImports]
+    from rclpy.executors import ExternalShutdownException  # pyright: ignore[reportMissingImports]
     from std_msgs.msg import Bool, String  # pyright: ignore[reportMissingImports]
     _HAVE_RCLPY = True
 except Exception:  # pragma: no cover - laptop has no ROS
     _HAVE_RCLPY = False
     Node = object          # lets DataLoggerHealthNode be defined (used only on NUC)
     RCLError = Exception
+    ExternalShutdownException = Exception
     Bool = String = None   # resolve method annotations (msg: Bool) at class-def time
 
 
@@ -114,6 +116,21 @@ def _rewrite_bag_metadata_and_files(bag_dir: str, old_base: str, new_base: str) 
     except OSError:
         # Best-effort; metadata rewrite isn't strictly required to use the bag.
         return
+
+
+def _stop_bag_process(proc: subprocess.Popen, timeout_s: float = 10.0) -> None:
+    """Stop ros2 bag cleanly so metadata.yaml is finalized before renaming."""
+    if proc.poll() is not None:
+        return
+    try:
+        proc.send_signal(signal.SIGINT)
+    except Exception:
+        pass
+    try:
+        proc.wait(timeout=timeout_s)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
 
 
 # ---------------------------------------------------------------------------
@@ -459,20 +476,14 @@ def main(argv=None) -> int:
         while rclpy.ok() and proc.poll() is None:
             rclpy.spin_once(node, timeout_sec=0.2)
         end_monotonic = time.monotonic()
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, ExternalShutdownException):
         # Stop request (Ctrl+C or orchestrator SIGINT)
         print("\nStopping ros2 bag recording...")
-        try:
-            proc.send_signal(signal.SIGINT)
-        except Exception:
-            pass
-        try:
-            proc.wait(timeout=10.0)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait()
         end_monotonic = time.monotonic()
     finally:
+        if end_monotonic is None:
+            end_monotonic = time.monotonic()
+        _stop_bag_process(proc)
         node.recording_active = False
         try:
             # Final publish

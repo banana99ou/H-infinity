@@ -139,7 +139,7 @@ class ExperimentSequencer(Node):
         # Auto-start the batch on launch. When False the node idles until an
         # /experiment/cmd {"action":"resume"} arrives (lets the battle station
         # arm it deliberately).
-        self.declare_parameter("autostart", True)
+        self.declare_parameter("autostart", False)
         # Per-phase wall-time budgets [s]. Conservative; tune on the robot.
         self.declare_parameter("preflight_timeout_s", 90.0)
         self.declare_parameter("reposition_timeout_s", 120.0)
@@ -277,6 +277,8 @@ class ExperimentSequencer(Node):
                 "limo_msgs not importable — battery gating (M2) disabled")
 
         self._repo_state = None  # last /reposition/status 'state'
+        self._repo_status = {}   # full last /reposition/status payload
+        self._repo_status_raw = ""
 
         # set_parameters service client for the follower.
         self._param_cli = self.create_client(
@@ -411,7 +413,13 @@ class ExperimentSequencer(Node):
             self.get_logger().warn(f"bad /experiment/cmd: {msg.data!r}")
             return
         action = str(d.get("action", "")).lower().strip()
-        if action == "pause":
+        if action in ("start", "arm"):
+            if self.phase == Phase.IDLE:
+                self._publish_status(message=f"{action}: starting preflight")
+                self._begin_batch()
+            else:
+                self.get_logger().info(f"{action} ignored — phase={self.phase.value}")
+        elif action == "pause":
             self._request_pause("operator pause (F5)")
         elif action == "resume":
             self._resume()
@@ -431,6 +439,8 @@ class ExperimentSequencer(Node):
     def _on_repo_status(self, msg):
         try:
             d = json.loads(msg.data)
+            self._repo_status = d if isinstance(d, dict) else {}
+            self._repo_status_raw = msg.data or ""
             self._repo_state = str(d.get("state", "")).lower().strip()
         except (ValueError, TypeError):
             pass
@@ -687,7 +697,8 @@ class ExperimentSequencer(Node):
             try:
                 self._preflight_proc = subprocess.Popen(
                     ["bash", self._preflight_path],
-                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    text=True, errors="replace")
             except Exception as exc:
                 self.get_logger().error(f"preflight launch failed: {exc}")
                 self._preflight_proc = None
@@ -698,18 +709,25 @@ class ExperimentSequencer(Node):
             if self._in_phase_s() > self._preflight_timeout:
                 try:
                     self._preflight_proc.kill()
+                    out, _ = self._preflight_proc.communicate(timeout=1.0)
                 except Exception:
-                    pass
+                    out = ""
                 self._preflight_proc = None
-                self._fail_leg("preflight timeout")
+                detail = self._summarize_preflight_output(out)
+                self._fail_leg(f"preflight timeout{detail}")
             return
         # Finished.
+        try:
+            out, _ = self._preflight_proc.communicate(timeout=1.0)
+        except Exception:
+            out = ""
         self._preflight_proc = None
         if rc == 0:
             self._publish_status(message="preflight pass")
             self._enter(Phase.REPOSITION_START)
         else:
-            self._fail_leg(f"preflight FAIL (exit {rc})")
+            detail = self._summarize_preflight_output(out)
+            self._fail_leg(f"preflight FAIL (exit {rc}){detail}")
 
     def _tick_repo_start(self):
         # R4 no-op: if the pin we need to be at equals the prior end pin, skip
@@ -722,6 +740,8 @@ class ExperimentSequencer(Node):
         res = self._start_exclusive_mover(PROC_REPOSITION)
         if res == "started":
             self._repo_state = None
+            self._repo_status = {}
+            self._repo_status_raw = ""
             self._enter(Phase.REPOSITION_GOTO)
         elif self._in_phase_s() > self._reposition_timeout:
             self._fail_leg("reposition start timeout")
@@ -753,7 +773,7 @@ class ExperimentSequencer(Node):
             self._enter(Phase.REPOSITION_KILL)
         elif self._repo_state == "aborted":
             self._goto_sent = False
-            self._fail_leg("reposition aborted (R3 area/exclusion or unreachable)")
+            self._fail_leg(self._reposition_abort_summary())
         elif self._in_phase_s() > self._reposition_timeout:
             self._goto_sent = False
             self._fail_leg("reposition goto timeout")
@@ -1033,6 +1053,7 @@ class ExperimentSequencer(Node):
         Always release any mover first (safe-state, C6).
         """
         self.get_logger().warn(f"leg fail: {reason}")
+        self._publish_status(message=f"leg fail: {reason}")
         # Stop any in-flight bag so we don't leak a partial recording.
         if self._recorder is not None:
             try:
@@ -1051,6 +1072,40 @@ class ExperimentSequencer(Node):
             f"{self._cur_cell()['cell_id'] if self._cur_cell() else '?'} {self.leg.value}",
             title="H-inf leg fail", tags="x")
         self._handle_leg_failure()
+
+    def _summarize_preflight_output(self, output, max_chars=600):
+        """Return a compact failure detail from preflight stdout/stderr."""
+        text = str(output or "")
+        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+        if not lines:
+            return ""
+        interesting = [
+            ln for ln in lines
+            if any(tok in ln.lower() for tok in (
+                "fail", "failed", "error", "warn", "missing", "stale", "not fixed",
+                "rtk", "estop", "exclusive", "skipped",
+            ))
+        ]
+        chosen = interesting[-6:] if interesting else lines[-6:]
+        summary = " | ".join(chosen)
+        if len(summary) > max_chars:
+            summary = summary[-max_chars:]
+        return f": {summary}"
+
+    def _reposition_abort_summary(self):
+        """Preserve the exact reposition-node abort reason in experiment status."""
+        status = self._repo_status if isinstance(self._repo_status, dict) else {}
+        reason = status.get("reason") or status.get("message") or "aborted"
+        parts = [f"reposition aborted: {reason}"]
+        for key in ("err_m", "err_deg"):
+            value = status.get(key)
+            if value is None:
+                continue
+            try:
+                parts.append(f"{key}={float(value):.2f}")
+            except (TypeError, ValueError):
+                parts.append(f"{key}={value}")
+        return " ".join(parts)
 
     def _classify(self, cell, bag_info):
         """D4 per-run pass/fail (system_spec §5 / experiment.md).
@@ -1250,6 +1305,10 @@ class ExperimentSequencer(Node):
         self._publish_status(message=f"paused: {reason}")
 
     def _resume(self):
+        if self.phase == Phase.IDLE:
+            self._publish_status(message="resume from idle: starting preflight")
+            self._begin_batch()
+            return
         if self.phase != Phase.PAUSED:
             self.get_logger().info("resume ignored — not paused")
             return
@@ -1330,6 +1389,11 @@ class ExperimentSequencer(Node):
 
     def _publish_status(self, message=""):
         cell = self._cur_cell()
+        cmd_owner = None
+        if self.phase in (Phase.REPOSITION_START, Phase.REPOSITION_GOTO, Phase.REPOSITION_KILL):
+            cmd_owner = "reposition"
+        elif self.phase in (Phase.FOLLOWER_START, Phase.RUN):
+            cmd_owner = "follower"
         payload = {
             "run_id": self.run_id,
             "cell_id": cell["cell_id"] if cell else None,
@@ -1340,6 +1404,7 @@ class ExperimentSequencer(Node):
             "pass": self._n_pass,
             "fail": self._n_fail,
             "eta_s": self._eta_s(),
+            "cmd_owner": cmd_owner,
             "message": message,
         }
         m = String()

@@ -430,6 +430,8 @@ class RepositionNode(Node):
             lat = float(d['lat'])
             lon = float(d['lon'])
             heading_deg = float(d['heading_deg'])
+            dry_run = bool(d.get('dry_run', False))
+            approach_dist = float(d.get('approach_dist_m', self._approach_dist))
         except (ValueError, TypeError, KeyError) as exc:
             self._abort(f'bad /reposition/goto payload: {exc}')
             return
@@ -441,14 +443,15 @@ class RepositionNode(Node):
             self._abort('no RTK FIXED fix yet; refusing to start (R1)')
             return
 
+        self._approach_dist = approach_dist
         xy = self._geo.latlon_to_local((lat, lon), self._anchor)[0]
         self._target_xy = (float(xy[0]), float(xy[1]))
         self._target_yaw = self._bearing_deg_to_local_yaw(heading_deg)
         # Approach-entry point: offset back along the target heading so the
         # final segment runs straight into the pin along that heading (R2).
         self._entry_xy = (
-            self._target_xy[0] - self._approach_dist * math.cos(self._target_yaw),
-            self._target_xy[1] - self._approach_dist * math.sin(self._target_yaw),
+            self._target_xy[0] - approach_dist * math.cos(self._target_yaw),
+            self._target_xy[1] - approach_dist * math.sin(self._target_yaw),
         )
 
         # R4: no-op if we already start within tolerance of the target pose.
@@ -474,7 +477,21 @@ class RepositionNode(Node):
         # R3: pre-flight the whole plan against the working area + exclusions.
         ok, reason = self._plan_clear()
         if not ok:
+            if dry_run:
+                self._state = 'idle'
+                self._reason = f'dry-run FAIL: {reason} (R3)'
+                self._zero_cmd()
+                self._publish_status(err_m=err_m, err_deg=float('nan'))
+                return
             self._abort(f'planned path breaches working area: {reason} (R3)')
+            return
+
+        if dry_run:
+            self._state = 'idle'
+            self._reason = (
+                f'dry-run OK: plan fits, approach_dist_m={approach_dist:.2f}')
+            self._zero_cmd()
+            self._publish_status(err_m=err_m, err_deg=float('nan'))
             return
 
         self._state = 'aligning'
@@ -684,6 +701,7 @@ class RepositionNode(Node):
             'err_m': None if err_m != err_m else round(float(err_m), 4),
             'err_deg': None if err_deg != err_deg else round(float(err_deg), 3),
             'reason': reason if reason is not None else self._reason,
+            'approach_dist_m': self._approach_dist,
         }
         m = String()
         m.data = json.dumps(payload)

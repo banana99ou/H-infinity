@@ -452,6 +452,29 @@ pipeline.
   whole batch — fine for a 1-cell smoke; raise `k` for a stage-2 walk-away
   matrix.
 
+**2026-06-02 — full-matrix bench dry-run harness (NUC, wheels-off):**
+
+- [x] `tools/qc/ros/bench_world_node.py` + `scenarios/experiment_bench.yaml` —
+  walks the FULL 320-cell matrix on a pedestal with no GPS. The node supplies
+  synthetic RTK (integrates `/cmd_vel` through a unicycle in the venue frame,
+  seeded at pin A, publishes `/gps_rtk_f9p_helical/gps/{fix,rtk_status}`
+  quality=4) + a scripted battery fault (republishes `/limo_status` ->
+  `/limo_status_bench`, drops volts < halt after N completed runs). Exercises the
+  autonomy brain + real movers + safety chain end-to-end and verifies the M2
+  low-battery halt + operator notification. **Wheels-off only** — it spoofs RTK
+  FIXED, so the movers energize; no translation only because the wheels are up.
+- [!] **BUG FOUND + FIXED — operator notify (T8) was dead.**
+  `experiment_sequencer_node._notify()` never passed `topic`/`server` to
+  `tools/notify/ntfy.py`, and the node never read the config's `ntfy:` block, so
+  a non-empty `ntfy.topic` was silently ignored and **NO operator push (battery
+  halt M2, circuit breaker F4, RTK loss F2) ever left the robot.** In the field
+  the unattended operator would never be told the battery died — exactly the gap
+  the battery dry-run targets. Fixed: `set_notify_channel()` wires topic/server
+  from config; `_notify` forwards them and fires on a daemon thread (the blocking
+  ~5 s HTTP POST also sat in the control `_tick`). Empty topic still disables push
+  (safe default). **TODO: verify the push end-to-end on the bench run, then set a
+  real field topic in `experiment.yaml`.**
+
 **Fixed — real bug the suite caught:**
 
 - [x] `tools/ops/limo_ops.py` `ORCH_NAMES` was missing `"ops"` — drift vs

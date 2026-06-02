@@ -1,0 +1,52 @@
+# Bench dry-run of the FULL experiment matrix (TEST HARNESS — wheels off ground).
+#
+# Same 320-cell matrix as scenarios/experiment.yaml, but isolated for a hands-off
+# bench walk driven by tools/qc/ros/bench_world_node.py (synthetic RTK + scripted
+# battery fault). Differences from experiment.yaml:
+#   - run_id: distinct, so bench bags never collide with real batches.
+#   - artifact_sync.enabled: false — bench bags are wheels-off junk; do NOT push
+#     them to the Mac/NAS.
+#   - ntfy.topic: a throwaway push topic for the battery-halt notification test
+#     (filled in at deploy time; "" = push disabled).
+# Launch with bag_root pointed at /tmp so the junk bags are ephemeral:
+#   ros2 run limo_path_follower experiment_sequencer_node --ros-args \
+#     -p experiment_yaml:=/home/agilex/H-infinity/scenarios/experiment_bench.yaml \
+#     -p bag_root:=/tmp/limo_bench_bags \
+#     -r /limo_status:=/limo_status_bench
+# Keep the matrix block in sync with experiment.yaml.
+
+run_id: bench_dryrun_2026_06_02
+
+# Placeholder rooftop geometry. Safe for the bench because bench_world seeds the
+# synthetic RTK pose AT pin A and a cell's 4 legs net back to ~A, so RTK
+# reposition is an R4 no-op every time and the placeholder corners/island are
+# never exercised. (If reposition ever does plan a real drive here, that is a
+# finding about this venue, not the controller.)
+venue: scenarios/venues/rooftop.json
+
+matrix:
+  radius_m: [1.0, 0.7, 0.5, 0.4]
+  controller: [lpv-hinf, pid]
+  v_const: [1.0, 0.5]
+  path_family: [step, slalom]
+
+repetitions: 10
+
+gating:
+  battery_volts_warn: 10.8
+  battery_volts_halt: 10.5
+  rtk_run_window_pct: 95
+
+retry:
+  max_retries: 1
+  circuit_breaker_k: 3
+
+ntfy:
+  server: https://ntfy.sh
+  # Throwaway topic for the battery-halt push test. Subscribe at
+  # https://ntfy.sh/<topic> (or the ntfy app) to receive "come pick it up".
+  # Empty = push disabled (no external send).
+  topic: ""
+
+artifact_sync:
+  enabled: false

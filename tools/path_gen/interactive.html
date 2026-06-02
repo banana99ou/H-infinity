@@ -73,6 +73,37 @@
   }
   .estop-banner.latched { display: block; }
 
+  /* Operator alert toasts: low battery, bad/stale RTK, sequencer pause,
+     disconnect. Fixed top-right so they're visible regardless of scroll. */
+  .alert-stack {
+    position: fixed; top: 10px; right: 10px; z-index: 9999;
+    width: 300px; display: flex; flex-direction: column; gap: 8px;
+    pointer-events: none;
+  }
+  .alert {
+    position: relative; pointer-events: auto;
+    padding: 8px 28px 8px 10px; border-radius: 5px;
+    font-size: 12px; color: #fff; border: 2px solid;
+    box-shadow: 0 2px 12px rgba(0,0,0,0.5);
+  }
+  .alert.warn     { background: #7a5b00; border-color: #ffb300; }
+  .alert.critical { background: #8a0d0d; border-color: #ff3b3b;
+                    animation: alertpulse 1s ease-in-out infinite; }
+  .alert.acked    { opacity: 0.5; animation: none; }
+  @keyframes alertpulse {
+    0%,100% { box-shadow: 0 0 4px rgba(255,0,0,0.4); }
+    50%     { box-shadow: 0 0 16px rgba(255,40,40,0.9); }
+  }
+  .alert-title  { font-weight: 800; letter-spacing: 0.3px; }
+  .alert-detail { margin-top: 2px; opacity: 0.95; }
+  .alert-age    { margin-top: 3px; font-size: 10px; opacity: 0.6; }
+  .alert-x {
+    position: absolute; top: 4px; right: 6px; cursor: pointer;
+    background: none; border: none; color: #fff; font-size: 16px;
+    line-height: 1; opacity: 0.7; padding: 0;
+  }
+  .alert-x:hover { opacity: 1; }
+
   /* Compact map legend rows. */
   .legend-row { font-size: 11px; margin: 3px 0; display: flex; align-items: center; gap: 6px; }
   .legend-swatch { width: 14px; height: 14px; border-radius: 50%; border: 1px solid #000; flex: 0 0 14px; }
@@ -130,6 +161,9 @@
 </head>
 <body>
 <div id="errbar"></div>
+<!-- Operator alert toasts (low battery, bad/stale RTK, sequencer pause, etc.).
+     Populated by raiseAlert()/renderAlerts(); fixed-position overlay. -->
+<div id="alert-stack" class="alert-stack"></div>
 
 <!-- Floating teleop panel — visible == engaged. Closing X disengages. -->
 <div id="teleop-panel" aria-hidden="true">
@@ -1041,6 +1075,7 @@ function setConnUI(connected) {
     lastRtkFix = { lat: null, lon: null, status: null, t: 0 };
     lastRtkStatus = { quality: null, rtcm_state: null, fwd_age_s: null, raw: '', t: 0 };
     lastOdomTime = 0; lastPixhawkTime = 0; lastBattTime = 0;
+    clearDataAlerts();   // their backing streams just went away
     if (rtkMarker)        { map.removeLayer(rtkMarker);        rtkMarker = null; }
     if (gpsRawMarker)     { map.removeLayer(gpsRawMarker);     gpsRawMarker = null; }
     if (robotMarker)      { map.removeLayer(robotMarker);      robotMarker = null; }
@@ -1055,12 +1090,130 @@ function setConnUI(connected) {
   }
 }
 
+// ============================================================
+// Operator alerts (T8 browser channel) — surface low battery, bad/stale RTK,
+// sequencer pauses (battery halt / circuit breaker / RTK loss), and disconnects
+// as on-page toasts + a beep + a flashing tab title, plus an OS desktop
+// notification when the browser grants permission. This is the LOCAL (LIMO-AP)
+// counterpart to the ntfy push: needs no internet, and the beep + title flash
+// reach the operator even when this tab is in the background.
+//
+// Each alert has a stable id, so a persistent condition shows once (not once per
+// message) and self-clears when the condition resolves. The "x" acknowledges
+// (mutes the beep/flash for that id) but leaves the toast until it clears.
+// ============================================================
+const _alerts = {};                 // id -> {level, title, detail, since, acked}
+const _baseTitle = document.title;
+let _titleTimer = null, _titleOn = false;
+let _audioCtx = null;
+let _manualDisconnect = false;
+
+function initAlertAudio() {
+  // Must run inside a user gesture (the Connect click) per browser autoplay policy.
+  try {
+    if (!_audioCtx) _audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    if (_audioCtx.state === 'suspended') _audioCtx.resume();
+  } catch (e) { _audioCtx = null; }
+}
+
+function requestNotifyPermission() {
+  try {
+    if ('Notification' in window && Notification.permission === 'default')
+      Notification.requestPermission().catch(() => {});
+  } catch (e) {}
+}
+
+function _beep(level) {
+  if (!_audioCtx) return;
+  const n = level === 'critical' ? 3 : 1;
+  const freq = level === 'critical' ? 880 : 520;
+  for (let i = 0; i < n; i++) {
+    const t = _audioCtx.currentTime + i * 0.22;
+    const o = _audioCtx.createOscillator(), g = _audioCtx.createGain();
+    o.type = 'square'; o.frequency.value = freq;
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.exponentialRampToValueAtTime(0.18, t + 0.01);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + 0.18);
+    o.connect(g); g.connect(_audioCtx.destination);
+    o.start(t); o.stop(t + 0.2);
+  }
+}
+
+function _osNotify(level, title, detail, tag) {
+  try {
+    if ('Notification' in window && Notification.permission === 'granted') {
+      const n = new Notification((level === 'critical' ? '\u{1F6A8} ' : '⚠️ ') + title,
+        { body: detail || '', tag, renotify: true });
+      if (level !== 'critical') setTimeout(() => { try { n.close(); } catch (e) {} }, 8000);
+    }
+  } catch (e) {}
+}
+
+function _anyUnacked() { return Object.values(_alerts).some((a) => !a.acked); }
+
+function _titleFlash() {
+  if (_anyUnacked()) {
+    if (_titleTimer) return;
+    _titleTimer = setInterval(() => {
+      _titleOn = !_titleOn;
+      document.title = _titleOn ? '\u{1F6A8} ALERT — ' + _baseTitle : _baseTitle;
+    }, 800);
+  } else if (_titleTimer) {
+    clearInterval(_titleTimer); _titleTimer = null; document.title = _baseTitle;
+  }
+}
+
+function renderAlerts() {
+  const stack = $('alert-stack');
+  if (!stack) return;
+  stack.innerHTML = Object.keys(_alerts).map((id) => {
+    const a = _alerts[id];
+    const age = Math.max(0, Math.round((Date.now() - a.since) / 1000));
+    const icon = a.level === 'critical' ? '\u{1F6A8}' : '⚠️';
+    return `<div class="alert ${a.level}${a.acked ? ' acked' : ''}">` +
+      `<button class="alert-x" onclick="ackAlert('${id}')" title="acknowledge">&times;</button>` +
+      `<div class="alert-title">${icon} ${a.title}</div>` +
+      `<div class="alert-detail">${a.detail || ''}</div>` +
+      `<div class="alert-age">${age}s ago</div></div>`;
+  }).join('');
+  _titleFlash();
+}
+
+function raiseAlert(id, level, title, detail) {
+  const ex = _alerts[id];
+  // (Re)fire the beep/notification only on a NEW alert, an escalation, or
+  // changed text — not on every repeat of a steady condition. A change re-arms
+  // (un-acks) it so an escalation always re-alerts.
+  const changed = !ex || ex.level !== level || ex.detail !== detail;
+  _alerts[id] = {
+    level, title, detail,
+    since: ex ? ex.since : Date.now(),
+    acked: changed ? false : ex.acked,
+  };
+  if (changed && !_alerts[id].acked) { _beep(level); _osNotify(level, title, detail, id); }
+  renderAlerts();
+}
+
+function ackAlert(id) { if (_alerts[id]) { _alerts[id].acked = true; renderAlerts(); } }
+function clearAlert(id) { if (_alerts[id]) { delete _alerts[id]; renderAlerts(); } }
+
+// Drop the data-driven alerts (keep 'conn'): on disconnect their backing data is
+// stale; they'll re-raise on reconnect if the condition still holds.
+function clearDataAlerts() {
+  ['batt', 'batt_stale', 'rtk_fixed', 'rtcm', 'rtk_stale', 'rtk_status_stale', 'exp_paused']
+    .forEach(clearAlert);
+}
+
 function connect() {
   if (typeof ROSLIB === 'undefined') { alert('roslibjs not loaded'); return; }
+  initAlertAudio();           // resume audio under this click (autoplay policy)
+  requestNotifyPermission();  // ask once for OS desktop notifications
+  _manualDisconnect = false;
   const url = $('ws-url').value.trim();
   ros = new ROSLIB.Ros({ url });
 
   ros.on('connection', () => {
+    clearAlert('conn');
     setConnUI(true);
     subscribeAll();
   });
@@ -1069,12 +1222,19 @@ function connect() {
     $('conn-state').textContent = 'error';
     setDot('conn-dot', 'bad');
   });
-  ros.on('close', () => setConnUI(false));
+  ros.on('close', () => {
+    setConnUI(false);
+    if (!_manualDisconnect)
+      raiseAlert('conn', 'critical', 'rosbridge disconnected',
+        'lost link to the robot — monitoring is blind');
+  });
 }
 
 function disconnect() {
+  _manualDisconnect = true;
   if (ros) { try { ros.close(); } catch (e) {} ros = null; }
   setConnUI(false);
+  clearAlert('conn');
 }
 
 function subscribeAll() {
@@ -1275,10 +1435,35 @@ function updateRates() {
   else                         setDot('rtk-dot', 'warn');
   // Battery colour is set live in onLimoStatus; force red when it stalls.
   if (lastBattTime && (now - lastBattTime) >= STALE_MS) setDot('batt-dot', 'bad');
+
+  // --- Stream-hang watchdogs (only after we've seen a first message) ---------
+  // RTK fix HANG: had a fix, but the stream stopped. (The stale-socket bug froze
+  // the dot green in the field — this raises the operator alert instead.)
+  if (lastRtkFix.t && rtkAge >= STALE_MS)
+    raiseAlert('rtk_stale', 'critical', 'RTK fix feed hung',
+      `no /gps/fix in ${Math.round(rtkAge / 1000)}s`);
+  else if (lastRtkFix.t)
+    clearAlert('rtk_stale');
+  // rtk_status string stopped -> can't trust FIXED state (lower rate, 5 s grace).
+  const rsAge = lastRtkStatus.t ? (now - lastRtkStatus.t) : Infinity;
+  if (lastRtkStatus.t && rsAge >= 5000)
+    raiseAlert('rtk_status_stale', 'warn', 'RTK status feed stale',
+      `no rtk_status in ${Math.round(rsAge / 1000)}s`);
+  else if (lastRtkStatus.t)
+    clearAlert('rtk_status_stale');
+  // Battery telemetry stopped (base driver down?) -> battery is now unknown.
+  if (lastBattTime && (now - lastBattTime) >= STALE_MS)
+    raiseAlert('batt_stale', 'warn', 'Battery telemetry stale',
+      `no /limo_status in ${Math.round((now - lastBattTime) / 1000)}s`);
+  else if (lastBattTime)
+    clearAlert('batt_stale');
   // Grey out frozen map markers so a dead stream can't look authoritative.
   setMarkerStale(rtkMarker,    rtkAge >= STALE_MS, rtkIsFixed() ? '#e91e63' : '#ffc107');
   setMarkerStale(gpsRawMarker, !!lastPixhawkTime && (now - lastPixhawkTime) >= STALE_MS, '#ff9800');
   setMarkerStale(robotMarker,  !!lastOdomTime && (now - lastOdomTime) >= STALE_MS, '#39f');
+
+  // Keep the toast "Xs ago" ages ticking even when no alert state changed.
+  if (Object.keys(_alerts).length) renderAlerts();
 
   odomCount = 0; statusCount = 0; expCount = 0;
 }
@@ -1479,6 +1664,20 @@ function onExpStatus(msg) {
     `<span class="${failClass}">fail: ${fail}</span>`;
 
   $('exp-message').textContent = d.message != null ? String(d.message) : '';
+
+  // Sequencer pause/abort -> operator alert. This is the channel the (dead) ntfy
+  // push was meant to use: battery halt (M2), circuit breaker (F4), and
+  // persistent RTK loss (F2) all land here as phase=paused with the reason in
+  // `message`.
+  if (phase === 'paused') {
+    raiseAlert('exp_paused', 'critical', 'Experiment PAUSED',
+      d.message ? String(d.message) : 'sequencer paused — operator action needed');
+  } else if (phase === 'aborted') {
+    raiseAlert('exp_paused', 'critical', 'Experiment ABORTED',
+      d.message ? String(d.message) : 'batch aborted');
+  } else {
+    clearAlert('exp_paused');
+  }
 }
 
 function expSendCmd(action) {
@@ -1541,6 +1740,26 @@ function onRtkStatus(msg) {
     raw,
     t: Date.now(),
   };
+
+  // Bad RTK: not FIXED (quality != 4). FLOAT (5) is called out specifically.
+  const q = lastRtkStatus.quality;
+  if (q === RTK_FIXED_QUALITY) {
+    clearAlert('rtk_fixed');
+  } else {
+    raiseAlert('rtk_fixed', 'warn', 'RTK not FIXED',
+      `quality=${q == null ? '?' : q}` + (q === 5 ? ' (FLOAT — not trusted)' : ''));
+  }
+
+  // RTK corrections stale (the stale-socket bug that recurred 3x on May-29):
+  // RTCM STALE, or forward age of the last correction frame > 3 s.
+  if (lastRtkStatus.rtcm_state === 'STALE' ||
+      (lastRtkStatus.fwd_age_s != null && lastRtkStatus.fwd_age_s > 3)) {
+    raiseAlert('rtcm', 'critical', 'RTK corrections stale',
+      `RTCM ${lastRtkStatus.rtcm_state || '?'} (fwd_age ${fmtAge(lastRtkStatus.fwd_age_s)}) — ` +
+      'may need to restart the rover GPS-RTK node');
+  } else if (lastRtkStatus.rtcm_state === 'OK') {
+    clearAlert('rtcm');
+  }
 }
 
 // Human-friendly age formatting: seconds → "1.4s" / "12s" / "3.2h".
@@ -1627,6 +1846,14 @@ function onLimoStatus(msg) {
   else if (v <= BATT_WARN_V) cls = 'warn';
   el.innerHTML = `<span class="${cls}">${v.toFixed(2)} V</span>`;
   setDot('batt-dot', cls);
+
+  if (v <= BATT_HALT_V)
+    raiseAlert('batt', 'critical', 'Battery critical',
+      `${v.toFixed(2)} V ≤ ${BATT_HALT_V} V halt — come collect the robot`);
+  else if (v <= BATT_WARN_V)
+    raiseAlert('batt', 'warn', 'Battery low', `${v.toFixed(2)} V ≤ ${BATT_WARN_V} V warn`);
+  else
+    clearAlert('batt');
 }
 
 function onPixhawkFix(msg) {

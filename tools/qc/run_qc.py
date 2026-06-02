@@ -71,19 +71,19 @@ def field_gated(args: argparse.Namespace) -> int:
         return 2
     if not args.confirm_pedestal:
         print(
-            "REFUSE: field-gated pedestal smoke requires --confirm-pedestal.",
+            "REFUSE: field-gated pedestal motor test requires --confirm-pedestal.",
             file=sys.stderr,
         )
         return 2
     if not args.allow_motor_energize:
         print(
-            "REFUSE: field-gated pedestal smoke requires --allow-motor-energize.",
+            "REFUSE: field-gated pedestal motor test requires --allow-motor-energize.",
             file=sys.stderr,
         )
         return 2
     return run([
         sys.executable,
-        "tools/qc/field_pedestal_smoke.py",
+        "tools/qc/pedestal_motor_test.py",
         "--confirm-pedestal",
         "--allow-motor-energize",
     ])

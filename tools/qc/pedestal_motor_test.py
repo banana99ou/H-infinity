@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
-"""Field-gated pedestal smoke runner with synthetic feedback.
+"""Pedestal MOTOR test with synthetic feedback — NOT a passive smoke test.
 
-This is intentionally outside the default/laptop/ros-sim tiers. It may energize
-motors through the real estop safety chain, so run_qc.py requires explicit
-confirmation flags before invoking it.
+DANGER: this energizes the drive motors. It CLEARS the E-stop and SPOOFS RTK
+FIXED (plus synthetic odom/battery) to push commands through the real safety
+chain, so the wheels WILL turn. Run ONLY with the robot on a pedestal / wheels
+off the ground. Intentionally outside the default/laptop/ros-sim tiers;
+run_qc.py field-gated requires --confirm-wheels-on-floor + --confirm-pedestal +
+--allow-motor-energize before invoking it.
 """
 
 from __future__ import annotations

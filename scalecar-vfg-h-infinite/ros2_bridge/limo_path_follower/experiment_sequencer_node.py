@@ -38,6 +38,7 @@ import math
 import os
 import subprocess
 import sys
+import threading
 import time
 from datetime import datetime, timezone
 from enum import Enum
@@ -66,15 +67,47 @@ except Exception:  # pragma: no cover - exercised only on a broken deploy
 
 # --- Notify (T8) is optional; import defensively so a missing module never ---
 # crashes the batch (per the shared contract).
+#
+# Push channel. Populated from the config's `ntfy:` block by
+# ExperimentSequencer.__init__ via set_notify_channel(). This wiring used to be
+# MISSING: the old _notify wrapper dropped topic/server, and the node never read
+# config.ntfy, so a non-empty ntfy.topic was silently ignored and NO operator
+# alert (battery halt, circuit breaker, RTK loss) ever left the robot. See the
+# "notify topic never wired" entry in ToDo.md.
+_NTFY_TOPIC = ""
+_NTFY_SERVER = "https://ntfy.sh"
+
+
+def set_notify_channel(topic, server=None):
+    """Wire the ntfy push channel from config (idempotent). Empty topic disables
+    push (the safe default)."""
+    global _NTFY_TOPIC, _NTFY_SERVER
+    _NTFY_TOPIC = str(topic or "")
+    if server:
+        _NTFY_SERVER = str(server)
+
+
 try:
     sys.path.insert(0, os.path.join(_REPO_ROOT, "tools", "notify"))
     from ntfy import notify as _ntfy_notify  # type: ignore
 
     def _notify(message, title=None, priority=None, tags=None):
-        try:
-            return _ntfy_notify(message, title=title, priority=priority, tags=tags)
-        except Exception:
+        # Disabled (empty topic) -> instant no-op. Otherwise fire-and-forget on a
+        # daemon thread: ntfy.notify does a blocking HTTP POST (timeout ~5s) and
+        # this is called from the control _tick (incl. the 30s heartbeat), so a
+        # synchronous call could stall the state machine on a slow network.
+        if not _NTFY_TOPIC:
             return False
+
+        def _send():
+            try:
+                _ntfy_notify(message, title=title, priority=priority,
+                             tags=tags, topic=_NTFY_TOPIC, server=_NTFY_SERVER)
+            except Exception:
+                pass
+
+        threading.Thread(target=_send, daemon=True).start()
+        return True
 except Exception:  # pragma: no cover
     def _notify(message, title=None, priority=None, tags=None):
         return False
@@ -174,6 +207,11 @@ class ExperimentSequencer(Node):
         self._batt_warn = float(self._gating.get("battery_volts_warn", 11.0))
         self._batt_halt = float(self._gating.get("battery_volts_halt", 10.5))
         self._rtk_window_pct = float(self._gating.get("rtk_run_window_pct", 95))
+
+        # Wire the operator push channel (T8) from config. Without this the
+        # _notify() calls below are no-ops (see set_notify_channel docstring).
+        self._ntfy = self._cfg.get("ntfy", {}) or {}
+        set_notify_channel(self._ntfy.get("topic", ""), self._ntfy.get("server"))
 
         # -- Artifact archiving: push each finished bag off the robot (Mac
         #    priority + NAS), detached + rate-limited so it never competes with

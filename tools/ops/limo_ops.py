@@ -108,7 +108,7 @@ def cmd_kill(args) -> int:
 
 def cmd_stop_all(_args) -> int:
     rc = 0
-    for name in ("sequencer", "follower", "reposition"):
+    for name in ("sequencer", "sequencer_smoke", "follower", "reposition"):
         rc = topic_pub_once("/orchestrator/kill", "std_msgs/msg/String", f"data: {name}") or rc
     rc = topic_pub_once("/estop_trigger", "std_msgs/msg/Bool", "data: true") or rc
     return rc
@@ -154,13 +154,13 @@ def cmd_explain_last_failure(_args) -> int:
 
 def cmd_run_smoke(args) -> int:
     if args.dry_run:
-        print("DRY RUN: would start experiment sequencer with smoke config.")
+        print("DRY RUN: would start sequencer_smoke with smoke config.")
         print("Use --armed only after field-gated QC confirmation.")
         return 0
     if not args.armed:
         print("REFUSE: run-smoke requires --dry-run or --armed.", file=sys.stderr)
         return 2
-    return topic_pub_once("/orchestrator/start", "std_msgs/msg/String", "data: sequencer")
+    return topic_pub_once("/orchestrator/start", "std_msgs/msg/String", "data: sequencer_smoke")
 
 
 def main(argv=None) -> int:

@@ -12,6 +12,7 @@ import numpy as np
 import pytest
 
 from tools.analysis import run_eval
+from tools.path_gen import path_overlay
 
 
 # --- build_path_from_recipe -------------------------------------------------
@@ -146,3 +147,31 @@ def test_odom_belief_none_when_no_odom_at_all():
     arr, label = run_eval.odom_belief_source({})
     assert arr is None
     assert label == run_eval.TOPIC_ODOM
+
+
+def test_path_frame_transform_passes_through_without_anchor():
+    x = np.array([1.0, 2.0])
+    y = np.array([3.0, 4.0])
+    yaw = np.array([0.1, 0.2])
+    venue_anchor = type("Anchor", (), {"lat0": 1.0, "lon0": 2.0, "bearing_deg": 42.0})()
+
+    xo, yo, yawo = run_eval.transform_to_path_frame(
+        x, y, yaw, venue_anchor, path_frame_anchor=None)
+
+    assert xo is x
+    assert yo is y
+    assert yawo is yaw
+
+
+def test_project_rtk_to_local_uses_hardcoded_anchor_when_sidecar_missing():
+    x, y, yaw, anchor = run_eval.project_rtk_to_local(
+        [path_overlay.LAT0], [path_overlay.LON0], anchor_spec=None)
+
+    assert x[0] == pytest.approx(0.0, abs=1e-6)
+    assert y[0] == pytest.approx(0.0, abs=1e-6)
+    # With one RTK sample there is no track direction to infer, so yaw is the
+    # helper's zero default even though the anchor bearing is hardcoded.
+    assert yaw[0] == pytest.approx(0.0)
+    assert anchor.lat0 == pytest.approx(path_overlay.LAT0)
+    assert anchor.lon0 == pytest.approx(path_overlay.LON0)
+    assert anchor.bearing_deg == pytest.approx(path_overlay.BEARING_DEG)

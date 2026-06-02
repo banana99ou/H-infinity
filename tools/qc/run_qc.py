@@ -69,9 +69,24 @@ def field_gated(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 2
-    print("Field-gated execution is intentionally a harness gate in this pass.")
-    print("Next implementation should call tools/ops/limo_ops.py run-smoke --armed.")
-    return 0
+    if not args.confirm_pedestal:
+        print(
+            "REFUSE: field-gated pedestal smoke requires --confirm-pedestal.",
+            file=sys.stderr,
+        )
+        return 2
+    if not args.allow_motor_energize:
+        print(
+            "REFUSE: field-gated pedestal smoke requires --allow-motor-energize.",
+            file=sys.stderr,
+        )
+        return 2
+    return run([
+        sys.executable,
+        "tools/qc/field_pedestal_smoke.py",
+        "--confirm-pedestal",
+        "--allow-motor-energize",
+    ])
 
 
 def main(argv=None) -> int:
@@ -83,6 +98,8 @@ def main(argv=None) -> int:
         default="laptop",
     )
     ap.add_argument("--confirm-wheels-on-floor", action="store_true")
+    ap.add_argument("--confirm-pedestal", action="store_true")
+    ap.add_argument("--allow-motor-energize", action="store_true")
     args = ap.parse_args(argv)
 
     if args.tier == "unit":

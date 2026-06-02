@@ -1,7 +1,9 @@
 .DS_Store
 .specstory
 .vscode
+.claude/
 .tmp/
+.venv/
 __pycache__/
 tools/path_gen/tile_cache/
 tools/path_gen/out/

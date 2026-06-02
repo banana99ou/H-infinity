@@ -68,11 +68,13 @@ def topic_pub_once(topic: str, type_name: str, payload: str) -> int:
 
 
 def echo_once(topic: str, timeout_s: float, durability: str | None = None) -> tuple[int, str]:
-    args = ["topic", "echo", "--once", topic]
+    # Flags MUST go before the topic positional: `ros2 topic echo` silently
+    # ignores --qos-durability placed AFTER the topic (falls back to volatile,
+    # which never matches a latched-only sample). Confirmed on Humble.
+    args = ["topic", "echo", "--once"]
     if durability:
-        # Match a latched (transient_local) publisher so a one-shot echo gets the
-        # last published sample immediately instead of waiting for the next one.
         args += ["--qos-durability", durability]
+    args.append(topic)
     p = _ros2(args, timeout_s=timeout_s)
     return p.returncode, p.stdout.strip()
 

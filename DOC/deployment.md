@@ -136,6 +136,21 @@ flowchart LR
 The authoritative interface contract (topic names, types, directions) is
 `system_spec.md §4`; this diagram is the orientation view.
 
+### Operator monitoring & alerts
+
+The operator watches a run from the battle station
+(`tools/path_gen/interactive.html`) over rosbridge. It raises a **browser
+alert** — toast + beep + flashing tab title, plus an OS desktop notification
+when the browser permits — on: low battery (≤10.8 V warn / ≤10.5 V halt), RTK
+not FIXED, RTK fix / correction-chain hang, any sequencer pause or abort
+(battery halt, circuit breaker, RTK loss), and rosbridge disconnect. This is the
+**local** channel — it works on the LIMO AP with no internet. Grant the
+browser's notification permission when prompted on Connect; OS desktop popups
+need a secure context (served from `localhost`/https), but the in-page toast +
+beep + title flash always fire. The optional **remote** channel is an ntfy.sh
+push — set `ntfy.topic` in `experiment.yaml`. Behaviour spec: `gap_analysis.md`
+§3.8; operational model: `experiment.md`.
+
 ### Post-run: automatic analysis + backup
 
 What happens after each leg ends, unattended (see the script inventory above):

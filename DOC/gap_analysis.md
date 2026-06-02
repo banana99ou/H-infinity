@@ -102,10 +102,10 @@ V1 persist venue / V2 RTK corner pins / V3 exclusion-aware placement / V4 valida
 | ROC | State | Evidence |
 |---|---|---|
 | M1 preflight gate | ⚠️ | `preflight.sh` now adds an RTK-FIXED gate + `cmd_vel_raw` publisher check (T9, **hw-verified** FAIL→exit 1). Still standalone (T6 must invoke it per-cell) and run-window RTK-% (Y) unset. |
-| M2 battery alert/halt | ⚠️ | `/limo_status.battery_voltage` available; preflight warns <10.8 V / fails <10.5 V. **Spec says 30%/20% but telemetry is VOLTS** — thresholds must be restated in volts (open item). No runtime alert/halt. |
+| M2 battery alert/halt | ⚠️ | `/limo_status.battery_voltage` available; preflight warns <10.8 V / fails <10.5 V. **Spec says 30%/20% but telemetry is VOLTS** — thresholds must be restated in volts (open item). Runtime halt **is** wired (sequencer M2 pauses + notifies at a cell boundary when <10.5 V) + a web-UI browser alert (`interactive.html`). |
 | M3 wallclock heartbeat | ❌ | none. |
-| M4 ntfy alerts | ❌ | no notification code in repo. |
-| M5 live batch progress | ❌ | battle station shows follower telemetry only. |
+| M4 alerts (ntfy + web UI) | ⚠️ | `tools/notify/ntfy.py` + sequencer hooks exist (batch start/complete, leg fail, M2/F2/F4). **The ntfy wiring was dead** — topic/server never forwarded, so no push ever sent; fixed 2026-06 (`set_notify_channel`, off-thread). Push not yet field-verified; default topic empty (disabled). **Web-UI browser alerts** (`interactive.html`) now cover the same events locally (toast + beep + tab flash + OS notification). |
+| M5 live batch progress | ✅ | battle station subscribes `/experiment/status` (cell / ETA / pass-fail) + pause/resume/abort controls, and raises a browser alert on pause/abort (`interactive.html`, `onExpStatus`). |
 
 ### 3.9 Analysis
 | ROC | State | Evidence |
@@ -211,6 +211,7 @@ completion signal, and time each control cycle.
 **Modify:** sequencer (T6) hooks — batch start/complete, per-failure, **battery: alert/halt in VOLTS** (resolve the %→V open item; align with preflight's 10.8/10.5 V or a user-confirmed curve), wallclock heartbeat (M3).
 **Reuse:** `/limo_status.battery_voltage` (see `preflight.sh:109`).
 **Deps:** T6. **Verify:** trigger a test push; simulate low voltage → confirm halt.
+**Done (2026-06):** `ntfy.py` + sequencer hooks landed; the dead topic-forwarding bug fixed (`set_notify_channel`, off-thread). Added a **web-UI browser-alert channel** (`interactive.html`) as the primary local path — low battery, bad/stale RTK, RTK fix hang, sequencer pause/abort, disconnect. ntfy push still needs a real topic + a field-verify.
 
 ### T9 — Preflight hardening + RTK gate
 **ROC:** M1, C6(publisher check), F7. **Status:** ⚠️ → ✅.
@@ -222,6 +223,7 @@ completion signal, and time each control cycle.
 **ROC:** M5, F5. **Status:** ❌/⚠️ → ✅.
 **Modify:** `tools/path_gen/interactive.html` — subscribe to a sequencer status topic (define in T6, e.g. `/experiment/status` JSON: current cell, ETA, pass/fail tally); add pause/resume/abort controls (publish to a sequencer command topic; abort still also has the `/estop_trigger` path).
 **Deps:** T6. **Verify:** drive a batch; confirm progress + pause/resume from the browser.
+**Done (2026-06):** live progress + pause/resume/abort wired; extended with operator **browser alerts** (toast + beep + tab-title flash + OS notification) on battery / RTK / pause / disconnect.
 
 ### T11 — Analysis pipeline
 **ROC:** A1, A2, A3(plot). **Status:** ⚠️/❌ → ✅.

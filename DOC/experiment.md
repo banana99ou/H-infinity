@@ -320,8 +320,13 @@ The system is **done** when all of these are true:
 2. The orchestrator runs the full 320-cell matrix unattended, with
    RTK-direct reposition between cells, tracked-path turnarounds, and
    auto-retry on fail.
-3. Operator receives push notifications on low battery and on configured
-   wallclock intervals.
+3. Operator is alerted on low battery, RTK loss / not-FIXED, and any sequencer
+   pause or halt, via two channels:
+   - **Web-UI browser alerts** (primary, local): the battle station raises a
+     toast + beep + flashing tab title (+ an OS desktop notification when the
+     browser permits) on each event — no internet required, works on the LIMO AP.
+   - **ntfy.sh push** (optional, remote): phone push for the same events plus the
+     wallclock heartbeat, when `ntfy.topic` is set in `experiment.yaml`.
 4. Every passing run yields a bag + sidecar JSON in a deterministic
    directory layout, paired by run-ID with any external SD-card export.
 5. A single post-hoc command on the bag directory produces the headline
@@ -346,9 +351,13 @@ The system is **done** when all of these are true:
    3-point turn as the default; or auto-pick based on pose-vs-area
    geometry?
 
-4. **Ping channel.** Slack? ntfy.sh? Discord? Telegram? Email? Default
-   recommendation: ntfy.sh (single curl, no auth, lands as phone push)
-   unless you already use Slack regularly.
+4. **Ping channel.** *Resolved (2026-06):* the primary channel is **web-UI
+   browser alerts** in the battle station (`tools/path_gen/interactive.html`) —
+   local, no internet, works on the LIMO AP with no phone/data. An **ntfy.sh**
+   push (single curl, no auth, lands as phone push) is the optional remote
+   channel, enabled by setting `ntfy.topic` in `experiment.yaml`. (Note: the
+   sequencer's ntfy wiring was dead until 2026-06 — the topic was never
+   forwarded; fixed. See `gap_analysis.md` §3.8 / `ToDo.md`.)
 
 5. **Low-battery thresholds.** % at which to ping; % at which to
    auto-stop the batch (no new run started).

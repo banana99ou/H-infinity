@@ -29,13 +29,19 @@ from sequencer_harness import SimHarness  # noqa: E402
 # boundary, not just test hygiene.
 @pytest.fixture(scope="session", autouse=True)
 def _ros_context():
+    # Force an isolated domain BEFORE any rclpy.init so the sim can never see —
+    # or command — a real orchestrator/estop on the default domain. Guard the
+    # init/shutdown: a shared ros_context fixture (conftest.py) or another
+    # ros-sim module may have already initialized the context in this session,
+    # and Context.init() must only be called once.
     os.environ["ROS_DOMAIN_ID"] = "91"
-    rclpy.init()
+    did_init = False
+    if not rclpy.ok():
+        rclpy.init()
+        did_init = True
     yield
-    try:
+    if did_init and rclpy.ok():
         rclpy.shutdown()
-    except Exception:
-        pass
 
 
 @pytest.fixture

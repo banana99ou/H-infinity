@@ -192,6 +192,15 @@
       <span class="dot" id="batt-dot"></span>battery: <span id="batt-state">--</span>
     </div>
 
+    <details id="stack-details" open style="margin-top:10px;">
+      <summary>Node control (boot stack)</summary>
+      <div class="small" style="margin:4px 0 8px 0;">
+        Per-boot stack control. Start/kill the base, GNSS, estop, odom-zero,
+        follower, reposition, sequencer and ops nodes via the orchestrator.
+      </div>
+      <div class="stat" id="stack-panel">(connect first)</div>
+    </details>
+
     <h3>RTK &amp; GPS</h3>
     <div class="stat">
       <span class="dot" id="rtk-dot"></span>RTK: <span id="rtk-state">--</span>
@@ -240,7 +249,17 @@
       <button id="btn-venue-pin" class="primary">Add corner (click map)</button>
       <button id="btn-venue-clear-corners">Clear corners</button>
     </div>
+    <div class="row" style="margin-top:6px;">
+      <label style="margin:0;">nudge step (m)
+        <select id="venue-nudge-step">
+          <option value="0.05">0.05</option>
+          <option value="0.25" selected>0.25</option>
+          <option value="1.0">1.0</option>
+        </select>
+      </label>
+    </div>
     <div class="small" id="venue-corner-state">corners: 0 / 4</div>
+    <div class="small" style="color:#6cf;">Click 2 corners to set one side, then a 3rd for depth — corner 4 auto-snaps to a rectangle. Click a corner/pin to select it, then arrow keys nudge; drag to move freely.</div>
     <div class="small" id="venue-place-hint" style="color:#6cf;"></div>
     <label style="margin-top:6px;">safety margin (m)
       <span class="pill" id="venue-margin-val">0.50</span>
@@ -267,7 +286,7 @@
     <div class="stat" id="venue-validate-state">(validate to check fit + clearance)</div>
     <div class="row" style="margin-top:6px;">
       <button id="btn-venue-load">Load rooftop.json</button>
-      <button id="btn-venue-export" class="primary">Export venue JSON</button>
+      <button id="btn-venue-export" class="primary">Save venue JSON</button>
     </div>
     <div class="small">
       Pick a mode, then click anywhere on the map to drop a corner / exclusion /
@@ -282,13 +301,26 @@
     </div>
     <div class="row" style="margin-top:6px;">
       <button id="btn-teleop">Toggle keyboard teleop</button>
+      <button id="btn-reanchor-rtk" class="primary">Belief &rarr; RTK + reset odom</button>
     </div>
+    <div class="small ok" id="reanchor-state"></div>
     <div class="small">
-      For autonomous runs use the Experiment panel above. The big E-STOP latches
-      motion immediately; Stop scenario also clears the latched <code>/reference_path</code>.
+      Drag the blue belief dot to set its position by hand, or
+      <b>Belief &rarr; RTK</b> to snap it onto the RTK fix and re-zero odom to
+      (0,0,0). Both are motion-free (no driving). For autonomous runs use the
+      Experiment panel above. The big E-STOP latches motion immediately; Stop
+      scenario also clears the latched <code>/reference_path</code>.
     </div>
 
     <h3>Map</h3>
+    <label>belief heading / map bearing (deg E of N)
+      <span class="pill" id="bearing_val2">42.0</span>
+      <input type="range" id="bearing2" min="0" max="360" step="0.5" value="42">
+    </label>
+    <div class="small">
+      Rotation used to project the blue belief dot. No compass topic exists, so
+      after a re-anchor set this to the robot's true heading.
+    </div>
     <label>basemap
       <select id="basemap">
         <option value="osm" selected>OpenStreetMap</option>
@@ -311,9 +343,10 @@
       <div class="legend-row"><span class="legend-swatch" style="background:#0f8"></span>venue start pin (+arrow = heading)</div>
       <div class="legend-row"><span class="legend-swatch" style="background:#f80"></span>venue end pin (+arrow = heading)</div>
       <div class="legend-row"><span class="legend-swatch" style="background:#f33"></span>exclusion zone (red disc)</div>
+      <div class="legend-row"><span class="legend-swatch" style="background:#888"></span>stale (stream timed out)</div>
     </details>
 
-    <details id="adhoc-details" style="margin-top:10px;">
+    <details id="adhoc-details" style="margin-top:10px; display:none;">
       <summary>Ad-hoc curve (legacy)</summary>
       <div class="small" style="margin:4px 0 8px 0;">
         Pre-sequencer flow: design a curve in the browser, publish it directly
@@ -376,14 +409,7 @@
       <textarea id="export_text" placeholder="exported text appears here" readonly></textarea>
     </details>
 
-    <details id="stack-details" style="margin-top:10px;">
-      <summary>Stack debug (manual start/kill)</summary>
-      <div class="small" style="margin:4px 0 8px 0;">
-        Predates the sequencer. The orchestrator now manages stack state during
-        autonomous runs; only reach here when nothing else can bring a node back.
-      </div>
-      <div class="stat" id="stack-panel">(connect first)</div>
-    </details>
+    <!-- Node-control panel relocated near the top (just under Connection). -->
   </div>
 </div>
 
@@ -968,11 +994,29 @@ let lastExpTime = 0, expCount = 0;                // T10 — sequencer freshness
 let latestExpStatus = null;
 let odomRateTimer = null;
 let estopActive = null;
+// Field-session (2026-05-29) additions: odom-reset publisher, stream-staleness
+// tracking, and venue corner/pin selection for arrow-key nudging.
+let topicOdomReset = null;        // std_msgs/Bool -> /odom_zero/reset (re-zero odom)
+let topicOdomStatus = null;       // latched /odom_zero/status feedback
+let lastPixhawkTime = 0, lastBattTime = 0;
+let selectedVenueHandle = null;   // {kind:'corner', idx} | {kind:'start'|'end', id}
+let venueNudgeStep = 0.25;        // metres per arrow-key press
+const STALE_MS = 2500;            // a stream is considered stale after this many ms
 
 function setDot(id, cls) {
   const el = $(id);
   el.classList.remove('ok','bad','warn');
   if (cls) el.classList.add(cls);
+}
+
+// Grey-out a map marker when its source stream goes stale, so a frozen dot can't
+// masquerade as a live reading. Self-heals: the next message repaints liveColor.
+// (Field 2026-05-29: stale RTK looked healthy for minutes during the socket bug.)
+function setMarkerStale(marker, stale, liveColor) {
+  if (!marker) return;
+  marker.setStyle(stale
+    ? { fillColor: '#888', color: '#555', fillOpacity: 0.35 }
+    : { fillColor: liveColor, color: '#000', fillOpacity: 1 });
 }
 
 function setConnUI(connected) {
@@ -996,8 +1040,11 @@ function setConnUI(connected) {
     // a fresh connect should start blank rather than mislead with stale dots.
     lastRtkFix = { lat: null, lon: null, status: null, t: 0 };
     lastRtkStatus = { quality: null, rtcm_state: null, fwd_age_s: null, raw: '', t: 0 };
-    if (rtkMarker)    { map.removeLayer(rtkMarker);    rtkMarker = null; }
-    if (gpsRawMarker) { map.removeLayer(gpsRawMarker); gpsRawMarker = null; }
+    lastOdomTime = 0; lastPixhawkTime = 0; lastBattTime = 0;
+    if (rtkMarker)        { map.removeLayer(rtkMarker);        rtkMarker = null; }
+    if (gpsRawMarker)     { map.removeLayer(gpsRawMarker);     gpsRawMarker = null; }
+    if (robotMarker)      { map.removeLayer(robotMarker);      robotMarker = null; }
+    if (robotHeadingLine) { map.removeLayer(robotHeadingLine); robotHeadingLine = null; }
     $('estop-state').textContent = 'state: unknown (not connected)';
     const _banner = $('estop-banner');
     if (_banner) _banner.classList.remove('latched');
@@ -1133,6 +1180,17 @@ function subscribeAll() {
     ros, name: '/experiment/cmd', messageType: 'std_msgs/msg/String'
   });
 
+  // Odom re-zero command (motion-free SE(2) re-anchor in odom_zero_node).
+  // Publishing true latches the current pose as the new (0,0,0) origin.
+  topicOdomReset = new ROSLIB.Topic({
+    ros, name: '/odom_zero/reset', messageType: 'std_msgs/Bool'
+  });
+  // Latched confirmation of the last re-zero.
+  topicOdomStatus = new ROSLIB.Topic({
+    ros, name: '/odom_zero/status', messageType: 'std_msgs/msg/String'
+  });
+  topicOdomStatus.subscribe(onOdomZeroStatus);
+
   // Path-follower v_const setter
   setParamsService = new ROSLIB.Service({
     ros, name: '/path_follower_node/set_parameters',
@@ -1160,11 +1218,17 @@ function onOrchStatus(msg) {
   const rows = Object.keys(STACK_LABELS).map(name => {
     const alive = !!state[name];
     const meta = detail[name] || {};
+    // An orchestrator-killed node carries intentional_stop_reason; show it amber
+    // (expected) not red (crashed), even when the sequencer is dead/stale and
+    // cmd_owner is no longer 'reposition'. (Field: "follower not up?" false alarm.)
+    const intentionallyStopped = !alive && !!meta.intentional_stop_reason;
     const expectedOff =
       !alive && name === 'follower' && latestExpStatus &&
       latestExpStatus.cmd_owner === 'reposition';
-    const dotClass = alive ? 'ok' : (expectedOff ? 'warn' : 'bad');
-    const suffix = expectedOff ? ' <span class="warn">(reposition owns motion)</span>' : '';
+    const dotClass = alive ? 'ok' : ((intentionallyStopped || expectedOff) ? 'warn' : 'bad');
+    const suffix = intentionallyStopped
+      ? ` <span class="warn">(${meta.intentional_stop_reason})</span>`
+      : (expectedOff ? ' <span class="warn">(reposition owns motion)</span>' : '');
     const pid = meta.pid != null ? ` pid=${meta.pid}` : '';
     const rc = meta.last_exit_code != null ? ` rc=${meta.last_exit_code}` : '';
     const reason = meta.intentional_stop_reason ? ` ${meta.intentional_stop_reason}` : '';
@@ -1201,6 +1265,21 @@ function updateRates() {
   // fresh within 5 s and show messages/sec rather than a control-loop Hz.
   $('exp-rate').textContent = lastExpTime ? `${expCount}/s` : '--';
   setDot('exp-dot', !lastExpTime ? null : ((now - lastExpTime) < 5000 ? 'ok' : 'warn'));
+
+  // RTK dot tri-state, mirroring the marker colours; goes red when the fix
+  // stream stalls (the 2026-05-29 stale-socket bug left it frozen-green).
+  const rtkAge = lastRtkFix.t ? (now - lastRtkFix.t) : Infinity;
+  if (!lastRtkFix.t)           setDot('rtk-dot', null);
+  else if (rtkAge >= STALE_MS) setDot('rtk-dot', 'bad');
+  else if (rtkIsFixed())       setDot('rtk-dot', 'ok');
+  else                         setDot('rtk-dot', 'warn');
+  // Battery colour is set live in onLimoStatus; force red when it stalls.
+  if (lastBattTime && (now - lastBattTime) >= STALE_MS) setDot('batt-dot', 'bad');
+  // Grey out frozen map markers so a dead stream can't look authoritative.
+  setMarkerStale(rtkMarker,    rtkAge >= STALE_MS, rtkIsFixed() ? '#e91e63' : '#ffc107');
+  setMarkerStale(gpsRawMarker, !!lastPixhawkTime && (now - lastPixhawkTime) >= STALE_MS, '#ff9800');
+  setMarkerStale(robotMarker,  !!lastOdomTime && (now - lastOdomTime) >= STALE_MS, '#39f');
+
   odomCount = 0; statusCount = 0; expCount = 0;
 }
 
@@ -1243,13 +1322,37 @@ function drawRobot(x, y, yaw) {
   const head = localToLatLon([x + 0.5*Math.cos(yaw), y + 0.5*Math.sin(yaw)], s.lat0, s.lon0, s.bearing);
   if (!robotMarker) {
     robotMarker = L.circleMarker(ll, {
-      radius: 8, color: '#000', fillColor: '#39f', fillOpacity: 1, weight: 2
-    }).addTo(map);
+      radius: 8, color: '#000', fillColor: '#39f', fillOpacity: 1, weight: 2,
+      interactive: true, pane: 'markerPane',
+    }).addTo(map).bindTooltip('controller belief (drag to set initial position)');
     robotHeadingLine = L.polyline([ll, head], { color: '#39f', weight: 3 }).addTo(map);
+    bindRobotDrag();
   } else {
     robotMarker.setLatLng(ll);
     robotHeadingLine.setLatLngs([ll, head]);
   }
+}
+
+// Drag the belief dot to re-anchor the map projection (display-only; no odom
+// reset): translate the anchor lat/lon by the same delta the marker needs to
+// move, so the robot's current odom (x,y) re-projects onto the drop point.
+// circleMarker has no native drag — emulate via map mousemove while held.
+function bindRobotDrag() {
+  robotMarker.on('mousedown', () => {
+    map.dragging.disable();
+    const move = (e) => {
+      const lat0 = parseFloat($('lat').value), lon0 = parseFloat($('lon').value);
+      const cur = robotMarker.getLatLng();
+      const offLat = cur.lat - lat0, offLon = cur.lng - lon0;  // marker offset from anchor
+      $('lat').value = (e.latlng.lat - offLat).toFixed(8);
+      $('lon').value = (e.latlng.lng - offLon).toFixed(8);
+      redraw();                                                // updates _state + venue
+      drawRobot(lastRobotOdom.x, lastRobotOdom.y, lastRobotOdom.theta);  // reflect now
+      persistCurve();
+    };
+    const up = () => { map.off('mousemove', move); map.off('mouseup', up); map.dragging.enable(); };
+    map.on('mousemove', move); map.on('mouseup', up);
+  });
 }
 
 function publishPath() {
@@ -1475,8 +1578,8 @@ function onRtkFix(msg) {
     status: (msg.status && msg.status.status !== undefined) ? msg.status.status : null,
     t: Date.now(),
   };
-  const fresh = (Date.now() - lastRtkFix.t) < 2000;
-  setDot('rtk-dot', (fresh && rtkIsFixed()) ? 'ok' : 'bad');
+  // rtk-dot freshness/tri-state is evaluated in updateRates() (1 Hz) so it can
+  // also go stale when the fix stream stops — don't set it from here.
   const q = (lastRtkStatus.quality !== null) ? lastRtkStatus.quality : '?';
   const fixLabel = rtkIsFixed() ? 'FIXED' : `not FIXED (quality=${q})`;
   // RTCM chain health: surfaced from the rover-side rtk_status string.
@@ -1516,6 +1619,7 @@ const BATT_HALT_V = 10.5;
 function onLimoStatus(msg) {
   const v = msg.battery_voltage;
   if (v == null || !isFinite(v)) return;
+  lastBattTime = Date.now();
   const el = $('batt-state');
   if (!el) return;
   let cls = 'ok';
@@ -1527,6 +1631,7 @@ function onLimoStatus(msg) {
 
 function onPixhawkFix(msg) {
   if (msg.latitude === 0 && msg.longitude === 0) return;
+  lastPixhawkTime = Date.now();
   const ll = [msg.latitude, msg.longitude];
   if (!gpsRawMarker) {
     gpsRawMarker = L.circleMarker(ll, {
@@ -1534,6 +1639,16 @@ function onPixhawkFix(msg) {
     }).addTo(map).bindTooltip('Pixhawk GPS (regular)');
   } else {
     gpsRawMarker.setLatLng(ll);
+  }
+}
+
+// Latched confirmation of the last odom re-zero (from the Belief->RTK button).
+function onOdomZeroStatus(msg) {
+  let d; try { d = JSON.parse(msg.data); } catch (e) { return; }
+  const el = $('reanchor-state'); if (!el) return;
+  if (d && d.has_reset && d.origin) {
+    el.innerHTML = `<span class="ok">odom re-zeroed (origin was ` +
+      `${(+d.origin.x).toFixed(2)}, ${(+d.origin.y).toFixed(2)})</span>`;
   }
 }
 
@@ -1675,10 +1790,12 @@ function drawVenue() {
   // Corner rectangle (pinned corners, ordered) + inset polygon.
   if (venue.corners.length >= 1) {
     venue.corners.forEach((c, i) => {
+      const sel = selectedVenueHandle && selectedVenueHandle.kind === 'corner' && selectedVenueHandle.idx === i;
       const m = L.circleMarker([c.lat, c.lon], {
-        radius: 6, color: '#ff0', weight: 2, fillColor: '#ff0', fillOpacity: 0.6,
-        title: `corner ${i+1}`
-      }).addTo(map);
+        radius: sel ? 8 : 6, color: sel ? '#fff' : '#ff0', weight: sel ? 4 : 2,
+        fillColor: '#ff0', fillOpacity: 0.6, pane: 'markerPane', interactive: true,
+      }).addTo(map).bindTooltip(`corner ${i+1}`);
+      bindVenueCornerDrag(m, i);
       venueCornerMarkers.push(m);
     });
   }
@@ -1702,21 +1819,27 @@ function drawVenue() {
   const TIP_LEN = 0.8; // metres
   const drawPin = (ref, color) => {
     const posXY = latlonToLocalXY(ref.lat, ref.lon, lat0, lon0, bearing);
-    const hd = ref.heading_deg * Math.PI/180;
     // heading is compass-relative; in local frame +x is `bearing`, so the
     // local angle of a compass heading is (heading - bearing).
     const localAng = (ref.heading_deg - bearing) * Math.PI/180;
     const tipXY = [posXY[0] + TIP_LEN*Math.cos(localAng), posXY[1] + TIP_LEN*Math.sin(localAng)];
     const posLL = localToLatLon(posXY, lat0, lon0, bearing);
     const tipLL = localToLatLon(tipXY, lat0, lon0, bearing);
+    const sel = selectedVenueHandle && selectedVenueHandle.kind === ref._kind && selectedVenueHandle.id === ref.id;
     const line = L.polyline([posLL, tipLL], { color, weight: 2, dashArray: '3 3', interactive: false }).addTo(map);
     const posMarker = L.circleMarker(posLL, {
-      radius: 7, color, weight: 3, fillColor: color, fillOpacity: 0.5, pane: 'markerPane', interactive: true,
+      radius: sel ? 9 : 7, color: sel ? '#fff' : color, weight: sel ? 4 : 3,
+      fillColor: color, fillOpacity: 0.5, pane: 'markerPane', interactive: true,
     }).addTo(map).bindTooltip(`${ref.id} (${ref._kind})`);
     const tipMarker = L.circleMarker(tipLL, {
       radius: 5, color, weight: 2, fillColor: color, fillOpacity: 0.0, pane: 'markerPane', interactive: true,
     }).addTo(map);
     bindVenuePinDrag(posMarker, tipMarker, ref);
+    posMarker.on('click', (e) => {
+      L.DomEvent.stopPropagation(e);   // keep the map-click placer/clearer from firing
+      selectedVenueHandle = { kind: ref._kind, id: ref.id };
+      drawVenue();
+    });
     venuePinLayers.push({ posMarker, tipMarker, line, ref });
   };
   venue.start_pins.forEach(p => drawPin({ ...p, _kind: 'start' }, '#0f8'));
@@ -1743,7 +1866,7 @@ function bindVenuePinDrag(posMarker, tipMarker, ref) {
       if (real) { real.lat = e.latlng.lat; real.lon = e.latlng.lng; }
       drawVenue();
     };
-    const up = () => { map.off('mousemove', move); map.off('mouseup', up); map.dragging.enable(); };
+    const up = () => { map.off('mousemove', move); map.off('mouseup', up); map.dragging.enable(); persistVenue(); };
     map.on('mousemove', move); map.on('mouseup', up);
   });
   tipMarker.on('mousedown', () => {
@@ -1762,10 +1885,47 @@ function bindVenuePinDrag(posMarker, tipMarker, ref) {
       real.heading_deg = parseFloat(hdg.toFixed(1));
       drawVenue();
     };
-    const up = () => { map.off('mousemove', move); map.off('mouseup', up); map.dragging.enable(); };
+    const up = () => { map.off('mousemove', move); map.off('mouseup', up); map.dragging.enable(); persistVenue(); };
     map.on('mousemove', move); map.on('mouseup', up);
   });
 }
+
+// Corners: drag to move freely, click to select for arrow-key nudging. Mirrors
+// the pin-drag idiom. `dragMoved` distinguishes a click (select) from a drag.
+function bindVenueCornerDrag(marker, idx) {
+  let dragMoved = false;
+  marker.on('mousedown', () => {
+    map.dragging.disable();
+    dragMoved = false;
+    const move = (e) => {
+      dragMoved = true;
+      if (venue.corners[idx]) { venue.corners[idx].lat = e.latlng.lat; venue.corners[idx].lon = e.latlng.lng; }
+      drawVenue();
+    };
+    const up = () => {
+      map.off('mousemove', move); map.off('mouseup', up); map.dragging.enable();
+      if (dragMoved) persistVenue();
+    };
+    map.on('mousemove', move); map.on('mouseup', up);
+  });
+  marker.on('click', (e) => {
+    L.DomEvent.stopPropagation(e);   // keep the map-click placer/clearer from firing
+    selectedVenueHandle = { kind: 'corner', idx };
+    drawVenue();
+  });
+}
+
+// Resolve the currently selected corner/pin to its live venue.* entry.
+function resolveSelectedRef() {
+  if (!selectedVenueHandle) return null;
+  if (selectedVenueHandle.kind === 'corner') return venue.corners[selectedVenueHandle.idx] || null;
+  const arr = selectedVenueHandle.kind === 'start' ? venue.start_pins : venue.end_pins;
+  return arr.find(x => x.id === selectedVenueHandle.id) || null;
+}
+
+// Rectangle snapping happens in the corner-click flow (venuePlaceAt) — no
+// separate button. The map is never auto-panned, so corners land exactly where
+// you click.
 
 // ---- Export / load ----
 function venueToJSON() {
@@ -1815,11 +1975,14 @@ const VENUE_PLACE_BTN = {
   start: 'btn-venue-add-start', end: 'btn-venue-add-end',
 };
 function venueHintText() {
-  return venuePlaceMode
-    ? `click the map to place a ${venuePlaceMode}` +
-      (venuePlaceMode === 'corner' ? ` (${venue.corners.length}/4)` : '') +
-      ' — click the button again to stop'
-    : '';
+  if (!venuePlaceMode) return '';
+  if (venuePlaceMode === 'corner') {
+    const n = venue.corners.length;
+    const msg = n < 2 ? `click baseline corner ${n+1} of 2`
+                      : 'click once more to set depth — the rectangle auto-completes';
+    return `${msg} — click the button again to stop`;
+  }
+  return `click the map to place a ${venuePlaceMode} — click the button again to stop`;
 }
 function setVenuePlaceMode(mode) {
   venuePlaceMode = (venuePlaceMode === mode) ? null : mode;
@@ -1831,9 +1994,32 @@ function setVenuePlaceMode(mode) {
 function venuePlaceAt(latlng) {
   const lat = latlng.lat, lon = latlng.lng;
   if (venuePlaceMode === 'corner') {
-    if (venue.corners.length >= 4) { alert('already have 4 corners — clear first'); return; }
-    venue.corners.push({ lat, lon });
-    if (venue.corners.length >= 4) { setVenuePlaceMode(null); }
+    const n = venue.corners.length;
+    if (n >= 4) { alert('already have 4 corners — clear first'); return; }
+    if (n < 2) {
+      // First two clicks set one side of the rectangle, freely.
+      venue.corners.push({ lat, lon });
+    } else if (n === 2) {
+      // Third click sets the depth: corner 3 snaps to 90deg off the first side
+      // at C2, and corner 4 auto-snaps to close the rectangle (C1 + normal*d).
+      const { lat0, lon0, bearing } = venueAnchor();
+      const p1 = latlonToLocalXY(venue.corners[0].lat, venue.corners[0].lon, lat0, lon0, bearing);
+      const p2 = latlonToLocalXY(venue.corners[1].lat, venue.corners[1].lon, lat0, lon0, bearing);
+      const pc = latlonToLocalXY(lat, lon, lat0, lon0, bearing);
+      let sx = p2[0]-p1[0], sy = p2[1]-p1[1];
+      const slen = Math.hypot(sx, sy) || 1; sx /= slen; sy /= slen;
+      const nx = -sy, ny = sx;                          // unit normal to the C1-C2 side
+      const d = (pc[0]-p2[0])*nx + (pc[1]-p2[1])*ny;    // signed depth from the click
+      const ll3 = localToLatLon([p2[0]+nx*d, p2[1]+ny*d], lat0, lon0, bearing);
+      const ll4 = localToLatLon([p1[0]+nx*d, p1[1]+ny*d], lat0, lon0, bearing);
+      venue.corners.push({ lat: ll3[0], lon: ll3[1] });  // C3 (90deg at C2)
+      venue.corners.push({ lat: ll4[0], lon: ll4[1] });  // C4 (closes the rectangle)
+      setVenuePlaceMode(null);
+    } else {
+      // n === 3 (only from a loaded/odd venue): place the 4th corner freely.
+      venue.corners.push({ lat, lon });
+      setVenuePlaceMode(null);
+    }
   } else if (venuePlaceMode === 'exclusion') {
     venue.exclusions.push({ kind: 'circle', lat, lon, radius_m: parseFloat($('venue-excl-r').value) });
   } else if (venuePlaceMode === 'start') {
@@ -1841,30 +2027,35 @@ function venuePlaceAt(latlng) {
   } else if (venuePlaceMode === 'end') {
     venue.end_pins.push({ id: nextPinId('end'), lat, lon, heading_deg: parseFloat($('bearing').value) });
   } else { return; }
-  drawVenue();
+  drawVenue(); persistVenue();
   $('venue-place-hint').textContent = venueHintText();
 }
-map.on('click', (e) => { if (venuePlaceMode) venuePlaceAt(e.latlng); });
+map.on('click', (e) => {
+  if (venuePlaceMode) { venuePlaceAt(e.latlng); return; }
+  if (selectedVenueHandle) { selectedVenueHandle = null; drawVenue(); }   // background click clears selection
+});
 
+$('venue-nudge-step').onchange = (e) => { venueNudgeStep = parseFloat(e.target.value); };
 $('btn-venue-pin').onclick = () => setVenuePlaceMode('corner');
 $('btn-venue-clear-corners').onclick = () => {
   venue.corners = [];
+  selectedVenueHandle = null;
   if (venuePlaceMode === 'corner') $('venue-place-hint').textContent = venueHintText();
-  drawVenue();
+  drawVenue(); persistVenue();
 };
 $('venue-margin').oninput = (e) => {
   venue.safety_margin_m = parseFloat(e.target.value);
   $('venue-margin-val').textContent = venue.safety_margin_m.toFixed(2);
-  drawVenue();
+  drawVenue(); persistVenue();
 };
 $('venue-excl-r').oninput = (e) => {
   $('venue-excl-r-val').textContent = parseFloat(e.target.value).toFixed(2);
 };
 $('btn-venue-add-excl').onclick = () => setVenuePlaceMode('exclusion');
-$('btn-venue-clear-excl').onclick = () => { venue.exclusions = []; drawVenue(); };
+$('btn-venue-clear-excl').onclick = () => { venue.exclusions = []; drawVenue(); persistVenue(); };
 $('btn-venue-add-start').onclick = () => setVenuePlaceMode('start');
 $('btn-venue-add-end').onclick = () => setVenuePlaceMode('end');
-$('btn-venue-clear-pins').onclick = () => { venue.start_pins = []; venue.end_pins = []; venueStartCount = 0; venueEndCount = 0; drawVenue(); };
+$('btn-venue-clear-pins').onclick = () => { venue.start_pins = []; venue.end_pins = []; venueStartCount = 0; venueEndCount = 0; selectedVenueHandle = null; drawVenue(); persistVenue(); };
 $('btn-venue-validate').onclick = () => {
   const r = validateCurveAgainstVenue();
   $('venue-validate-state').innerHTML = r.ok
@@ -1879,7 +2070,7 @@ $('btn-venue-load').onclick = () => {
     const file = input.files[0]; if (!file) return;
     const reader = new FileReader();
     reader.onload = () => {
-      try { loadVenueObject(JSON.parse(reader.result)); }
+      try { loadVenueObject(JSON.parse(reader.result)); persistVenue(); }
       catch (e) { alert('venue JSON parse error: ' + e.message); }
     };
     reader.readAsText(file);
@@ -1909,7 +2100,11 @@ function restoreCurve() {
     if (c.family) $('family').value = c.family;
     if (c.lat != null)     $('lat').value = c.lat;
     if (c.lon != null)     $('lon').value = c.lon;
-    if (c.bearing != null) $('bearing').value = c.bearing;
+    if (c.bearing != null) {
+      $('bearing').value = c.bearing;
+      $('bearing2').value = c.bearing;
+      $('bearing_val2').textContent = parseFloat(c.bearing).toFixed(1);
+    }
     if (c.Llong != null)   $('L_long').value = c.Llong;
     if (c.Lshort != null)  $('L_short').value = c.Lshort;
     if (c.vspeed != null) {
@@ -1939,6 +2134,44 @@ function restoreCurve() {
   } catch (e) { console.warn('restore failed', e); }
 }
 
+// Venue persistence (default, automatic — so the last-used venue is still on
+// screen next morning). The explicit "Save venue JSON" button writes the file
+// on demand; this is just the local working-state restore. No NUC sync.
+const LS_VENUE_KEY = 'limo_battle_last_venue';
+function persistVenue() {
+  try {
+    const v = venueToJSON();
+    v._click_corners = venue.corners.map(c => ({ lat: c.lat, lon: c.lon }));
+    v._startCount = venueStartCount;
+    v._endCount = venueEndCount;
+    localStorage.setItem(LS_VENUE_KEY, JSON.stringify(v));
+  } catch (e) {}
+}
+function restoreVenue() {
+  try {
+    const raw = localStorage.getItem(LS_VENUE_KEY);
+    if (!raw) return;
+    const v = JSON.parse(raw);
+    loadVenueObject(v);
+    // loadVenueObject reads the normalized corners_wgs84; prefer the exact click
+    // order if we stored it so re-drag / re-export stays faithful.
+    if (Array.isArray(v._click_corners)) {
+      venue.corners = v._click_corners.map(c => ({ lat: c.lat, lon: c.lon }));
+    }
+    // Guard: a non-finite or null-island (~0,0) corner from a corrupt save would
+    // fling the init fitBounds to the Gulf of Guinea. Drop such corners.
+    const badCorner = (c) => !isFinite(c.lat) || !isFinite(c.lon) ||
+                             (Math.abs(c.lat) < 1 && Math.abs(c.lon) < 1);
+    if (venue.corners.some(badCorner)) {
+      console.warn('discarding corrupt restored venue corners');
+      venue.corners = [];
+    }
+    venueStartCount = v._startCount || venue.start_pins.length || 0;
+    venueEndCount = v._endCount || venue.end_pins.length || 0;
+    drawVenue();
+  } catch (e) { console.warn('venue restore failed', e); }
+}
+
 // Hotkey: spacebar -> E-stop
 window.addEventListener('keydown', (e) => {
   if (e.code === 'Space' && document.activeElement.tagName !== 'INPUT'
@@ -1961,6 +2194,16 @@ if (_adhocDetailsEl) _adhocDetailsEl.addEventListener('toggle', redraw);
     persistCurve();
   });
 });
+// Visible bearing mirror (#bearing lives in the now-hidden ad-hoc block, but is
+// still the single source of truth read by redraw()/venueAnchor()/drawRobot()).
+$('bearing2').oninput = (e) => {
+  const v = e.target.value;
+  $('bearing').value = v;
+  $('bearing_val2').textContent = parseFloat(v).toFixed(1);
+  $('bearing_val').textContent  = parseFloat(v).toFixed(1);
+  redraw();
+  persistCurve();
+};
 $('btn-geojson').onclick = exportGeoJSON;
 $('btn-rospath').onclick = exportRosPath;
 $('btn-copy').onclick = copyLocal;
@@ -2008,6 +2251,20 @@ $('btn-anchor-reset').onclick = () => {
   syncAnchorInputs();
   redraw();
   persistCurve();
+};
+// Belief -> RTK + reset odom. Motion-free: snaps the projection anchor onto the
+// live RTK fix (so the blue dot lands on the magenta dot) and publishes
+// /odom_zero/reset to re-zero the robot's odom to (0,0,0). Does not drive.
+$('btn-reanchor-rtk').onclick = () => {
+  if (!rtkFresh()) { alert('no fresh RTK fix on /gps_rtk_f9p_helical/gps/fix — cannot re-anchor'); return; }
+  if (!confirm('Snap the belief anchor to the RTK fix and re-zero odom to (0,0,0)?\n(Motion-free — does not drive the robot.)')) return;
+  $('lat').value = lastRtkFix.lat.toFixed(8);
+  $('lon').value = lastRtkFix.lon.toFixed(8);
+  redraw();
+  drawRobot(lastRobotOdom.x, lastRobotOdom.y, lastRobotOdom.theta);
+  persistCurve();
+  if (topicOdomReset) topicOdomReset.publish(new ROSLIB.Message({ data: true }));
+  $('reanchor-state').innerHTML = '<span class="ok">anchor snapped to RTK; /odom_zero/reset sent</span>';
 };
 $('teleop-close').onclick = () => setTeleopShown(false);
 $('estop-btn').onclick = toggleEstop;
@@ -2143,6 +2400,28 @@ window.addEventListener('keyup', (e) => {
   if (!teleopKeys.w && !teleopKeys.a && !teleopKeys.s && !teleopKeys.d) teleopPublishZero();
 });
 
+// Arrow-key nudge for the selected venue corner/pin (true N/E, in metres).
+// Inert unless something is selected and teleop is closed, so it never collides
+// with Space=E-stop (which ignores arrows) or WASD teleop.
+window.addEventListener('keydown', (e) => {
+  if (!selectedVenueHandle || teleopShown) return;
+  if (['INPUT','TEXTAREA','SELECT'].includes(document.activeElement.tagName)) return;
+  if (!['ArrowUp','ArrowDown','ArrowLeft','ArrowRight','Escape'].includes(e.code)) return;
+  e.preventDefault();
+  if (e.code === 'Escape') { selectedVenueHandle = null; drawVenue(); return; }
+  const ref = resolveSelectedRef();
+  if (!ref) { selectedVenueHandle = null; return; }
+  let east = 0, north = 0;
+  if (e.code === 'ArrowUp') north = +venueNudgeStep;
+  else if (e.code === 'ArrowDown') north = -venueNudgeStep;
+  else if (e.code === 'ArrowRight') east = +venueNudgeStep;
+  else if (e.code === 'ArrowLeft') east = -venueNudgeStep;
+  ref.lat += (north / EARTH_R) * (180/Math.PI);
+  ref.lon += (east / (EARTH_R * Math.cos(ref.lat*Math.PI/180))) * (180/Math.PI);
+  drawVenue();
+  persistVenue();
+});
+
 $('t-v-cap').oninput = (e) => {
   teleopVCap = parseFloat(e.target.value);
   $('t-v-cap-val').textContent = teleopVCap.toFixed(2);
@@ -2170,9 +2449,20 @@ $('vspeed-val').textContent = parseFloat($('vspeed').value).toFixed(2);
 
 buildParamUI($('family').value);
 restoreCurve();          // overrides defaults if a prior session was saved
+restoreVenue();          // bring back the last-used venue (corners/pins/exclusions)
+// Keep the visible bearing mirror in sync with the (possibly restored) anchor.
+$('bearing2').value = $('bearing').value;
+$('bearing_val2').textContent = parseFloat($('bearing').value).toFixed(1);
 redraw();
 persistCurve();          // ensures storage has at least the current state
 setConnUI(false);
+
+// Dev hatch: load interactive.html?adhoc=1 to un-hide the legacy ad-hoc curve
+// UI (its code is retained, just hidden by default).
+if (new URLSearchParams(location.search).get('adhoc') === '1') {
+  const d = $('adhoc-details');
+  if (d) { d.style.display = ''; d.open = true; redraw(); }
+}
 
 // Persist whenever a parameter slider changes (the param sliders call redraw,
 // so we hook the global change here):

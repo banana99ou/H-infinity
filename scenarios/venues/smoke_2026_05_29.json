@@ -1,0 +1,30 @@
+{
+  "name": "smoke_2026_05_29",
+  "frame": "rtk_enu",
+  "_provenance": "Captured 2026-05-29 14:39 KST via interactive.html after force_resurvey.py forced a fresh base Survey-In at today's outdoor location. All lat/lon use the corrected RTK frame; the prior export with the stale-base offset has been overwritten.",
+  "_corner_note": "Reordered from click-order (C1,C2,C3,C4) to CCW (C1,C4,C3,C2) so point_in_polygon evaluates a simple convex traversal. Reposition was rejecting S1 as outside the click-order polygon. safety_margin_m relaxed from 0.5 to 0.1 for the smoke run (S1 was only 0.36m from the tightest edge under the 0.5m inset).",
+  "corners_wgs84": [
+    { "lat": 37.61244560055328, "lon": 126.99425116181375 },
+    { "lat": 37.61247986183099, "lon": 126.99428234249355 },
+    { "lat": 37.612522887599276, "lon": 126.99420019984245 },
+    { "lat": 37.61249579730363, "lon": 126.99417136609556 }
+  ],
+  "safety_margin_m": 0.1,
+  "exclusions": [],
+  "start_pins": [
+    {
+      "id": "S1",
+      "lat": 37.61247242527594,
+      "lon": 126.99426356703046,
+      "heading_deg": 135
+    }
+  ],
+  "end_pins": [
+    {
+      "id": "E1",
+      "lat": 37.612504561812116,
+      "lon": 126.99419651180507,
+      "heading_deg": 313
+    }
+  ]
+}

@@ -1,0 +1,33 @@
+# 1-cell smoke yaml for the field auto-reverse test (2026-05-29).
+# Disposable — not the headline matrix. Single cell, single repetition,
+# conservative speed, no auto-retry, no notification, no artifact sync.
+# Goal: drive AtoB -> turnaround -> BtoA and prove the sequencer state
+# machine ends up in PASS.
+
+run_id: smoke_2026_05_29_field
+
+venue: scenarios/venues/smoke_2026_05_29.json
+
+matrix:
+  radius_m:    [0.7]
+  controller:  [lpv-hinf]
+  v_const:     [0.2]      # conservative for first wheels-on-floor; tighten later
+  path_family: [step]
+
+repetitions: 1
+
+gating:
+  battery_volts_warn: 10.8
+  battery_volts_halt: 10.5
+  rtk_run_window_pct: 50  # relaxed for smoke; matrix wants 95
+
+retry:
+  max_retries: 0          # smoke: no auto-retry, surface every failure
+  circuit_breaker_k: 1    # halt after a single leg failure
+
+ntfy:
+  server: https://ntfy.sh
+  topic: ""               # push disabled
+
+artifact_sync:
+  enabled: false          # don't auto-push smoke bag to mac/nas

@@ -69,6 +69,17 @@ PROCS = {
     'sequencer': [
         'ros2', 'run', 'limo_path_follower', 'experiment_sequencer_node',
     ],
+    # T6 smoke variant: the SAME sequencer pinned to the 1-cell field smoke
+    # config (scenarios/smoke.yaml) instead of the full matrix (experiment.yaml,
+    # the autostart-false default). This is the deterministic "shortest full
+    # e2e" a fresh operator/LLM session arms via ops_node run_smoke_e2e.
+    # autostart stays false (idles until armed). Mutually exclusive with
+    # 'sequencer' — ops_node kills one before starting the other.
+    'sequencer_smoke': [
+        'ros2', 'run', 'limo_path_follower', 'experiment_sequencer_node',
+        '--ros-args', '-p',
+        'experiment_yaml:=/home/agilex/H-infinity/scenarios/smoke.yaml',
+    ],
     'ops': [
         'ros2', 'run', 'limo_path_follower', 'ops_node',
     ],

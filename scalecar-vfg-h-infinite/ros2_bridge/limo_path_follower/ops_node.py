@@ -23,6 +23,7 @@ class OpsNode(Node):
         self._rtk = ''
         self._last_cmd = None
         self._last_result = 'loaded'
+        self._pending_arm = False
 
         self.pub_status = self.create_publisher(String, '/ops/status', 10)
         self.pub_orch_start = self.create_publisher(String, '/orchestrator/start', 10)
@@ -48,7 +49,15 @@ class OpsNode(Node):
         try:
             self._exp = json.loads(msg.data) or {}
         except (ValueError, TypeError):
-            pass
+            return
+        # run_smoke_e2e starts the smoke sequencer (autostart=false), which
+        # idles until armed; arm it once it reports loaded/idle so the operator
+        # gets a single deterministic "run the smoke e2e" command.
+        if self._pending_arm and self._exp.get('phase') == 'idle':
+            self._exp_cmd('start')
+            self._pending_arm = False
+            self._last_result = 'smoke sequencer armed'
+            self._publish_status()
 
     def _on_rtk(self, msg):
         self._rtk = msg.data or ''
@@ -70,8 +79,14 @@ class OpsNode(Node):
                 self._last_result = (
                     'refused run_smoke_e2e: confirmed_wheels_on_floor required')
             else:
-                self._exp_cmd('start')
-                self._last_result = 'sent experiment start'
+                # Deterministic shortest full e2e: pin the 1-cell smoke config.
+                # Kill the matrix sequencer (mutually exclusive), start the
+                # smoke-config sequencer, and arm it when it reports idle
+                # (see _on_exp). The 320-run matrix is a separate, explicit path.
+                self._orch_kill('sequencer')
+                self._orch_start('sequencer_smoke')
+                self._pending_arm = True
+                self._last_result = 'starting smoke sequencer (smoke.yaml); arms when idle'
         elif action == 'restart_rtk_receiver':
             self._orch_kill('base_gnss')
             self._orch_start('base_gnss')

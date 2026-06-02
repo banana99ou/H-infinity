@@ -24,6 +24,9 @@ ORCH_NAMES = {
     "follower",
     "reposition",
     "sequencer",
+    # 1-cell smoke variant of the sequencer (orchestrator pins it to
+    # scenarios/smoke.yaml). Motion-capable like 'sequencer'.
+    "sequencer_smoke",
     # In-graph operator/LLM command facade (orchestrator_node.PROCS['ops'] ->
     # ros2 run limo_path_follower ops_node). Not a mover itself: it only
     # republishes onto /orchestrator/*, /experiment/cmd, /estop_trigger, so it
@@ -86,7 +89,7 @@ def cmd_start(args) -> int:
     if args.name not in ORCH_NAMES:
         print(f"unknown orchestrator process '{args.name}'. Known: {sorted(ORCH_NAMES)}", file=sys.stderr)
         return 2
-    if args.name in {"base_vanilla", "base_gnss", "follower", "reposition", "sequencer"} and not args.allow_motion_capable:
+    if args.name in {"base_vanilla", "base_gnss", "follower", "reposition", "sequencer", "sequencer_smoke"} and not args.allow_motion_capable:
         print(
             f"REFUSE: '{args.name}' is motion-capable or can lead to motion. "
             "Pass --allow-motion-capable after confirming the robot state.",

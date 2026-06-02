@@ -13,8 +13,29 @@ from __future__ import annotations
 import os
 import sys
 
+import pytest
+
 _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
 _PKG_SRC = os.path.join(_REPO_ROOT, "scalecar-vfg-h-infinite", "ros2_bridge")
 
 if _PKG_SRC not in sys.path:
     sys.path.insert(0, _PKG_SRC)
+
+
+@pytest.fixture(scope="session")
+def ros_context():
+    """Initialize one isolated ROS context for ros-sim tests.
+
+    Keep this non-autouse so laptop collection can still skip cleanly before
+    importing ROS packages.
+    """
+    os.environ.setdefault("ROS_DOMAIN_ID", "91")
+    import rclpy
+
+    did_init = False
+    if not rclpy.ok():
+        rclpy.init()
+        did_init = True
+    yield
+    if did_init and rclpy.ok():
+        rclpy.shutdown()

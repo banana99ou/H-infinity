@@ -84,7 +84,7 @@ def cmd_status(args) -> int:
     rc, out = echo_once("/orchestrator/status", timeout_s=args.timeout)
     print("\norchestrator_status:")
     print(out if rc == 0 and out else "(no sample; status topic may be volatile or idle)")
-    rc, out = echo_once("/experiment/status", timeout_s=2.0, durability="transient_local")
+    rc, out = echo_once("/experiment/status", timeout_s=4.0, durability="transient_local")
     print("\nexperiment_status:")
     print(out if rc == 0 and out else "(no sample)")
     return 0
@@ -151,10 +151,14 @@ def cmd_explain_last_failure(_args) -> int:
     # First pass: collect the public status streams that should contain failure
     # reasons. This gives AI callers one command instead of multiple ros2 calls.
     for topic in ("/experiment/status", "/reposition/status", "/orchestrator/status"):
-        # /experiment/status is latched (transient_local); read it as such so a
-        # paused/failed run's reason reaches even this late one-shot subscriber.
-        dur = "transient_local" if topic == "/experiment/status" else None
-        rc, out = echo_once(topic, timeout_s=1.5, durability=dur)
+        if topic == "/experiment/status":
+            # Latched (transient_local): read it as such. Allow generous time —
+            # DDS discovery on a busy graph (e.g. ~60 mavros nodes) can exceed a
+            # couple seconds, and a too-short timeout was masking the latch.
+            dur, tmo = "transient_local", 5.0
+        else:
+            dur, tmo = None, 2.5
+        rc, out = echo_once(topic, timeout_s=tmo, durability=dur)
         print(f"{topic}:")
         print(out if rc == 0 and out else "(no sample)")
     return 0

@@ -67,8 +67,13 @@ def topic_pub_once(topic: str, type_name: str, payload: str) -> int:
     return p.returncode
 
 
-def echo_once(topic: str, timeout_s: float) -> tuple[int, str]:
-    p = _ros2(["topic", "echo", "--once", topic], timeout_s=timeout_s)
+def echo_once(topic: str, timeout_s: float, durability: str | None = None) -> tuple[int, str]:
+    args = ["topic", "echo", "--once", topic]
+    if durability:
+        # Match a latched (transient_local) publisher so a one-shot echo gets the
+        # last published sample immediately instead of waiting for the next one.
+        args += ["--qos-durability", durability]
+    p = _ros2(args, timeout_s=timeout_s)
     return p.returncode, p.stdout.strip()
 
 
@@ -79,7 +84,7 @@ def cmd_status(args) -> int:
     rc, out = echo_once("/orchestrator/status", timeout_s=args.timeout)
     print("\norchestrator_status:")
     print(out if rc == 0 and out else "(no sample; status topic may be volatile or idle)")
-    rc, out = echo_once("/experiment/status", timeout_s=1.0)
+    rc, out = echo_once("/experiment/status", timeout_s=2.0, durability="transient_local")
     print("\nexperiment_status:")
     print(out if rc == 0 and out else "(no sample)")
     return 0
@@ -146,7 +151,10 @@ def cmd_explain_last_failure(_args) -> int:
     # First pass: collect the public status streams that should contain failure
     # reasons. This gives AI callers one command instead of multiple ros2 calls.
     for topic in ("/experiment/status", "/reposition/status", "/orchestrator/status"):
-        rc, out = echo_once(topic, timeout_s=1.5)
+        # /experiment/status is latched (transient_local); read it as such so a
+        # paused/failed run's reason reaches even this late one-shot subscriber.
+        dur = "transient_local" if topic == "/experiment/status" else None
+        rc, out = echo_once(topic, timeout_s=1.5, durability=dur)
         print(f"{topic}:")
         print(out if rc == 0 and out else "(no sample)")
     return 0

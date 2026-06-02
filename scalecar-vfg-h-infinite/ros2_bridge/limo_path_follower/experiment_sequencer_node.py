@@ -44,6 +44,7 @@ from enum import Enum
 
 import rclpy
 from rclpy.node import Node
+from rclpy.executors import ExternalShutdownException
 from rclpy.parameter import Parameter
 from rcl_interfaces.srv import SetParameters
 from rcl_interfaces.msg import ParameterValue, ParameterType
@@ -248,7 +249,11 @@ class ExperimentSequencer(Node):
             durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
         )
 
-        self.pub_status = self.create_publisher(String, "/experiment/status", 10)
+        # Latched so a late subscriber (operator `explain-last-failure`, a
+        # reconnecting web UI) immediately sees the CURRENT status — including a
+        # pause/fail reason. Previously volatile: once paused, status went
+        # "dark" to any new subscriber until the 30 s heartbeat (T10 diag gap).
+        self.pub_status = self.create_publisher(String, "/experiment/status", latched)
         self.pub_start = self.create_publisher(String, "/orchestrator/start", 10)
         self.pub_kill = self.create_publisher(String, "/orchestrator/kill", 10)
         self.pub_goto = self.create_publisher(String, "/reposition/goto", 10)
@@ -1424,12 +1429,16 @@ def main(args=None):
     node = ExperimentSequencer()
     try:
         rclpy.spin(node)
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, ExternalShutdownException):
+        # ExternalShutdownException: rclpy already tore the context down from a
+        # SIGINT/SIGTERM handler. Swallow it and skip the double-shutdown below
+        # (that raised "rcl_shutdown already called" on every clean kill).
         pass
     finally:
         node.shutdown()
         node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == "__main__":

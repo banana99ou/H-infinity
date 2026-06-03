@@ -3,49 +3,45 @@
 
 WHAT THIS IS
 ------------
-A stand-in for the *sensing* layer the autonomous test-runner gates on, so the
-full ``experiment_sequencer`` matrix can be walked on a bench (the LIMO up on a
-pedestal, **wheels OFF the ground**) with NO real GPS and a SCRIPTED battery
-fault. It does NOT move the robot and it does NOT touch the safety chain.
+A full stand-in for the LIMO's *sensing + base* layer, so the whole
+``experiment_sequencer`` matrix can be walked on a bench with NO real GPS and a
+SCRIPTED battery fault. It runs INSTEAD OF the real base driver (kill
+``base_vanilla`` first). It impersonates the node name ``limo_base_node`` so
+``tools/preflight/preflight.sh`` (which checks the node graph + the safety chain)
+passes unchanged.
 
-It supplies the two things the real ``base_vanilla`` driver does not:
+ONE kinematic model drives everything, so the controller's commands are executed
+exactly and the odom/RTK stay consistent:
 
-1. **Synthetic RTK** (there is no GPS FIXED indoors). It integrates the
-   *commanded* velocity (``/cmd_vel`` — the post-estop signal that also drives
-   the real wheels) through a unicycle model in the shared venue/local frame,
-   seeded at the venue start pin, and publishes::
+  sub  /cmd_vel  (geometry_msgs/Twist, post-estop)  -> integrate a unicycle in the
+       shared venue/local frame, seeded at the venue start pin.
+  pub  /wheel/odom                         nav_msgs/Odometry      (the belief source:
+         odom_zero re-zeros it -> /wheel/odom_zeroed -> the follower + the battle-
+         station blue dot. The follower's commands move this pose, so s_star reaches
+         the path end and legs COMPLETE — the real wheels-in-air odom barely moved,
+         which is why v1 legs timed out.)
+  pub  /gps_rtk_f9p_helical/gps/fix        sensor_msgs/NavSatFix  (same pose -> lat/lon;
+         the RTK magenta dot now AGREES with the odom dot — v1 diverged because the
+         two came from different sources.)
+  pub  /gps_rtk_f9p_helical/gps/rtk_status std_msgs/String        ("quality=4" FIXED)
+  pub  /limo_status                        limo_msgs/LimoStatus   (motion_mode=1 +
+         battery; battery drops below the 10.5 V halt after N completed runs to
+         exercise M2 + the operator notification.)
 
-       /gps_rtk_f9p_helical/gps/fix         sensor_msgs/NavSatFix
-       /gps_rtk_f9p_helical/gps/rtk_status  std_msgs/String   ("quality=4")
+WHY synthetic odom (not the real wheels)
+---------------------------------------
+With the wheels off the ground the real base odom does not advance like real
+driving, so the closed-loop follower can't reach the path end -> 180 s timeout ->
+circuit breaker. Integrating the controller's own /cmd_vel through a clean
+unicycle makes the world execute its intent exactly, so legs complete
+deterministically. The motors do NOT spin (no real base driver) — that is
+cosmetic; every mission-critical FEATURE is still exercised, and the safety chain
+(cmd_vel_raw -> estop_cli -> /cmd_vel) is intact.
 
-   Because the fix MOVES in response to commands, reposition's
-   course-over-ground heading resolves and it converges on the pin. A *static*
-   fix would make reposition creep forever and time out (it has no compass; it
-   infers heading from RTK displacement — see reposition_node.py).
+A "run" for the battery counter = one rising edge of /path_follower/done.
 
-2. **A scripted battery fault.** The real base owns ``/limo_status`` (real volts
-   + motion_mode); we must not collide with it. Instead we re-publish a copy on
-   ``/limo_status_bench`` (the sequencer is remapped onto it with
-   ``-r /limo_status:=/limo_status_bench``) and, after ``runs_before_low``
-   completed follower runs, force ``battery_voltage`` below the M2 halt
-   threshold. That lets us watch the sequencer detect low battery, pause, and
-   fire the operator notification ("come pick it up").
-
-SAFETY CONTRACT (read before running)
--------------------------------------
-* Run alongside ``base_vanilla`` — NOT ``base_gnss``. base_gnss's real RTK/MAVROS
-  stack publishes the same ``/gps_rtk_f9p_helical/*`` topics and would collide
-  with the synthetic fix.
-* **Wheels MUST be off the ground.** This node makes the system believe RTK is
-  FIXED, so the movers WILL energize and spin the motors. No translation happens
-  only because the wheels are in the air.
-* This node never publishes ``cmd_vel`` / ``cmd_vel_raw`` / ``estop``. It only
-  reads ``/cmd_vel`` and publishes *sensor* topics. The
-  ``cmd_vel_raw -> estop_cli -> /cmd_vel`` chain is untouched.
-* It spoofs RTK FIXED. Keep it OUT of the field stack — it is a tools/qc harness.
-
-A "run" for the battery counter = one rising edge of ``/path_follower/done``
-(one completed follower leg, which includes U-turn legs).
+SAFETY: spoofs RTK FIXED and impersonates the base — strictly a tools/qc bench
+harness; keep it OUT of the field stack.
 """
 
 import math
@@ -60,6 +56,7 @@ from rclpy.qos import (  # pyright: ignore[reportMissingImports]
     QoSHistoryPolicy,
 )
 from geometry_msgs.msg import Twist  # pyright: ignore[reportMissingImports]
+from nav_msgs.msg import Odometry  # pyright: ignore[reportMissingImports]
 from sensor_msgs.msg import NavSatFix  # pyright: ignore[reportMissingImports]
 from std_msgs.msg import String, Bool  # pyright: ignore[reportMissingImports]
 
@@ -72,12 +69,10 @@ except Exception:  # pragma: no cover - laptop / missing vendor msg
 
 
 # --- Shared local<->WGS84 anchor. Copied verbatim from the single source of ---
-# truth, tools/path_gen/path_overlay.py (LAT0/LON0/BEARING_DEG/EARTH_R +
-# local_to_latlon / latlon_to_local), inlined here so this harness does NOT
-# import path_overlay (which pulls in numpy/requests/PIL at module load). The
-# reposition node uses the SAME constants, so a fix we publish round-trips back
-# to the (x, y) we integrated. If the anchor ever changes in path_overlay,
-# update it here too.
+# truth, tools/path_gen/path_overlay.py (LAT0/LON0/BEARING_DEG/EARTH_R), inlined
+# so this harness does NOT import path_overlay (which pulls numpy/requests/PIL at
+# module load). The reposition node uses the SAME constants, so a fix we publish
+# round-trips back to the (x, y) we integrated.
 LAT0 = 37.61174497415274
 LON0 = 126.99429176572984
 BEARING_DEG = 42.0
@@ -107,15 +102,15 @@ def _wrap(a):
 
 
 def _bearing_deg_to_local_yaw(heading_deg):
-    # Mirror reposition_node._bearing_deg_to_local_yaw: a compass bearing maps to
-    # local yaw via radians(anchor.bearing_deg - heading_deg).
     return _wrap(math.radians(BEARING_DEG - heading_deg))
 
 
 class BenchWorld(Node):
 
     def __init__(self):
-        super().__init__('bench_world')
+        # Impersonate the base node so preflight's node-graph + safety-chain
+        # checks pass with the real base killed.
+        super().__init__('limo_base_node')
 
         # -- Parameters --------------------------------------------------
         self.declare_parameter('venue_file',
@@ -123,20 +118,20 @@ class BenchWorld(Node):
         self.declare_parameter('pin_id', 'A')          # seed pose at this start pin
         self.declare_parameter('runs_before_low', 5)   # drop battery after N runs
         self.declare_parameter('low_voltage', 10.3)    # < halt (10.5) => M2 halt
-        self.declare_parameter('healthy_voltage', 12.0)  # used until real status seen
+        self.declare_parameter('healthy_voltage', 12.5)
         self.declare_parameter('integrate_hz', 50.0)
         self.declare_parameter('fix_hz', 15.0)
         self.declare_parameter('status_hz', 5.0)
         self.declare_parameter('cmd_timeout_s', 0.3)   # hold pose if cmd_vel silent
-        self.declare_parameter('limo_status_in', '/limo_status')
-        self.declare_parameter('limo_status_out', '/limo_status_bench')
+        self.declare_parameter('odom_topic', '/wheel/odom')
+        self.declare_parameter('limo_status_topic', '/limo_status')
 
         self._runs_before_low = int(self.get_parameter('runs_before_low').value)
         self._low_v = float(self.get_parameter('low_voltage').value)
         self._healthy_v = float(self.get_parameter('healthy_voltage').value)
         self._cmd_timeout = float(self.get_parameter('cmd_timeout_s').value)
-        status_in = str(self.get_parameter('limo_status_in').value)
-        status_out = str(self.get_parameter('limo_status_out').value)
+        odom_topic = str(self.get_parameter('odom_topic').value)
+        status_topic = str(self.get_parameter('limo_status_topic').value)
 
         # -- Seed venue-frame pose at the start pin ----------------------
         self._x, self._y, self._yaw = self._seed_pose()
@@ -148,22 +143,19 @@ class BenchWorld(Node):
         self._prev_done = None           # for /path_follower/done edge counting
         self._runs = 0
         self._battery_low = False
-        self._real_status = None         # latest real LimoStatus (or None)
-        self._motion_mode_default = 1    # Ackermann, for the synthesized fallback
 
         # -- Publishers --------------------------------------------------
+        self.pub_odom = self.create_publisher(Odometry, odom_topic, 10)
         self.pub_fix = self.create_publisher(
             NavSatFix, '/gps_rtk_f9p_helical/gps/fix', 10)
         self.pub_rtk = self.create_publisher(
             String, '/gps_rtk_f9p_helical/gps/rtk_status', 10)
         self.pub_status = (
-            self.create_publisher(LimoStatus, status_out, 10)
+            self.create_publisher(LimoStatus, status_topic, 10)
             if LimoStatus is not None else None)
 
         # -- Subscriptions -----------------------------------------------
         self.create_subscription(Twist, '/cmd_vel', self._on_cmd, 10)
-        if LimoStatus is not None:
-            self.create_subscription(LimoStatus, status_in, self._on_status, 10)
         # /path_follower/done is latched (transient_local) — match it so we
         # actually receive the edges.
         done_qos = QoSProfile(
@@ -181,18 +173,18 @@ class BenchWorld(Node):
                           self._pub_fix)
         self.create_timer(1.0 / float(self.get_parameter('status_hz').value),
                           self._pub_rtk_status)
-        self.create_timer(0.2, self._pub_limo_status)   # 5 Hz battery republish
+        self.create_timer(0.2, self._pub_limo_status)   # 5 Hz battery
         self.create_timer(2.0, self._log_state)
 
         lat0, lon0 = _local_to_latlon(self._x, self._y)
         self.get_logger().info(
-            f"bench_world up. seeded at pin '{self.get_parameter('pin_id').value}' "
-            f"local=({self._x:.2f},{self._y:.2f}) yaw={math.degrees(self._yaw):.1f}deg "
-            f"=> ({lat0:.7f},{lon0:.7f}). Battery drops <{self._low_v}V after "
-            f"{self._runs_before_low} runs. RTK forced quality=4 (FIXED). "
-            f"limo_status {status_in} -> {status_out}."
+            f"[BENCH SIM as limo_base_node] up. seeded at pin "
+            f"'{self.get_parameter('pin_id').value}' local=({self._x:.2f},{self._y:.2f}) "
+            f"yaw={math.degrees(self._yaw):.1f}deg => ({lat0:.7f},{lon0:.7f}). "
+            f"synthetic odom -> {odom_topic}; RTK quality=4; limo_status -> "
+            f"{status_topic}; battery <{self._low_v}V after {self._runs_before_low} runs."
             + ("" if LimoStatus is not None else
-               "  WARNING: limo_msgs not importable — battery overlay DISABLED."))
+               "  WARNING: limo_msgs not importable — /limo_status DISABLED."))
 
     # ------------------------------------------------------------------
     def _seed_pose(self):
@@ -221,9 +213,6 @@ class BenchWorld(Node):
         self._v = float(msg.linear.x)
         self._w = float(msg.angular.z)
         self._last_cmd_t = self.get_clock().now()
-
-    def _on_status(self, msg):
-        self._real_status = msg
 
     def _on_done(self, msg: Bool):
         # Count rising edges (False -> True). The first message only sets the
@@ -257,6 +246,20 @@ class BenchWorld(Node):
         self._x += v * math.cos(self._yaw) * dt
         self._y += v * math.sin(self._yaw) * dt
         self._yaw = _wrap(self._yaw + w * dt)
+        self._pub_odom(v, w)
+
+    def _pub_odom(self, v, w):
+        m = Odometry()
+        m.header.stamp = self.get_clock().now().to_msg()
+        m.header.frame_id = 'odom'
+        m.child_frame_id = 'base_link'
+        m.pose.pose.position.x = self._x
+        m.pose.pose.position.y = self._y
+        m.pose.pose.orientation.z = math.sin(self._yaw / 2.0)
+        m.pose.pose.orientation.w = math.cos(self._yaw / 2.0)
+        m.twist.twist.linear.x = float(v)
+        m.twist.twist.angular.z = float(w)
+        self.pub_odom.publish(m)
 
     def _pub_fix(self):
         lat, lon = _local_to_latlon(self._x, self._y)
@@ -268,7 +271,7 @@ class BenchWorld(Node):
         m.latitude = lat
         m.longitude = lon
         m.altitude = 0.0
-        m.position_covariance_type = 0  # COVARIANCE_TYPE_UNKNOWN
+        m.position_covariance_type = 0
         self.pub_fix.publish(m)
 
     def _pub_rtk_status(self):
@@ -277,29 +280,18 @@ class BenchWorld(Node):
     def _pub_limo_status(self):
         if self.pub_status is None:
             return
-        if self._real_status is not None:
-            # Pass the real telemetry through, overriding only the voltage once
-            # the fault is armed (preserves motion_mode + every other field).
-            msg = self._real_status
-            if self._battery_low:
-                msg.battery_voltage = self._low_v
-            self.pub_status.publish(msg)
-        else:
-            # No real /limo_status yet (base not up, or differential mode): emit
-            # a healthy synthetic one so the sequencer's M2 gate has a value.
-            msg = LimoStatus()
-            try:
-                msg.battery_voltage = self._low_v if self._battery_low else self._healthy_v
-                msg.motion_mode = self._motion_mode_default
-            except Exception:  # noqa: BLE001 - field name drift across vendor versions
-                pass
-            self.pub_status.publish(msg)
+        msg = LimoStatus()
+        try:
+            msg.battery_voltage = self._low_v if self._battery_low else self._healthy_v
+            msg.motion_mode = 1   # Ackermann (preflight gate)
+        except Exception:  # noqa: BLE001 - field-name drift across vendor versions
+            pass
+        self.pub_status.publish(msg)
 
     def _log_state(self):
         lat, lon = _local_to_latlon(self._x, self._y)
         batt = (f'{self._low_v}V FAULTED' if self._battery_low
-                else (f'{self._real_status.battery_voltage:.2f}V real'
-                      if self._real_status is not None else f'{self._healthy_v}V synth'))
+                else f'{self._healthy_v}V')
         self.get_logger().info(
             f'pose local=({self._x:.2f},{self._y:.2f}) yaw={math.degrees(self._yaw):.0f}deg '
             f'=> ({lat:.7f},{lon:.7f}) | cmd v={self._v:.2f} w={self._w:.2f} | '

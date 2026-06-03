@@ -34,6 +34,12 @@ from rclpy.node import Node # pyright: ignore[reportMissingImports]
 
 from geometry_msgs.msg import Twist # pyright: ignore[reportMissingImports]
 from std_msgs.msg import Bool # pyright: ignore[reportMissingImports]
+from rclpy.qos import (  # pyright: ignore[reportMissingImports]
+    QoSProfile,
+    QoSDurabilityPolicy,
+    QoSReliabilityPolicy,
+    QoSHistoryPolicy,
+)
 
 
 class EstopCliNode(Node):
@@ -66,7 +72,22 @@ class EstopCliNode(Node):
             except Exception as e:
                 self.get_logger().error(f"Failed to open debug file: {e}")
 
-        self.estop_pub = self.create_publisher(Bool, "/estop", 10)
+        # /estop is a STATE signal, not an event: publish it LATCHED
+        # (transient_local + reliable) so any subscriber — including the
+        # experiment sequencer, which subscribes transient_local — reliably reads
+        # the current e-stop state the moment it joins, not only on an edge. The
+        # old default (volatile) was QoS-incompatible with that subscriber, so the
+        # sequencer never received /estop at all (it could not see a real e-stop).
+        estop_qos = QoSProfile(
+            depth=1,
+            history=QoSHistoryPolicy.KEEP_LAST,
+            reliability=QoSReliabilityPolicy.RELIABLE,
+            durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
+        )
+        self.estop_pub = self.create_publisher(Bool, "/estop", estop_qos)
+        # Heartbeat the current state at 2 Hz so consumers always have a fresh,
+        # latched value (also fixes "cannot read current e-stop without an edge").
+        self.estop_state_timer = self.create_timer(0.5, self.publish_estop_state)
         self.cmd_vel_pub = self.create_publisher(Twist, "cmd_vel", 10)
         self.cmd_vel_raw_sub = self.create_subscription(
             Twist, "cmd_vel_raw", self.cmd_vel_raw_callback, 10

@@ -674,16 +674,14 @@ class ExperimentSequencer(Node):
         return None
 
     def _tick(self):
-        # Heartbeat + status republish (M3 / M5).
+        # Heartbeat status republish (M3 / M5). Status-only: it deliberately does
+        # NOT push to ntfy/Discord. The heartbeat chimed every heartbeat_s (30s)
+        # and desensitised the operator to the alert chime. Push channels now fire
+        # only on action-needed events (pause: battery M2 / breaker F4 / RTK F2;
+        # batch complete). Live progress is on /experiment/status (browser).
         if time.monotonic() - self._last_heartbeat >= self._heartbeat_s:
             self._last_heartbeat = time.monotonic()
             self._publish_status(message="heartbeat")
-            if self.phase not in (Phase.IDLE, Phase.DONE, Phase.ABORTED):
-                _notify(
-                    f"[{self.run_id}] {self.phase.value} cell "
-                    f"{self.cell_index + 1}/{self.n_cells} "
-                    f"pass={self._n_pass} fail={self._n_fail}",
-                    title="H-inf heartbeat")
 
         # Global guards that can fire from any active phase.
         if self.phase in (Phase.IDLE, Phase.DONE, Phase.ABORTED, Phase.PAUSED):

@@ -144,8 +144,11 @@ def notify_discord(message, *, title=None, timeout=5):
         return False
     content = message if title is None else "**{}**\n{}".format(title, message)
     body = json.dumps({"content": str(content)[:1900]}).encode("utf-8")  # 2000 cap
+    # Discord's WAF 403s the default "Python-urllib/x.y" User-Agent — set our own.
     req = urllib.request.Request(
-        url, data=body, headers={"Content-Type": "application/json"}, method="POST")
+        url, data=body, method="POST",
+        headers={"Content-Type": "application/json",
+                 "User-Agent": "H-infinity-sequencer/1.0"})
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             status = getattr(resp, "status", None) or resp.getcode()

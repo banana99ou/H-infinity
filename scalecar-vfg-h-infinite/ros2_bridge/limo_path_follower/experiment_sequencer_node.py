@@ -89,20 +89,24 @@ def set_notify_channel(topic, server=None):
 
 try:
     sys.path.insert(0, os.path.join(_REPO_ROOT, "tools", "notify"))
-    from ntfy import notify as _ntfy_notify  # type: ignore
+    from ntfy import notify as _ntfy_notify, notify_discord as _discord_notify  # type: ignore
 
     def _notify(message, title=None, priority=None, tags=None):
-        # Disabled (empty topic) -> instant no-op. Otherwise fire-and-forget on a
-        # daemon thread: ntfy.notify does a blocking HTTP POST (timeout ~5s) and
-        # this is called from the control _tick (incl. the 30s heartbeat), so a
-        # synchronous call could stall the state machine on a slow network.
-        if not _NTFY_TOPIC:
-            return False
-
+        # Fire-and-forget on a daemon thread: each channel does a blocking HTTP
+        # POST (~5s) and this runs from the control _tick (incl. the 30s
+        # heartbeat), so a synchronous call could stall the state machine on a
+        # slow network. Two INDEPENDENT push channels: ntfy.sh (only if a topic is
+        # wired) and a Discord webhook (if discord.env is present). The battle-
+        # station browser alerts are a third, separate channel (rosbridge-side).
         def _send():
+            if _NTFY_TOPIC:
+                try:
+                    _ntfy_notify(message, title=title, priority=priority,
+                                 tags=tags, topic=_NTFY_TOPIC, server=_NTFY_SERVER)
+                except Exception:
+                    pass
             try:
-                _ntfy_notify(message, title=title, priority=priority,
-                             tags=tags, topic=_NTFY_TOPIC, server=_NTFY_SERVER)
+                _discord_notify(message, title=title)
             except Exception:
                 pass
 

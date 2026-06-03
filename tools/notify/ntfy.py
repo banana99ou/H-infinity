@@ -18,7 +18,9 @@ CLI (manual testing, pure stdlib, hits no robot):
 from __future__ import annotations
 
 import argparse
+import json
 import logging
+import os
 import sys
 import urllib.error
 import urllib.request
@@ -97,6 +99,61 @@ def notify(
         return False
     except Exception as exc:  # noqa: BLE001 - last-resort guard; must not raise
         log.warning("ntfy: unexpected error posting to %s (%s)", url, exc)
+        return False
+
+
+def _discord_webhook():
+    """Resolve the Discord webhook URL, or None. Never raises.
+
+    Order: env ``DISCORD_WEBHOOK_URL`` first, then a ``discord.env`` at the repo
+    root (env ``H_INFINITY_ROOT`` / the known NUC path / two levels up from this
+    file). The file is a secret (gitignored), one ``KEY=URL`` or a bare webhook
+    URL per line; ``#`` comments and blanks are skipped.
+    """
+    url = os.environ.get("DISCORD_WEBHOOK_URL")
+    if url:
+        return url.strip()
+    here = os.path.dirname(os.path.abspath(__file__))
+    for root in (os.environ.get("H_INFINITY_ROOT"),
+                 "/home/agilex/H-infinity",
+                 os.path.abspath(os.path.join(here, "..", ".."))):
+        if not root:
+            continue
+        try:
+            with open(os.path.join(root, "discord.env")) as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    if line.startswith("DISCORD_WEBHOOK_URL="):
+                        return line.split("=", 1)[1].strip()
+                    if "discord.com/api/webhooks" in line:
+                        return line
+        except OSError:
+            continue
+    return None
+
+
+def notify_discord(message, *, title=None, timeout=5):
+    """POST ``message`` to the Discord webhook from discord.env. Returns True on a
+    2xx response, False otherwise (incl. no webhook configured). Never raises, so
+    the sequencer is never interrupted by a notification failure."""
+    url = _discord_webhook()
+    if not url:
+        log.info("discord disabled (no webhook) — message not sent: %r", message)
+        return False
+    content = message if title is None else "**{}**\n{}".format(title, message)
+    body = json.dumps({"content": str(content)[:1900]}).encode("utf-8")  # 2000 cap
+    req = urllib.request.Request(
+        url, data=body, headers={"Content-Type": "application/json"}, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            status = getattr(resp, "status", None) or resp.getcode()
+            ok = 200 <= int(status) < 300
+            (log.info if ok else log.warning)("discord: POST -> HTTP %s", status)
+            return ok
+    except Exception as exc:  # noqa: BLE001 - last-resort guard; must not raise
+        log.warning("discord: post failed (%s)", exc)
         return False
 
 

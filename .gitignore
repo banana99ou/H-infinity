@@ -11,3 +11,7 @@ tools/indoor_test/out/
 # Run artifacts (rosbags + sidecars) — large, NUC-generated, pulled via tools/sync
 Experiment Data/
 tools/analysis/*_out/
+
+# Secrets — never commit (webhook URLs etc.)
+discord.env
+*.env

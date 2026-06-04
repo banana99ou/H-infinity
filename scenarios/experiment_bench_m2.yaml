@@ -1,0 +1,52 @@
+# Bench M2 low-battery-halt TEST (TEST HARNESS — wheels off the ground).
+#
+# PURPOSE: prove the M2 low-battery detection + operator notification works
+# end-to-end — i.e. when the (fake) battery drops below the halt threshold, the
+# sequencer stops starting new runs AND pings the operator to come collect the
+# robot. Driven by tools/qc/ros/bench_world_node.py with `-p runs_before_low:=2`,
+# so the synthetic battery faults to 10.3 V (< 10.5 V halt) after 2 completed legs.
+#
+# Differences from experiment_bench.yaml:
+#   - retry.circuit_breaker_k raised high so an incidental reposition abort on the
+#     PLACEHOLDER rooftop.json venue cannot trip F4 first and pre-empt the M2 halt
+#     we are testing (in experiment_sequencer_node._tick, F4 is checked before M2).
+#   - run_id distinct so bench bags never collide.
+#
+# Launch (wheels OFF; bench_world IS the base sim, no real motion):
+#   python3 tools/qc/ros/bench_world_node.py --ros-args -p runs_before_low:=2 \
+#     -p venue_file:=/home/agilex/H-infinity/scenarios/venues/rooftop.json
+#   ros2 run limo_path_follower experiment_sequencer_node --ros-args \
+#     -p experiment_yaml:=/home/agilex/H-infinity/scenarios/experiment_bench_m2.yaml \
+#     -p bag_root:=/tmp/limo_bench_bags
+#   ros2 topic pub --once /experiment/cmd std_msgs/msg/String '{data: "{\"action\":\"arm\"}"}'
+
+run_id: bench_m2_2026_06_04
+
+venue: scenarios/venues/rooftop.json
+
+matrix:
+  radius_m: [1.0, 0.7, 0.5, 0.4]
+  controller: [lpv-hinf, pid]
+  v_const: [1.0, 0.5]
+  path_family: [step, slalom]
+
+repetitions: 10
+
+gating:
+  battery_volts_warn: 10.8
+  battery_volts_halt: 10.5
+  rtk_run_window_pct: 95
+
+retry:
+  max_retries: 1
+  circuit_breaker_k: 50   # disarm F4 so the M2 battery-halt is what stops the batch
+
+ntfy:
+  # Discord (discord.env on the NUC) is the live operator channel and fires
+  # regardless of this topic. Leave ntfy topic empty unless you also want an
+  # ntfy.sh push.
+  server: https://ntfy.sh
+  topic: ""
+
+artifact_sync:
+  enabled: false

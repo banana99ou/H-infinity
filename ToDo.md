@@ -475,6 +475,53 @@ pipeline.
   (safe default). **TODO: verify the push end-to-end on the bench run, then set a
   real field topic in `experiment.yaml`.**
 
+**2026-06-04 — desk field-readiness sweep + fresh bench dry-run (rebuilt code):**
+
+- [x] Rebuilt `limo_path_follower` after rsync (clears the 2026-06-02 stale-install
+  finding); `run_qc.py ros-sim` 28/28, laptop smoke 22/22. RTK fixes confirmed
+  present in code: base re-survey-on-boot (`rtcm_server.force_survey_in_on_boot`,
+  default on, `--no-force-survey-in` opt-out), rover launcher `respawn=True`, rover
+  socket `SO_KEEPALIVE` + stale watchdog + reconnect. Discord operator-alert channel
+  verified end-to-end (live test post returned 2xx).
+- [x] **M2 low-battery halt + operator notify validated end-to-end (rebuilt code).**
+  `scenarios/experiment_bench_m2.yaml` (F4 disarmed: `circuit_breaker_k=50`) +
+  `bench_world --ros-args -p runs_before_low:=2`: autonomy ran AtoB + turnaround_B
+  (2 legs, both PASS), fake battery dropped 12.5 → 10.3 V (< 10.5 halt), sequencer
+  caught it at the next PREFLIGHT — `PAUSE: battery 10.30V < halt 10.5V (M2)` — and
+  fired the high-priority operator alert (`_notify` → Discord; discord.env present).
+  Confirms M2 detection + the "come collect the robot" push. The F4-disarm is
+  required because `_tick` checks F4 *before* M2, so a stray reposition abort would
+  otherwise pre-empt the battery halt.
+- [!] **Bench full-matrix dry-run does NOT complete on the placeholder venue.**
+  Fresh `bench_world` + bench sequencer (`experiment_bench.yaml`, rebuilt code):
+  cell 1 AtoB + turnaround_B PASS, then `reposition aborted: target outside inset
+  working area (R3) err_m=35.76`, retry exhausted → cell skip → next preflight →
+  F4 circuit-breaker pause. Root cause = `rooftop.json` is PLACEHOLDER (42 m × 10 m
+  projected rectangle, pins A/B ~42 m apart); the short step-curvature legs do NOT
+  net back to pin A, so reposition plans a real out-of-bounds drive — exactly the
+  case the yaml comment anticipated ("a finding about this venue, not the
+  controller"). Safety logic behaved correctly (retry/skip/F4). Not a controller or
+  sequencer bug; not a field blocker (the field venue is re-pinned from live RTK).
+  BUT the bench cannot currently demo a clean full walk + M2 battery-halt on the
+  placeholder venue. **Same R3 area-abort surface that killed the May-29 field run**
+  → venue-pin correctness is the #1 on-site dependency.
+- [!] **deployment.md claim vs reality (flag).** "Validated by the bench path: …
+  reposition geometry" / "walks the FULL 320-cell matrix" overstates today's
+  behaviour — the bench aborts at cell 1 on the placeholder venue. Narrow the wording
+  to "exercises the state machine through the first reposition + the M2/F4 paths,
+  given a self-consistent venue." Proposed, not yet edited.
+- [ ] **Preflight `/wheel/odom` liveness false-negative (observed once).** A
+  cell-boundary preflight reported "/wheel/odom — no messages in 3 s" even though
+  `bench_world._integrate` publishes odom unconditionally at 50 Hz and the graph was
+  small (no mavros). Cause unconfirmed (transient vs too-tight 3 s echo window under
+  DDS churn). If it recurs in the field it spuriously fails preflight → cell failures
+  → circuit-breaker pause (operator intervention). Widen the odom-liveness window /
+  add a retry in `preflight.sh`. Sev: Med (field).
+- [ ] **Field-start hazard:** `bench_world_node.py` impersonates `limo_base_node` and
+  is currently RUNNING (paused bench). Before any field trip it MUST be killed and
+  the REAL base brought up — a lingering impersonator silently replaces the base
+  driver (see `DOC/deployment.md` "never let anything impersonate limo_base_node").
+
 **Fixed — real bug the suite caught:**
 
 - [x] `tools/ops/limo_ops.py` `ORCH_NAMES` was missing `"ops"` — drift vs

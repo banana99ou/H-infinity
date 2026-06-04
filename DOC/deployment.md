@@ -43,6 +43,57 @@ NUC. Keep them in mind before declaring a runtime environment "ready".
    ```
    Recreate the symlink if the repo moves.
 
+## Bench / pedestal testing (synthetic sim) — NOT the field test
+
+**There are two distinct test paths; do not confuse them.** A fresh session told
+to "run the full e2e test" means the **field test (wheels on the floor)** — NOT
+the bench sim described here.
+
+|  | Field test (wheels on the floor) | Bench / pedestal test (synthetic sim) |
+|---|---|---|
+| Robot | wheels ON the ground, real driving | up on a pedestal, wheels OFF the ground |
+| Odometry | **real** `/wheel/odom` from the wheels | **synthetic** (integrated from `/cmd_vel`) |
+| RTK / GPS | **real** F9P RTK FIXED outdoors | **synthetic** `quality=4` |
+| Battery / M2 | real `/limo_status` voltage | scripted fault (drops < halt after N runs) |
+| Venue | re-pinned from live RTK | placeholder `rooftop.json` |
+| Config | `scenarios/experiment.yaml` | `scenarios/experiment_bench.yaml` |
+
+The bench path (`tools/qc/ros/bench_world_node.py` + `experiment_bench.yaml`) is a
+**simulation harness** for exercising the autonomy/sequencer logic indoors, with
+no GPS and no field. It spoofs RTK FIXED and stands in for the base driver, so it
+is **unsafe and wrong on the floor**: never start `bench_world_node.py`, use
+`experiment_bench.yaml`, or let anything impersonate `limo_base_node` during a
+real wheels-on-floor run. A bench pass is **not** a field-readiness pass.
+
+**Key finding (2026-06-03) — why the bench path cannot just use the real wheels.**
+On a pedestal the *real* wheel odometry is unusable: with no ground contact the
+base reports drifting/runaway motion, so the follower's belief
+(`/wheel/odom_zeroed`) gallops off the map while the robot is stationary — the
+controller chases a belief already "past the end," never reaches the path end, and
+the leg times out → circuit breaker. (Seen on the battle station as: blue odom dot
+far away, magenta RTK dot still at the start pin.) The reposition + synthetic-RTK
+loop, by contrast, works on the bench (it arrives at the pin). So a pedestal
+autonomy run *requires* feeding the follower a synthetic odom; the exact wiring —
+and whether the real base/motors stay physically in the loop — is still an open
+decision, not settled here.
+
+**Validated by the bench path (2026-06-04, rebuilt code):** sequencer state machine,
+preflight gating, odom-reset handshake, bag recording, **battery-halt (M2) +
+operator notification** (confirmed end-to-end: fake battery < halt → M2 pause →
+Discord push received), circuit breaker (F4), RTK-loss pause/resume (F2), e-stop,
+and a single recorded leg + turnaround completing.
+**NOT a clean full-matrix walk:** the bench does **not** walk the whole matrix on
+the placeholder `rooftop.json`. After the first leg the synthetic pose no longer
+nets back to pin A, so **reposition aborts** ("target outside inset working area",
+R3) and the cell is skipped. This is a placeholder-venue geometry artifact — the
+`experiment_bench.yaml` comment anticipates it ("a finding about this venue, not the
+controller"), and the safety logic (retry → skip → F4) behaves correctly — but it
+means **reposition geometry is exercised only up to its R3 area-gate, not validated
+as correct end-to-end**. A self-consistent bench venue is needed for a full walk.
+**Not validated (needs the floor):** real wheel odometry, real RTK acquisition +
+FIXED hold, real motor actuation, real vehicle dynamics / tracking accuracy, and
+the real venue geometry (`rooftop.json` is placeholder).
+
 ## Support scripts inventory
 
 The legacy `agile_ws` runtime stack that this project builds on. These are

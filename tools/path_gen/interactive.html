@@ -2046,9 +2046,12 @@ function drawVenue() {
   const TIP_LEN = 0.8; // metres
   const drawPin = (ref, color) => {
     const posXY = latlonToLocalXY(ref.lat, ref.lon, lat0, lon0, bearing);
-    // heading is compass-relative; in local frame +x is `bearing`, so the
-    // local angle of a compass heading is (heading - bearing).
-    const localAng = (ref.heading_deg - bearing) * Math.PI/180;
+    // heading_deg is a TRUE compass bearing (deg E of N), matching what the robot
+    // (reposition_node) drives. localToLatLon is left-handed wrt compass (+y -> bearing-90),
+    // so the local angle that renders the arrow AT compass `heading_deg` is
+    // (bearing - heading_deg). Fix 2026-06-04: was (heading_deg - bearing), which drew &
+    // stored the MIRROR of heading_deg about the bearing axis (robot drove the opposite way).
+    const localAng = (bearing - ref.heading_deg) * Math.PI/180;
     const tipXY = [posXY[0] + TIP_LEN*Math.cos(localAng), posXY[1] + TIP_LEN*Math.sin(localAng)];
     const posLL = localToLatLon(posXY, lat0, lon0, bearing);
     const tipLL = localToLatLon(tipXY, lat0, lon0, bearing);
@@ -2106,8 +2109,8 @@ function bindVenuePinDrag(posMarker, tipMarker, ref) {
       const pos = latlonToLocalXY(real.lat, real.lon, lat0, lon0, bearing);
       const tip = latlonToLocalXY(e.latlng.lat, e.latlng.lng, lat0, lon0, bearing);
       const localAng = Math.atan2(tip[1]-pos[1], tip[0]-pos[0]);
-      // back to compass heading: heading = localAng + bearing
-      let hdg = (localAng * 180/Math.PI) + bearing;
+      // back to true compass heading (exact inverse of drawPin): heading = bearing - localAng
+      let hdg = bearing - (localAng * 180/Math.PI);
       hdg = ((hdg % 360) + 360) % 360;
       real.heading_deg = parseFloat(hdg.toFixed(1));
       drawVenue();

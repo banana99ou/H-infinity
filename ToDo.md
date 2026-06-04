@@ -565,6 +565,13 @@ pipeline.
   - **Candidate fix:** make the UI render+export use true compass `heading_deg` (drop
     the double bearing-rotation in the tip math) so the drawn arrow == the bearing the
     robot drives; then re-export. Confirm against `reposition_node`.
+  - **APPLIED 2026-06-04 (subagent-verified; robot is canonical, UI was the bug).** Proven
+    numerically (100k samples): UI arrow = `2*bearing - heading_deg` (mirror); robot drives
+    true `heading_deg`. Fixed `interactive.html` drawPin (L2054) + drag-inverse (L2113) sign
+    so the drawn arrow == true compass == robot drive direction. Migrated `rooftop.json`
+    S1 133.6->310.4, E1 312.6->131.4 (= 2*42 - old, preserving the operator's on-screen aim).
+    **STILL PENDING: on-robot nudge test (place at S1, reposition, few cm -> nose toward E1)
+    before any autonomous run — the empirical tie-breaker.** See [[project_heading_convention_bug]].
 
 **Fixed — real bug the suite caught:**
 

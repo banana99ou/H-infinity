@@ -541,6 +541,12 @@ pipeline.
     Commit a copy of the rule under `tools/` so a fresh NUC inherits it. (Most-robust
     alternative: flash unique serials onto the two CP2102s via `cp210x-program`, then
     key udev on serial.) See [[project_limo_base_dual_cp2102]].
+  - **DONE 2026-06-04:** persistent rule applied — but keyed on `ATTRS{devpath}=="7.4"`,
+    NOT KERNELS: the USB bus renumbered mid-session (`3-7.4` -> `1-7.4`), so
+    `KERNELS=="3-7.4:1.0"` and `ENV{ID_PATH}` (not populated during rule eval) both
+    failed to match; `ATTRS{devpath}` (raw sysfs, bus-number independent) binds
+    correctly. Verified `/dev/limo_base -> chassis`, odom 49.9 Hz, motion_mode 1.
+    Repo copy committed at `tools/udev/99-limo-base.rules`.
 - [!] **FIELD BUG (2026-06-04) — battle-station vs robot HEADING-CONVENTION mismatch
   (suspected; needs on-robot confirm).** In `tools/path_gen/interactive.html` the
   start/end pin arrow is drawn with `localAng = (heading_deg - bearing)` then placed

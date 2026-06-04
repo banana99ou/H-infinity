@@ -1,0 +1,22 @@
+# /etc/udev/rules.d/99-limo-base.rules  (LIMO chassis serial adapter)
+#
+# This NUC has TWO CP2102 USB-serial bridges that BOTH report serial "0001"
+# (factory default), so a serial-based match is ambiguous and /dev/limo_base can
+# bind the wrong adapter (base_gnss then gets no /wheel/odom). Match the chassis by
+# its PHYSICAL USB PORT instead, via ATTRS{devpath}.
+#
+# Why ATTRS{devpath} and not the obvious alternatives:
+#   - KERNELS (e.g. "3-7.4:1.0") carries the USB BUS NUMBER, which renumbers across
+#     controller resets (observed 3-7.4 -> 1-7.4 within one session) -> brittle.
+#   - ENV{ID_PATH} is not reliably populated during rule evaluation -> didn't match.
+#   - ATTRS{devpath} is the raw sysfs hub-port chain ("7.4"), bus-number independent.
+#
+# Chassis observed on USB devpath 7.4 (controller 0000:00:14.0) on 2026-06-04.
+# If the chassis is moved to a different physical USB port, update devpath:
+#   udevadm info -a -n /dev/ttyUSBx | grep -m1 'ATTRS{devpath}'
+#
+# Install on the NUC:
+#   sudo cp tools/udev/99-limo-base.rules /etc/udev/rules.d/99-limo-base.rules
+#   sudo udevadm control --reload && sudo udevadm trigger --action=add --subsystem-match=tty
+#   readlink -f /dev/limo_base   # -> the chassis ttyUSB
+SUBSYSTEM=="tty", ATTRS{idVendor}=="10c4", ATTRS{idProduct}=="ea60", ATTRS{devpath}=="7.4", SYMLINK+="limo_base"

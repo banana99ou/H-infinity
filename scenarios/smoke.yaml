@@ -6,7 +6,7 @@
 
 run_id: smoke_2026_05_29_field
 
-venue: scenarios/venues/smoke_2026_05_29.json
+venue: scenarios/venues/rooftop.json
 
 matrix:
   radius_m:    [0.7]

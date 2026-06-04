@@ -1,43 +1,25 @@
 {
   "name": "rooftop",
   "frame": "rtk_enu",
-  "_provenance": "PLACEHOLDER GEOMETRY — derived from the hardcoded rooftop anchor (lat0=37.61174497415274, lon0=126.99429176572984, bearing=42.0 deg E of N, track 42 m x 10 m) in tools/path_gen/interactive.html (~L219-226) and tools/path_gen/path_overlay.py (L33-38). These corners are a projected rectangle, NOT surveyed pins. Re-capture all corners and the island center/radius from live RTK on the robot via the battle-station 'pin corner' workflow before any run depends on them. See TODO(hw-verify) markers below.",
+  "_provenance": "Live-RTK venue from the 2026-06-04 field session, restored VERBATIM from the operator's battle-station export (venue_rooftop.json). Pin headings are exactly as exported: on the map the S1/E1 arrows correctly point AT each other. CAUTION: a UI/robot heading-convention mismatch is suspected — interactive.html renders/stores heading mirrored about the venue bearing axis (tip compass = 2*bearing - heading_deg), while reposition_node treats heading_deg as a true compass bearing (E of N). So the robot may steer to the MIRROR of the on-screen arrow. Verify the actual drive direction on the robot (and/or fix the UI convention) before trusting this for an autonomous run. See ToDo 2026-06-04.",
   "corners_wgs84": [
-    { "_label": "right-bottom (local 0,0)", "_placeholder": true, "lat": 37.61174497, "lon": 126.99429177 },
-    { "_label": "right-top (local 42,0)",   "_placeholder": true, "lat": 37.61202536, "lon": 126.99461046 },
-    { "_label": "left-top (local 42,10)",   "_placeholder": true, "lat": 37.61208547, "lon": 126.99452619 },
-    { "_label": "left-bottom (local 0,10)", "_placeholder": true, "lat": 37.61180508, "lon": 126.99420749 }
+    { "lat": 37.61241585431486, "lon": 126.99418913573028 },
+    { "lat": 37.61244028872587, "lon": 126.99421260505916 },
+    { "lat": 37.61249898439774, "lon": 126.99412107467653 },
+    { "lat": 37.61247481559728, "lon": 126.99409559369089 }
+  ],
+  "corners_click_order_wgs84": [
+    { "lat": 37.61247481559728, "lon": 126.99409559369089 },
+    { "lat": 37.61241585431486, "lon": 126.99418913573028 },
+    { "lat": 37.61244028872587, "lon": 126.99421260505916 },
+    { "lat": 37.61249898439774, "lon": 126.99412107467653 }
   ],
   "safety_margin_m": 0.5,
-  "exclusions": [
-    {
-      "kind": "circle",
-      "_label": "central roundabout island (the hole in the rectangle)",
-      "_placeholder": true,
-      "_comment": "Center is the rectangle centroid; radius is a guess. TODO(hw-verify): drive the island perimeter and re-pin center + radius from live RTK.",
-      "lat": 37.61191522,
-      "lon": 126.99440898,
-      "radius_m": 2.0
-    }
-  ],
+  "exclusions": [],
   "start_pins": [
-    {
-      "id": "A",
-      "_placeholder": true,
-      "_comment": "TODO(hw-verify): re-pin on the long side, inside the inset polygon, clear of the island.",
-      "lat": 37.61178517,
-      "lon": 126.99425963,
-      "heading_deg": 42.0
-    }
+    { "id": "S1", "lat": 37.61243630485506, "lon": 126.99418611824515, "heading_deg": 133.6 }
   ],
   "end_pins": [
-    {
-      "id": "B",
-      "_placeholder": true,
-      "_comment": "TODO(hw-verify): re-pin on the long side, inside the inset polygon, clear of the island.",
-      "lat": 37.61204527,
-      "lon": 126.99457832,
-      "heading_deg": 222.0
-    }
+    { "id": "E1", "lat": 37.61247986183099, "lon": 126.99411906301977, "heading_deg": 312.6 }
   ]
 }

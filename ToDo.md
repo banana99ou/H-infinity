@@ -521,6 +521,44 @@ pipeline.
   is currently RUNNING (paused bench). Before any field trip it MUST be killed and
   the REAL base brought up — a lingering impersonator silently replaces the base
   driver (see `DOC/deployment.md` "never let anything impersonate limo_base_node").
+- [!] **FIELD BUG (2026-06-04) — `base_gnss` gives no `/wheel/odom`: `/dev/limo_base`
+  resolves to the WRONG serial adapter.** The NUC has TWO CP2102 USB-serial adapters
+  that both report serial `0001` (factory default). `99-limo-base.rules` keys the
+  `/dev/limo_base` symlink on `serial=="0001"`, so it matches BOTH and lands on
+  whichever enumerated first — **ttyUSB0 = the non-chassis adapter (USB port 3-3)**.
+  The real chassis is **ttyUSB1 (USB port 3-7.4)**. `base_gnss` opens
+  `port_name=limo_base` → `/dev/limo_base` → ttyUSB0 → no chassis → no `/wheel/odom`,
+  no `/limo_status`. `base_vanilla` hardcodes `port_name=ttyUSB1`, so it worked this
+  boot — but is equally fragile (ttyUSB0/1 can swap on reboot).
+  - **QUICK FIX APPLIED (per-session):** `sudo ln -sfn ttyUSB1 /dev/limo_base`,
+    restart `base_gnss`. Verified `/wheel/odom` 49.9 Hz, `motion_mode=1`, batt 12.2 V.
+  - **IDEAL SOLVE (persistent — do later):** rewrite `/etc/udev/rules.d/99-limo-base.rules`
+    to match the chassis by PHYSICAL USB PORT instead of the non-unique serial:
+    `SUBSYSTEM=="tty", KERNELS=="3-7.4:1.0", SYMLINK+="limo_base"`, then
+    `sudo udevadm control --reload && sudo udevadm trigger`. Survives reboots/port-swaps
+    as long as the chassis cable stays in NUC USB port 3-7.4. Also point base_vanilla's
+    launch default at the `limo_base` symlink so both launches share the robust path.
+    Commit a copy of the rule under `tools/` so a fresh NUC inherits it. (Most-robust
+    alternative: flash unique serials onto the two CP2102s via `cp210x-program`, then
+    key udev on serial.) See [[project_limo_base_dual_cp2102]].
+- [!] **FIELD BUG (2026-06-04) — battle-station vs robot HEADING-CONVENTION mismatch
+  (suspected; needs on-robot confirm).** In `tools/path_gen/interactive.html` the
+  start/end pin arrow is drawn with `localAng = (heading_deg - bearing)` then placed
+  via `localToLatLon`, so the on-screen arrow points at compass `2*bearing - heading_deg`
+  (a reflection about the venue bearing axis); on drag it stores the inverse. But
+  `reposition_node._bearing_deg_to_local_yaw` treats `heading_deg` as a TRUE compass
+  bearing (E of N) and steers the robot to `heading_deg`. Net: a venue whose arrows
+  correctly point AT each other on the map (operator's export: S1=133.6, E1=312.6 with
+  bearing~42 -> arrows ~310/131, i.e. facing each other) encodes headings that would
+  drive the robot to the MIRROR (~133/312, facing away). I wrongly "corrected" the
+  headings (mirrored them) by reading the raw numbers as compass; **reverted** — the
+  venue file now holds the operator's verbatim export.
+  - **DO NOT trust either side until verified on the robot.** Test: place robot at S1,
+    reposition, drive a few cm, watch whether it heads toward E1 (UI correct) or away
+    (UI mirrored vs robot). That decides which side to fix.
+  - **Candidate fix:** make the UI render+export use true compass `heading_deg` (drop
+    the double bearing-rotation in the tip math) so the drawn arrow == the bearing the
+    robot drives; then re-export. Confirm against `reposition_node`.
 
 **Fixed — real bug the suite caught:**
 

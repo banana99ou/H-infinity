@@ -88,7 +88,7 @@ from rclpy.qos import (
 )
 from sensor_msgs.msg import NavSatFix
 from geometry_msgs.msg import Twist
-from std_msgs.msg import String
+from std_msgs.msg import String, Float64
 
 # Reuse the shared geo anchor + projections (latlon_to_local is the inverse we
 # added alongside local_to_latlon). The reposition node lives in the colcon
@@ -244,6 +244,23 @@ class RepositionNode(Node):
             'venue_file',
             os.path.join(_REPO_ROOT, 'scenarios', 'venues', 'rooftop.json'))
         self.declare_parameter('control_rate_hz', 20.0)
+        # When True, reposition arrives on POSITION ALONE and ignores final
+        # heading (steers straight at the pin, skips the R2 hold + P3 reverse).
+        # This was a workaround for the COG-only heading limit-cycle; now that the
+        # Pixhawk compass gives a standstill-capable heading (see below), the
+        # default is heading-converging arrival (False, spec R2). Kept as an
+        # explicit fallback. Per-goto override: {"pos_only": true|false} in /reposition/goto.
+        self.declare_parameter('arrive_on_position_only', False)
+        # Heading source: the Pixhawk magnetometer (compass_hdg, deg) is
+        # standstill-capable, unlike COG (noise-dominated at slow near-pin moves
+        # -> the heading limit-cycle). The Pixhawk is mounted ~90deg rotated (sign
+        # unknown); the total offset (mount + declination + frame convention) is
+        # auto-calibrated against forward-motion COG into compass_corr_rad. Set
+        # use_compass_heading False for COG-only; a non-NaN compass_offset_rad
+        # skips auto-cal and uses that correction directly.
+        self.declare_parameter('use_compass_heading', True)
+        self.declare_parameter('compass_topic', '/pixhawk/global_position/compass_hdg')
+        self.declare_parameter('compass_offset_rad', float('nan'))
 
         self._pos_tol = float(self.get_parameter('pos_tol_m').value)
         self._heading_tol = math.radians(
@@ -258,6 +275,12 @@ class RepositionNode(Node):
             float(self.get_parameter('three_point_turn_deg').value))
         self._reverse_time = float(self.get_parameter('reverse_time_s').value)
         self._rtk_timeout = float(self.get_parameter('rtk_timeout_s').value)
+        self._pos_only_default = bool(
+            self.get_parameter('arrive_on_position_only').value)
+        self._use_compass = bool(self.get_parameter('use_compass_heading').value)
+        self._compass_topic = str(self.get_parameter('compass_topic').value)
+        self._compass_corr_rad = float(
+            self.get_parameter('compass_offset_rad').value)  # NaN until calibrated
         self._venue_file = str(self.get_parameter('venue_file').value)
         rate = float(self.get_parameter('control_rate_hz').value)
 
@@ -283,7 +306,9 @@ class RepositionNode(Node):
         # COG estimation anchor: the (x, y, ros_time) of the fix from which we
         # are currently accumulating travel to estimate course-over-ground.
         self._cog_ref_xy = None
-        self._heading_est = None     # last trusted COG heading (rad, local)
+        self._heading_est = None     # last trusted heading (rad, local): compass or COG
+        self._compass_hdg_deg = None  # latest raw Pixhawk compass heading (deg)
+        self._compass_cal_acc = []    # forward-motion (cog - compass) samples for auto-cal
 
         # -- Mission state ----------------------------------------------
         self._state = 'idle'
@@ -294,6 +319,8 @@ class RepositionNode(Node):
         # 3-point turn sub-state: None | 'reverse'; with a deadline.
         self._turn_phase = None
         self._reverse_deadline = None
+        # Per-mission position-only flag (set from the goto payload / param).
+        self._pos_only = self._pos_only_default
 
         # -- ROS interfaces ----------------------------------------------
         self.sub_fix = self.create_subscription(
@@ -302,6 +329,8 @@ class RepositionNode(Node):
             String, '/gps_rtk_f9p_helical/gps/rtk_status', self._rtk_cb, 10)
         self.sub_goto = self.create_subscription(
             String, '/reposition/goto', self._goto_cb, 10)
+        self.sub_compass = self.create_subscription(
+            Float64, self._compass_topic, self._compass_cb, 10)
 
         self.pub_cmd = self.create_publisher(Twist, 'cmd_vel_raw', 10)
         status_qos = QoSProfile(
@@ -373,6 +402,18 @@ class RepositionNode(Node):
     # Subscriptions
     # ------------------------------------------------------------------
 
+    def _compass_cb(self, msg: Float64):
+        """Pixhawk magnetometer heading (deg). When the compass is calibrated this
+        drives self._heading_est continuously — including at standstill, which is
+        what lets reposition converge heading instead of COG-limit-cycling."""
+        self._compass_hdg_deg = float(msg.data)
+        if self._anchor is None:
+            return
+        if self._use_compass and self._compass_corr_rad == self._compass_corr_rad:
+            self._heading_est = _wrap(
+                self._bearing_deg_to_local_yaw(self._compass_hdg_deg)
+                + self._compass_corr_rad)
+
     def _rtk_cb(self, msg: String):
         """Parse the `quality=N` token out of the rtk_status string (R1)."""
         q = None
@@ -394,8 +435,12 @@ class RepositionNode(Node):
         """
         if self._geo is None or self._anchor is None:
             return
-        if self._rtk_quality != 4:
-            return  # not FIXED -> do not trust this fix for closed-loop use
+        if self._rtk_quality not in (4, 5):
+            # Accept RTK FIXED(4) or FLOAT(5). TEMPORARY field relaxation
+            # (2026-06-05): the base can't hold FIXED here; FLOAT is ~dm-level,
+            # coarser than the cm-level FIXED this loop was designed for (R1).
+            # Revert to {4} only once FIXED is reliable. See ToDo 2026-06-05.
+            return
         lat = msg.latitude
         lon = msg.longitude
         if lat != lat or lon != lon:  # NaN check
@@ -420,8 +465,38 @@ class RepositionNode(Node):
         dx = self._fix_xy[0] - self._cog_ref_xy[0]
         dy = self._fix_xy[1] - self._cog_ref_xy[1]
         if math.hypot(dx, dy) >= self._cog_min_travel:
-            self._heading_est = math.atan2(dy, dx)
+            cog_heading = math.atan2(dy, dx)
             self._cog_ref_xy = self._fix_xy
+            # COG is the direction of travel — a valid heading only when moving
+            # FORWARD (not during a 3-point reverse). Use it to auto-calibrate the
+            # compass; once calibrated the compass owns heading_est (standstill-OK).
+            fwd = (self._turn_phase != 'reverse')
+            calibrated = (self._compass_corr_rad == self._compass_corr_rad)  # not NaN
+            if (self._use_compass and fwd and self._compass_hdg_deg is not None
+                    and not calibrated):
+                corr = _wrap(cog_heading
+                             - self._bearing_deg_to_local_yaw(self._compass_hdg_deg))
+                self._compass_cal_acc.append(corr)
+                if len(self._compass_cal_acc) >= 5:
+                    sx = sum(math.sin(c) for c in self._compass_cal_acc)
+                    sy = sum(math.cos(c) for c in self._compass_cal_acc)
+                    self._compass_corr_rad = math.atan2(sx, sy)
+                    calibrated = True
+                    self.get_logger().warn(
+                        "compass auto-calibrated: corr="
+                        f"{math.degrees(self._compass_corr_rad):.1f} deg "
+                        f"(persist with compass_offset_rad:={self._compass_corr_rad:.4f}).")
+            if self._use_compass and calibrated:
+                # Cross-check only; heading_est still trusts the compass.
+                if fwd and self._heading_est is not None:
+                    d = abs(_wrap(cog_heading - self._heading_est))
+                    if d > math.radians(30):
+                        self.get_logger().warn(
+                            f"compass vs COG disagree {math.degrees(d):.0f} deg "
+                            "(magnetic interference?).")
+            else:
+                # Fallback: COG drives heading_est until the compass is calibrated.
+                self._heading_est = cog_heading
 
     def _goto_cb(self, msg: String):
         """Accept a new go-to-pose command and plan it (R1-R4)."""
@@ -432,15 +507,17 @@ class RepositionNode(Node):
             heading_deg = float(d['heading_deg'])
             dry_run = bool(d.get('dry_run', False))
             approach_dist = float(d.get('approach_dist_m', self._approach_dist))
+            pos_only = bool(d.get('pos_only', self._pos_only_default))
         except (ValueError, TypeError, KeyError) as exc:
             self._abort(f'bad /reposition/goto payload: {exc}')
             return
+        self._pos_only = pos_only
 
         if self._geo is None or self._anchor is None or self._inset is None:
             self._abort('geo/venue not loaded; cannot plan')
             return
-        if self._fix_xy is None or self._rtk_quality != 4:
-            self._abort('no RTK FIXED fix yet; refusing to start (R1)')
+        if self._fix_xy is None or self._rtk_quality not in (4, 5):
+            self._abort('no usable RTK fix yet (need FIXED/FLOAT); refusing to start (R1)')
             return
 
         self._approach_dist = approach_dist
@@ -449,10 +526,15 @@ class RepositionNode(Node):
         self._target_yaw = self._bearing_deg_to_local_yaw(heading_deg)
         # Approach-entry point: offset back along the target heading so the
         # final segment runs straight into the pin along that heading (R2).
-        self._entry_xy = (
-            self._target_xy[0] - approach_dist * math.cos(self._target_yaw),
-            self._target_xy[1] - approach_dist * math.sin(self._target_yaw),
-        )
+        # In position-only mode heading is ignored, so collapse the entry onto
+        # the target (no final-straight heading segment; we drive to the point).
+        if self._pos_only:
+            self._entry_xy = self._target_xy
+        else:
+            self._entry_xy = (
+                self._target_xy[0] - approach_dist * math.cos(self._target_yaw),
+                self._target_xy[1] - approach_dist * math.sin(self._target_yaw),
+            )
 
         # R4: no-op if we already start within tolerance of the target pose.
         err_m = math.hypot(self._fix_xy[0] - self._target_xy[0],
@@ -461,17 +543,19 @@ class RepositionNode(Node):
         # yet, position alone decides the no-op (a stationary robot at the pin
         # with unknown heading still needs a creep to confirm — so require a
         # heading estimate to claim arrived).
-        if err_m <= self._pos_tol and self._heading_est is not None and \
-                abs(_wrap(self._heading_est - self._target_yaw)) <= self._heading_tol:
+        _head_ok = (self._heading_est is not None and
+                    abs(_wrap(self._heading_est - self._target_yaw))
+                    <= self._heading_tol)
+        if err_m <= self._pos_tol and (self._pos_only or _head_ok):
             self._state = 'arrived'
             self._reason = 'already within tolerance (R4 no-op)'
             self.get_logger().info(
                 f'goto: start pose already within tolerance '
                 f'(err {err_m:.3f} m); no-op (R4).')
             self._zero_cmd()
-            self._publish_status(err_m=err_m,
-                                 err_deg=math.degrees(_wrap(
-                                     self._heading_est - self._target_yaw)))
+            _ed = (float('nan') if self._heading_est is None
+                   else math.degrees(_wrap(self._heading_est - self._target_yaw)))
+            self._publish_status(err_m=err_m, err_deg=_ed)
             return
 
         # R3: pre-flight the whole plan against the working area + exclusions.
@@ -558,7 +642,7 @@ class RepositionNode(Node):
             return
 
         # RTK gate (R1): require a fresh FIXED fix to keep moving.
-        if self._rtk_quality != 4 or self._fix_stamp is None or \
+        if self._rtk_quality not in (4, 5) or self._fix_stamp is None or \
                 self._fix_xy is None:
             self._zero_cmd()
             self._publish_status(err_m=float('nan'), err_deg=float('nan'),
@@ -594,19 +678,26 @@ class RepositionNode(Node):
                                  self._fix_xy[1] - self._target_xy[1])
         in_final = d_to_target <= self._approach_dist
 
-        # Arrival check (R4 condition, evaluated continuously).
+        # Arrival check (R4 condition, evaluated continuously). In position-only
+        # mode we arrive on distance alone (heading is acquired by the path
+        # lead-in); otherwise both position and COG heading must be in tolerance.
         head_err = (None if self._heading_est is None
                     else _wrap(self._heading_est - self._target_yaw))
-        if d_to_target <= self._pos_tol and head_err is not None and \
-                abs(head_err) <= self._heading_tol:
+        _arrived = d_to_target <= self._pos_tol and (
+            self._pos_only or (head_err is not None
+                               and abs(head_err) <= self._heading_tol))
+        if _arrived:
             self._state = 'arrived'
-            self._reason = 'arrived within tolerance'
+            self._reason = ('arrived (position only)' if self._pos_only
+                            else 'arrived within tolerance')
             self._zero_cmd()
-            self.get_logger().info(
-                f'arrived: err {d_to_target:.3f} m, '
-                f'heading err {math.degrees(head_err):.1f} deg.')
-            self._publish_status(err_m=d_to_target,
-                                 err_deg=math.degrees(head_err))
+            _hetxt = ('' if head_err is None
+                      else f', heading err {math.degrees(head_err):.1f} deg')
+            self.get_logger().info(f'arrived: err {d_to_target:.3f} m{_hetxt}.')
+            self._publish_status(
+                err_m=d_to_target,
+                err_deg=(float('nan') if head_err is None
+                         else math.degrees(head_err)))
             return
 
         # Pick the steering target: the entry point while approaching, the pin
@@ -616,8 +707,10 @@ class RepositionNode(Node):
                                 steer_to[0] - self._fix_xy[0])
 
         # During the final segment we hold the *target heading* (R2) rather
-        # than chase the point, so the approach is a clean straight line.
-        desired_heading = self._target_yaw if in_final else bearing_to
+        # than chase the point, so the approach is a clean straight line. In
+        # position-only mode we always chase the point (no heading hold).
+        desired_heading = (bearing_to if self._pos_only
+                           else (self._target_yaw if in_final else bearing_to))
 
         # Need a heading estimate (COG) to steer. If we don't have one yet,
         # creep straight forward to generate one.
@@ -632,8 +725,10 @@ class RepositionNode(Node):
 
         # 3-point decision (P3): if the required turn is too sharp to creep
         # through within the area, back up first. Only triggers while aligning
-        # (large initial mis-heading), not during the final straight segment.
-        if not in_final and abs(yaw_err) > self._three_point_turn and \
+        # (large initial mis-heading), not during the final straight segment,
+        # and never in position-only mode (which must not reverse off the pin).
+        if not in_final and not self._pos_only and \
+                abs(yaw_err) > self._three_point_turn and \
                 self._turn_phase is None:
             self._turn_phase = 'reverse'
             self._reverse_deadline = self.get_clock().now() + \

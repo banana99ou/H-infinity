@@ -29,6 +29,7 @@ SSH_E=(-e "ssh -o BatchMode=yes -o ConnectTimeout=20")
 CODE_EXCLUDES=(
   --exclude=.git --exclude=.DS_Store --exclude=__pycache__ --exclude='*.pyc'
   --exclude=.specstory --exclude=.vscode --exclude=.claude
+  --exclude=.venv --exclude=venv --exclude='*.egg-info'
   --exclude=build --exclude=install --exclude=log --exclude=.pytest_cache
   --exclude="$ARTIFACTS/"            # never push artifacts up
 )

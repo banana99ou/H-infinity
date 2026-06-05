@@ -5,6 +5,38 @@ Working checklist for getting the professor-provided H-infinity stack from
 
 ## Status
 
+**2026-06-05 field session END (robot rebooted on low battery; operator inside).**
+_Test location: the pedestrian road in front of the lab — the venue keeps its
+legacy `rooftop` codename (`scenarios/venues/rooftop.json`)._
+Phase 1 of the autonomous-leg fix (plan: `~/.claude/plans/swift-scribbling-dream.md`)
+is IMPLEMENTED + build-clean + synced + the new orchestrator code is loaded on the NUC
+(managed list now has `geofence`). UNTESTED on the robot — battery died before the run.
+
+Done this session (uncommitted as of session end — COMMIT pending):
+- `reposition_node`: heading from the Pixhawk compass (`/pixhawk/global_position/
+  compass_hdg`), auto-calibrated vs forward COG (absorbs the **90° mount** + declination),
+  standstill-capable → converges heading instead of COG-limit-cycling.
+  `arrive_on_position_only` default → False (spec §R2). COG = fallback/cross-check.
+- Single fixed rooftop path: `smoke.yaml` `path_override` (L1 2.5/R 0.7/30°/L2 1.0 ≈
+  3.7×0.6 m), passed through by `_recipe_for_leg`. (Venue-fitting deferred = general soln.)
+- RTK accept {4,5} (TEMP): `experiment_sequencer_node` + `tools/ops/limo_ops.py`
+  (reposition done earlier; preflight already passes FLOAT as non-fatal warn).
+- `tools/safety/geofence_watchdog.py` (venue-polygon RTK geofence → /estop_trigger),
+  registered as orchestrator `geofence` PROC.
+
+NEXT SESSION (battery charged, back outside):
+1. Bring up stack + `geofence` PROC; confirm RTK + `compass_hdg` live.
+2. Arm ONE A→B leg via the sequencer (`limo_ops run-smoke --armed`) — do NOT hand-drive.
+   Watch reposition self-calibrate the compass on its approach (log: "compass
+   auto-calibrated: corr=… deg") then converge heading + arrive; venue-fit path tracks;
+   bag records; classifies PASS. Geofence + estop as backstops.
+3. VALIDATE the compass cal is stable/sane (corr repeatable across runs; cross-check
+   warnings absent) — roof magnetic interference is the top risk. COG fallback if bad.
+4. Charge battery FULLY first (was 12.4 V / not topped up; died mid-session).
+5. NUC reboot left the ros2 CLI **daemon** seeing only LAN (QCar2) nodes, not local ones;
+   nodes themselves are fine (direct `--no-daemon` discovery works). If it recurs, use
+   `ros2 … --no-daemon` or investigate the daemon's interface binding.
+
 Battle station online and field-tested. Major workstreams since last update
 (2026-04-30):
 
@@ -572,6 +604,62 @@ pipeline.
     S1 133.6->310.4, E1 312.6->131.4 (= 2*42 - old, preserving the operator's on-screen aim).
     **STILL PENDING: on-robot nudge test (place at S1, reposition, few cm -> nose toward E1)
     before any autonomous run — the empirical tie-breaker.** See [[project_heading_convention_bug]].
+
+- [!] **FIELD BUG (2026-06-05) — reposition heading does NOT converge (limit cycle); BLOCKS
+  autonomous runs.** Standalone `/reposition/goto` to S1 of the re-measured rooftop venue
+  (S1 heading_deg=308.9, ~2.8 m away). Existing `reposition_node` code (unmodified).
+  **Position converges** (err_m 3.0 -> ~0.4 m, near `pos_tol_m`=0.15) but **heading never
+  settles**: over the full 120 s window `err_deg` swung ±150° (−20,+176,−141,+43,−150,+143…)
+  and never entered the `heading_tol_deg`=5° arrival band. It cycles forever:
+  aligning -> approaching -> "3-point reverse (P3)" -> "final straight segment (R2)" ->
+  heading reads ~140° off -> reverse again. Killed the proc to stop it (cmd_vel silent).
+  - **Suspected root cause:** no compass in the loop — heading is course-over-ground
+    (bearing between successive RTK fixes), trusted only above `cog_min_travel_m`=0.10 m.
+    Near the pin the moves are sub-threshold, so the COG heading is RTK-noise-dominated and
+    flips sign -> the controller chases a phantom heading. The "final straight (R2)" ticks
+    show err_deg ~140°, i.e. it commits to the approach with a bad heading estimate.
+  - **Consequence:** the heading-convention tie-breaker (above) is **inconclusive** — it never
+    settled, so we can't read "nose toward E1." Position-only reposition works.
+  - **Knobs to investigate (defaults):** `cog_min_travel_m`=0.10, `approach_dist_m`=0.6,
+    `k_yaw`=1.2, `max_yaw_rate`=0.8, `three_point_turn_deg`=100, `reverse_time_s`=1.5,
+    `heading_tol_deg`=5.0, `pos_tol_m`=0.15. Candidate directions: raise `cog_min_travel_m`
+    and/or `approach_dist_m` so the final straight yields a clean COG; relax `heading_tol_deg`;
+    or revisit whether an IMU/compass heading source should feed R2. **Needs professor /
+    spec input — do not retune controller blindly.**
+
+**2026-06-05 — first controller-driven leg on the robot (direct-follower workaround):**
+Bypassed the sequencer + reposition (heading limit-cycle) and drove the LPV-Hinf
+follower directly on a venue-fitting step curve (L1=2.5,R=0.7,theta=30deg,L2=1.0 =
+3.87 m, ~0.6 m lateral) with the robot hand-oriented at S1 and an external RTK
+geofence watchdog (/tmp/geofence_watchdog.py). RESULT: leg completed — done=True,
+s_star 3.60/3.87 (hit the done threshold), e_psi=0 at end, stayed in venue
+(geofence never tripped), stopped clean. The controller + curve tracking work on
+hardware. Caveats + bugs found this session:
+
+- [!] **No tracking-error trace.** Direct-follower records no bag (bag is owned by
+  the sequencer BAG_START, which we bypassed) and the live monitor only kept the
+  end state — so we know the leg *completed in-bounds* but have NO cross-track /
+  e_psi-vs-time data to judge tracking quality. Bag pipeline was not exercised at
+  all today (only stale 2026-05-29 bags on the NUC).
+- [!] **Web UI shows no path.** `/reference_path` IS published correctly (40 poses)
+  but in frame_id `odom` (the zeroed robot frame). The battle station draws on the
+  RTK/world venue map, so an odom-frame path does not overlay -> blank. Root cause =
+  the same path-is-robot-relative issue (no odom->world transform applied). Fix:
+  publish/transform the reference path into the world/ENU frame, or have the UI
+  apply the reset-pose transform. (path_follower_node `_publish_sampled_path` L405/414
+  stamps `self._odom_frame`.)
+- [!] **Path not venue-sized (confirmed root cause of the earlier off-roof finding).**
+  `_recipe_for_leg` sends only R; defaults L1=L2=5.0 -> 11.1 m / 5.7 m-wide curve in a
+  3.2x9.3 m venue. Needs venue-aware sizing (derive L1/L2/theta/R from venue extent).
+- [!] **No run-time geofence in follower/sequencer.** Worked around with an external
+  watchdog (/tmp/geofence_watchdog.py, RTK polygon -> /estop_trigger). Promote to a
+  committed tool and/or a follower-internal check.
+- [!] **RTK won't hold FIXED outdoors today — only FLOAT (q=5).** Relaxed reposition
+  RTK gates to accept {4,5} (TEMP, ~dm accuracy); sequencer `_on_rtk` (RTK_FIXED_TOKEN)
+  + ops `wait-rtk-fixed` still FIXED-only (edit paused). Revert to {4} when FIXED holds.
+  Spec tension: §R2 + the FIXED-only ADR vs accepting FLOAT.
+- minor (mine): /tmp/run_leg.sh done-check compared "true" vs the emitted "True", so the
+  monitor ran full 80 ticks instead of breaking — cosmetic, fix the compare.
 
 **Fixed — real bug the suite caught:**
 

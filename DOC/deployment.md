@@ -94,6 +94,93 @@ as correct end-to-end**. A self-consistent bench venue is needed for a full walk
 FIXED hold, real motor actuation, real vehicle dynamics / tracking accuracy, and
 the real venue geometry (`rooftop.json` is placeholder).
 
+## Runbook — autonomous smoke e2e start (field)
+
+> Test location (2026-06-05 session): the pedestrian road in front of the lab.
+> The venue keeps its legacy `rooftop` codename (`scenarios/venues/rooftop.json`).
+
+The canonical field procedure: this is what "run the full e2e test" means (see the
+field-vs-bench table above). It arms the **autonomous** sequencer for the single
+smoke cell (`scenarios/smoke.yaml`: 1× `lpv-hinf`, step, conservative `v_const`);
+the same steps with `scenarios/experiment.yaml` and the `sequencer` PROC run the
+full 320-cell matrix. To drive one leg **by hand** instead, use the **Manual run
+(per-phase)** panel in the battle station (+ `bag_node` over `/bag/cmd`, which
+lands the same bag + sidecar) — that path is for when the autonomous loop is
+blocked.
+
+### 0 · Prerequisites (once per session)
+- **Code synced + built on the NUC**, not just rsync'd: `tools/sync/sync.sh push`,
+  then `cd ~/agilex_ws && colcon build --packages-select limo_path_follower` and
+  source `install/setup.bash`. New nodes/controller edits only reach the graph
+  after a rebuild.
+- **Chassis in Ackermann mode** on the physical switch (`motion_mode == 1`).
+- **Venue pinned + saved from the battle-station map under live RTK** — never
+  hand-edit the venue JSON; the pin-heading convention only round-trips through
+  the editor (`memory/project_heading_convention_bug`). Confirm `smoke.yaml`'s
+  `venue:` points at it (currently `scenarios/venues/rooftop.json`).
+
+### 1 · Bring up the stack
+```
+bash ~/H-infinity/tools/orchestrator/start_battle.sh   # rosbridge :9090 + orchestrator
+```
+Then start exactly these four processes (battle-station supervisor buttons, or
+`ros2 topic pub --once /orchestrator/start std_msgs/String '{data: <name>}'`):
+`base_gnss`, `estop`, `odom_zero`, `ops`.
+Do **not** hand-start `sequencer_smoke`, `follower`, or `reposition` — the arm
+command (step 3) starts the sequencer, and the sequencer brings up
+`follower`/`reposition`/`odom_zero` itself in C6-safe order (exactly one
+`cmd_vel_raw` publisher at any instant).
+
+### 2 · Preflight gate (no wheels move)
+```
+bash ~/H-infinity/tools/preflight/preflight.sh   # must exit 0
+```
+Checks the node graph, the `cmd_vel_raw → estop → /cmd_vel` chain with a single
+`cmd_vel_raw` publisher (C6), Ackermann, battery ≥ 10.5 V, `/wheel/odom` > 30 Hz,
+and **RTK FIXED (quality=4)**. FLOAT (quality=5) only WARNs here, but the
+sequencer's M1/F2 gate is FIXED-only and will pause the batch on FLOAT.
+
+### 3 · Automatic arm (one command)
+```
+ros2 topic pub --once /ops/cmd std_msgs/String \
+  '{data: "{\"action\":\"run_smoke_e2e\",\"confirmed_wheels_on_floor\":true}"}'
+```
+`ops_node` kills the matrix `sequencer`, starts `sequencer_smoke` pinned to
+`smoke.yaml` (which idles — `autostart: false`), and auto-sends
+`/experiment/cmd {action:start}` once it reports `idle`. The sequencer then runs
+itself through its phase order: preflight → reposition → odom-reset → bag →
+follower → set-params → push-recipe → run → stop/classify → turnaround → return
+leg → done.
+- `confirmed_wheels_on_floor: true` is **mandatory** — `ops_node` refuses the arm
+  without it. It is the operator's acknowledgement that the robot is placed and
+  clear to drive.
+- **UI equivalent:** process-start `sequencer_smoke`, then click **Resume** in the
+  Experiment panel (Resume-from-IDLE begins the batch). This path **skips** the
+  wheels-on-floor guard, so prefer `run_smoke_e2e`.
+
+### 4 · Watch / stop
+- Live state on `/experiment/status` (phase, cell, pass/fail, ETA) — shown in the
+  Experiment panel and mirrored on `/ops/status`.
+- **Pause** (`/experiment/cmd {action:pause}`) halts in safe-state and holds.
+  **ABORT** stops the batch *and* latches the E-stop. **E-STOP** is the hard stop.
+- Pass = a bag + sidecar under `Experiment Data/` and `phase: done` with `fail: 0`.
+
+### Current tight-venue caveats (separate workstream)
+The steps above are unchanged, but on the present rooftop venue two known issues
+will interrupt the loop until fixed elsewhere:
+- **Path footprint exceeds the venue.** The step recipe carries only `R`; the
+  follower's defaults `L1 = L2 = 5.0 m` give an ~5.7 × 5.7 m driven path inside an
+  ~8.3 × 2.2 m inset, so the run leaves the box until per-venue path geometry is
+  plumbed through `_recipe_for_leg`. Keep the E-stop / geofence ready, or wait for
+  the path-fit.
+- **Reposition heading limit-cycle** hangs the reposition phase (no compass; COG
+  is noise-dominated near the pin). No-code workaround: use a venue whose start
+  and end pin **coincide (A == B)** — `_reposition_is_noop()` then skips reposition
+  (`experiment_sequencer_node.py`), the operator hand-places the robot, and
+  odom-reset → bag → follow → classify run normally. The driven path comes from the
+  odom-zero origin, not the pin coordinates, so pin heading is irrelevant in that
+  case.
+
 ## Support scripts inventory
 
 The legacy `agile_ws` runtime stack that this project builds on. These are

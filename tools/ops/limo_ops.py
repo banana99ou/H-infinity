@@ -143,7 +143,7 @@ def cmd_wait_rtk_fixed(args) -> int:
         rc, out = echo_once("/gps_rtk_f9p_helical/gps/rtk_status", timeout_s=2.0)
         if rc == 0 and out:
             last = out
-            if _parse_rtk_quality(out) == 4:
+            if _parse_rtk_quality(out) in (4, 5):  # TEMP: accept FLOAT(5), not just FIXED(4)
                 print(out)
                 return 0
         time.sleep(1.0)

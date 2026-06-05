@@ -130,9 +130,11 @@ DEFAULT_BAG_ROOT = os.path.join(_REPO_ROOT, "Experiment Data")
 DEFAULT_CHECKPOINT = os.path.join(_REPO_ROOT, "Experiment Data", "checkpoint.json")
 DEFAULT_EXPERIMENT_YAML = os.path.join(_REPO_ROOT, "scenarios", "experiment.yaml")
 
-# RTK FIXED token in /gps_rtk_f9p_helical/gps/rtk_status (NMEA GGA quality=4),
-# matching tools/preflight/preflight.sh.
-RTK_FIXED_TOKEN = "quality=4"
+# Acceptable RTK qualities parsed from /gps_rtk_f9p_helical/gps/rtk_status. FIXED(4)
+# is the spec target; FLOAT(5) is a TEMPORARY field acceptance (2026-06-05) because
+# the base can't hold FIXED here — FLOAT is ~dm vs cm. Revert to (4,) once FIXED is
+# reliable. Keep in sync with tools/preflight/preflight.sh.
+RTK_OK_QUALITIES = (4, 5)
 
 
 class Phase(Enum):
@@ -206,6 +208,10 @@ class ExperimentSequencer(Node):
         self.run_id = str(self._cfg.get("run_id", "run"))
         self._gating = self._cfg.get("gating", {}) or {}
         self._retry = self._cfg.get("retry", {}) or {}
+        # Fixed step-path geometry override (L1/R/theta_arc/L2/direction) for a
+        # small/fixed venue, so the curve fits instead of the follower's 5 m
+        # defaults. Empty -> use the cell radius + follower defaults. See smoke.yaml.
+        self._path_override = self._cfg.get("path_override", {}) or {}
         self._max_retries = int(self._retry.get("max_retries", 1))
         self._breaker_k = int(self._retry.get("circuit_breaker_k", 3))
         self._batt_warn = float(self._gating.get("battery_volts_warn", 11.0))
@@ -502,7 +508,15 @@ class ExperimentSequencer(Node):
             self._leg_estopped = True
 
     def _on_rtk(self, msg):
-        self._rtk_fixed = (RTK_FIXED_TOKEN in (msg.data or ""))
+        q = None
+        for tok in (msg.data or "").replace("(", " ").replace(",", " ").split():
+            if tok.startswith("quality="):
+                try:
+                    q = int(tok.split("=", 1)[1])
+                except ValueError:
+                    q = None
+                break
+        self._rtk_fixed = q in RTK_OK_QUALITIES
         if self.phase == Phase.RUN:
             self._leg_rtk_total_samples += 1
             if self._rtk_fixed:
@@ -621,8 +635,12 @@ class ExperimentSequencer(Node):
             return {"type": "uturn", "params": {}}
         if fam in ("slalom",):
             return {"type": "slalom", "params": {"R": R}}
-        # default + "step"
-        return {"type": "step", "params": {"R": R}}
+        # default + "step". A config `path_override` lets a fixed/small venue pin
+        # the exact step geometry (L1/R/theta_arc/L2/direction) instead of the
+        # follower's 5 m defaults (which overrun a small venue). Single fixed path.
+        params = {"R": R}
+        params.update(self._path_override)
+        return {"type": "step", "params": params}
 
     # ==================================================================
     # State machine

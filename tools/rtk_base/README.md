@@ -107,7 +107,10 @@ receiver's active config before RTCM bytes are broadcast to the rover.
 
 Suggested config:
 
-- **TMODE3 = Survey-In** (1). Min duration 60 s, position accuracy 5.0 m.
+- **TMODE3 = Survey-In** (1). Min duration 300 s, position accuracy 2.0 m
+  (forced on every boot by `rtk-base.service`; tightened from the old 60 s /
+  5.0 m, which let the base lock an unsurveyed position and gave the rover a
+  flaky FIX).
   - Each power-on, the F9P self-surveys until both bounds are met, then locks
     that position and starts broadcasting. Within-session RTK is FIXED-capable
     even though the absolute frame jumps a few cm to ~1 m each session.
@@ -132,8 +135,8 @@ Reference: https://docs.holybro.com/gps-and-rtk-system/zed-f9p-h-rtk-series/port
    the AP otherwise). systemd starts rtk-base.service automatically.
 3. Wait for the boot-time survey-in. Logs first show
    `[ubx] forcing TMODE3 Survey-In on boot`, then RTCM messages start to flow
-   once the F9P locks its current antenna position. Expect ~1 min in good
-   open sky.
+   once the F9P locks its current antenna position. Expect ~5 min (the survey
+   min-duration) in good open sky.
 4. From the battle station, start `base_gnss`. The NUC's
    GPS-RTK_ROS2_pub_node.py will connect to <pi-ip>:2101 and start forwarding
    RTCM3 into the rover. /gps_rtk_f9p_helical/gps/rtk_status should show

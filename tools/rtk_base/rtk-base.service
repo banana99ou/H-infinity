@@ -23,6 +23,8 @@ ExecStart=/usr/bin/python3 /home/pi/H-infinity/tools/rtk_base/rtcm_server.py \
     --baud 115200 \
     --host 0.0.0.0 \
     --port 2101 \
+    --survey-min-duration-s 300 \
+    --survey-acc-limit-m 2.0 \
     --log-level INFO
 
 Restart=always

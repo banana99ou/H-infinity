@@ -69,8 +69,9 @@ artifact_sync:
                              #   only if a run ever shows contention.
   bwlimit_kbps: 4000         # rsync --bwlimit (0 = unlimited)
   # Mac needs Remote Login ON + the NUC key authorized; until then this target
-  # fast-fails and is skipped (non-fatal). Tailscale MagicDNS name 'macbook-air'.
-  mac_target: "hyeon-yongjeong@macbook-air:/Users/hyeon-yongjeong/code/H-infinity/Experiment Data/"
+  # fast-fails and is skipped (non-fatal). Tailscale MagicDNS name 'macbook-air-2'
+  # (verified NUC->Mac reachable 2026-06-05; the bare 'macbook-air' didn't resolve).
+  mac_target: "hyeon-yongjeong@macbook-air-2:/Users/hyeon-yongjeong/code/H-infinity/Experiment Data/"
   # Direct NUC->NAS push (per routing decision 2026-05-26). 'Experiment Data' is
   # in the code folder's Syncthing .stignore on BOTH Mac and NAS, so Syncthing
   # never carries artifacts -> this direct rsync is the sole path to the NAS (no

@@ -1,10 +1,12 @@
-# 1-cell smoke yaml for the field auto-reverse test (2026-05-29).
-# Disposable — not the headline matrix. Single cell, single repetition,
-# conservative speed, no auto-retry, no notification, no artifact sync.
+# 1-cell smoke yaml for the field auto-reverse test (2026-06-05).
+# Single cell, single repetition, conservative speed, no auto-retry.
+# Alerts: ntfy push off (topic blank) but the Discord webhook fires
+#   (discord.env present on the NUC) — operator gets phone alerts.
+# Artifacts: per-run bag pushed off-robot to Mac + NAS (artifact_sync below).
 # Goal: drive AtoB -> turnaround -> BtoA and prove the sequencer state
 # machine ends up in PASS.
 
-run_id: smoke_2026_05_29_field
+run_id: smoke_2026_06_05_field
 
 venue: scenarios/venues/rooftop.json
 
@@ -15,6 +17,17 @@ matrix:
   path_family: [step]
 
 repetitions: 1
+
+# Single FIXED rooftop path (this venue is small/non-ideal — NOT venue-fit). The
+# follower's default step is L1=L2=5 m (~11 m long / 5.7 m wide), which overruns the
+# ~3.2 x 9.3 m venue. These dims (~3.7 m long / ~0.6 m lateral) tracked clean inside
+# the venue 2026-06-05. Overrides the step recipe for AtoB/BtoA legs.
+path_override:
+  L1: 2.5
+  R: 0.7
+  theta_arc: 0.5236     # 30 deg
+  L2: 1.0
+  direction: 1
 
 gating:
   battery_volts_warn: 10.8
@@ -30,4 +43,14 @@ ntfy:
   topic: ""               # push disabled
 
 artifact_sync:
-  enabled: false          # don't auto-push smoke bag to mac/nas
+  # Push the finished bag off the robot to the Mac (priority) + NAS, detached +
+  # rate-limited + low-priority so it never competes with the run. Per-run, the
+  # tested default path; tools/sync/push_artifact.sh does the work (non-fatal on
+  # failure — a target that's unreachable fast-fails and is skipped).
+  enabled: true
+  granularity: per-run
+  bwlimit_kbps: 4000
+  # Mac needs Remote Login ON + the NUC key authorized, else this target skips.
+  mac_target: "hyeon-yongjeong@macbook-air-2:/Users/hyeon-yongjeong/code/H-infinity/Experiment Data/"
+  nas_target: "me@nanasrv:/mnt/raid0/main/code/H-infinity/Experiment Data/"
+  local_repo: "/home/agilex/H-infinity/Experiment Data"

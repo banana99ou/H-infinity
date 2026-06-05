@@ -1,25 +1,59 @@
 {
   "name": "rooftop",
   "frame": "rtk_enu",
-  "_provenance": "Live-RTK venue from the 2026-06-04 field session. Pin headings MIGRATED to true compass bearing (the robot's convention). The battle-station UI had a heading mirror bug (stored 2*bearing - true_heading), so the operator's verbatim export (S1=133.6 / E1=312.6 — which rendered as arrows correctly facing each other) was the MIRROR of what reposition_node actually drives. Migrated via new = 2*42 - old: S1 133.6->310.4 (faces E1), E1 312.6->131.4 (faces S1). The UI mirror bug is now fixed (interactive.html drawPin + drag-inverse, 2026-06-04), so these true-compass values also render correctly on the map. PENDING on-robot verification before any autonomous run: place robot at S1, reposition, nudge a few cm -> nose must point toward E1. See ToDo 2026-06-04.",
+  "_provenance": "Surveyed 2026-06-05 at the pedestrian road in front of the lab (NOT a rooftop; the venue keeps its legacy 'rooftop' codename). Corners + S1/E1 pins re-measured live under RTK this session. Pin headings are true-compass bearings (reposition_node convention).",
   "corners_wgs84": [
-    { "lat": 37.61241585431486, "lon": 126.99418913573028 },
-    { "lat": 37.61244028872587, "lon": 126.99421260505916 },
-    { "lat": 37.61249898439774, "lon": 126.99412107467653 },
-    { "lat": 37.61247481559728, "lon": 126.99409559369089 }
+    {
+      "lat": 37.612403902697864,
+      "lon": 126.99420724064113
+    },
+    {
+      "lat": 37.61242647797282,
+      "lon": 126.99422970414163
+    },
+    {
+      "lat": 37.6124783281494,
+      "lon": 126.9941466664929
+    },
+    {
+      "lat": 37.612455752874446,
+      "lon": 126.9941242029924
+    }
   ],
   "corners_click_order_wgs84": [
-    { "lat": 37.61247481559728, "lon": 126.99409559369089 },
-    { "lat": 37.61241585431486, "lon": 126.99418913573028 },
-    { "lat": 37.61244028872587, "lon": 126.99421260505916 },
-    { "lat": 37.61249898439774, "lon": 126.99412107467653 }
+    {
+      "lat": 37.61242647797282,
+      "lon": 126.99422970414163
+    },
+    {
+      "lat": 37.612403902697864,
+      "lon": 126.99420724064113
+    },
+    {
+      "lat": 37.612455752874446,
+      "lon": 126.9941242029924
+    },
+    {
+      "lat": 37.6124783281494,
+      "lon": 126.9941466664929
+    }
   ],
   "safety_margin_m": 0.5,
   "exclusions": [],
   "start_pins": [
-    { "id": "S1", "lat": 37.61243630485506, "lon": 126.99418611824515, "heading_deg": 310.4 }
+    {
+      "id": "S1",
+      "lat": 37.612422228509814,
+      "lon": 126.99420556426051,
+      "heading_deg": 308.9
+    }
   ],
   "end_pins": [
-    { "id": "E1", "lat": 37.61247986183099, "lon": 126.99411906301977, "heading_deg": 131.4 }
+    {
+      "id": "E1",
+      "lat": 37.61246047366803,
+      "lon": 126.9941468909383,
+      "heading_deg": 130.5
+    }
   ]
 }

@@ -93,6 +93,15 @@ PROCS = {
     'bag': [
         'ros2', 'run', 'limo_path_follower', 'bag_node',
     ],
+    # Run-time venue geofence (safety): watches the live RTK fix and latches a
+    # hard E-stop via /estop_trigger if the robot leaves the venue polygon (or
+    # RTK goes blind). The follower has no area guard during a recorded leg, so
+    # this is the only thing that stops a mis-aimed leg before the roof edge.
+    # Records/publishes nothing but /estop_trigger; safe alongside any leg.
+    'geofence': [
+        'python3', '/home/agilex/H-infinity/tools/safety/geofence_watchdog.py',
+        '--venue', '/home/agilex/H-infinity/scenarios/venues/rooftop.json',
+    ],
 }
 
 EXCLUSIVE = {'base_vanilla', 'base_gnss'}

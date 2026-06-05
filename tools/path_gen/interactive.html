@@ -276,6 +276,88 @@
     </div>
 
     <!-- ============================================================
+         Manual run (per-phase) — drive ONE leg by hand entirely from the
+         browser, without the autonomous sequencer. Each control maps to one
+         sequencer phase; the operator clicks them in order. The autonomous
+         panel above is unchanged (both modes coexist).
+         ============================================================ -->
+    <details id="manual-run-details" style="margin-top:10px;">
+      <summary><b>Manual run (per-phase)</b></summary>
+      <div class="small" style="color:#6cf;">
+        Drive ONE leg by hand, top to bottom — this mirrors the sequencer's
+        phase order (preflight &rarr; reposition &rarr; reset &rarr; bag &rarr;
+        follower &rarr; params &rarr; recipe &rarr; run &rarr; stop).
+        <b>C6:</b> <i>reposition</i> and <i>follower</i> must NEVER run together
+        (two <code>/cmd_vel_raw</code> publishers) — always <b>kill one before
+        starting the other</b>. For unattended matrix runs use the Experiment
+        panel above.
+      </div>
+
+      <div class="small" style="margin-top:8px;"><b>0 &middot; Preflight</b> — confirm RTK = FIXED (quality=4) and battery OK in the RTK &amp; GPS panel above before any motion.</div>
+
+      <div class="small" style="margin-top:8px;"><b>1 &middot; Reposition to start pin</b> (RTK go-to-pose). Kill the follower first (C6).</div>
+      <div class="row" style="margin-top:4px;">
+        <button id="mr-repo-start" class="primary">Start reposition node</button>
+        <button id="mr-repo-kill">Kill reposition node</button>
+      </div>
+      <div class="row" style="margin-top:4px;">
+        <select id="mr-pin" style="flex:1;"><option value="">(no venue pins)</option></select>
+        <label style="margin:0;white-space:nowrap;"><input type="checkbox" id="mr-dry"> dry-run</label>
+      </div>
+      <div class="row" style="margin-top:4px;">
+        <button id="mr-goto" class="primary">Go to pin</button>
+      </div>
+      <div class="stat" id="mr-repo-state">(idle)</div>
+      <div class="small">When it reports <b>arrived</b>, <b>kill reposition</b> before the recorded leg.</div>
+
+      <div class="small" style="margin-top:8px;"><b>2 &middot; Reset odom</b></div>
+      <div class="row" style="margin-top:4px;">
+        <button id="mr-odom-reset" class="primary">Reset odom &rarr; (0,0,0)</button>
+      </div>
+      <div class="small" id="mr-odom-state">Latches the current pose as the path origin (motion-free).</div>
+
+      <div class="small" style="margin-top:8px;"><b>3 &middot; Start bag</b> — before the run, so the whole leg is captured.</div>
+      <div class="row" style="margin-top:4px;">
+        <input type="text" id="mr-runid" placeholder="run/cell label (for sidecar)" style="flex:1;">
+      </div>
+      <div class="row" style="margin-top:4px;">
+        <button id="mr-bag-start" class="primary">Start bag</button>
+        <button id="mr-bag-stop" class="estop">Stop bag</button>
+      </div>
+      <div class="stat" id="mr-bag-state">(not recording)</div>
+
+      <div class="small" style="margin-top:8px;"><b>4 &middot; Follower</b> — start AFTER reposition is killed (C6).</div>
+      <div class="row" style="margin-top:4px;">
+        <button id="mr-foll-start" class="primary">Start follower node</button>
+        <button id="mr-foll-kill">Kill follower node</button>
+      </div>
+
+      <div class="small" style="margin-top:8px;"><b>5 &middot; Controller + speed</b> (follower must be running)</div>
+      <div class="row" style="margin-top:4px;">
+        <select id="mr-ctrl"><option value="lpv-hinf">lpv-hinf</option><option value="pid-ff">pid-ff</option></select>
+        <label style="margin:0;">v <input type="number" id="mr-v" value="0.20" step="0.05" min="0" max="1.5" style="width:60px;"> m/s</label>
+        <button id="mr-setparams">Set</button>
+      </div>
+      <div class="small" id="mr-param-state"></div>
+
+      <div class="small" style="margin-top:8px;"><b>6 &middot; Reference path (recipe) &rarr; run</b></div>
+      <div class="row" style="margin-top:4px;">
+        <select id="mr-family"><option value="step">step</option><option value="slalom">slalom</option><option value="uturn">uturn</option></select>
+        <label style="margin:0;">R <input type="number" id="mr-radius" value="0.70" step="0.05" min="0.1" style="width:60px;"> m</label>
+        <button id="mr-push-recipe" class="primary">Push</button>
+      </div>
+      <div class="small" id="mr-recipe-state"></div>
+      <div class="small">Clear the big E-STOP to let it drive; watch Telemetry for completion (<code>/path_follower/done</code>).</div>
+
+      <div class="small" style="margin-top:8px;"><b>7 &middot; Stop</b> — Stop bag (above), then Kill follower node (above).</div>
+      <div class="small" style="margin-top:6px;">
+        Bag + sidecar land in <code>Experiment&nbsp;Data/</code> on the NUC (marked
+        a manual leg, not auto-classified). bag_node records only &mdash; never
+        drives, and refuses to start while the sequencer is running.
+      </div>
+    </details>
+
+    <!-- ============================================================
          T5 — Venue / working-area editor (V1-V4).
          ============================================================ -->
     <h3>Venue / working area</h3>
@@ -1032,6 +1114,14 @@ let estopActive = null;
 // tracking, and venue corner/pin selection for arrow-key nudging.
 let topicOdomReset = null;        // std_msgs/Bool -> /odom_zero/reset (re-zero odom)
 let topicOdomStatus = null;       // latched /odom_zero/status feedback
+// Manual-run (per-phase) wiring: drive ONE leg by hand from the browser using
+// the same robot contracts the autonomous sequencer uses. Pure rosbridge; the
+// per-phase primitives (reposition, recipe, set_parameters, bag) already exist.
+let topicRepoGoto = null, topicRepoStatus = null;  // /reposition/{goto,status}
+let topicBagCmd = null, topicBagStatus = null;     // /bag/{cmd,status} (bag_node)
+let topicRefRecipe = null;        // /reference_path_recipe (analytic curve, latched)
+let manualPins = [];              // venue pins mirrored for the manual-run dropdown
+let manualLastRecipe = null;      // last recipe pushed (labels the manual bag sidecar)
 let lastPixhawkTime = 0, lastBattTime = 0;
 let selectedVenueHandle = null;   // {kind:'corner', idx} | {kind:'start'|'end', id}
 let venueNudgeStep = 0.25;        // metres per arrow-key press
@@ -1351,6 +1441,33 @@ function subscribeAll() {
   });
   topicOdomStatus.subscribe(onOdomZeroStatus);
 
+  // ----- Manual run (per-phase) -----
+  // Reposition go-to-pose: publish a venue-pin pose, watch the node's status.
+  // reposition_node drives cmd_vel_raw through the normal estop chain (a
+  // sanctioned mover, C6) — the webui never touches cmd_vel itself.
+  topicRepoGoto = new ROSLIB.Topic({
+    ros, name: '/reposition/goto', messageType: 'std_msgs/msg/String'
+  });
+  topicRepoStatus = new ROSLIB.Topic({
+    ros, name: '/reposition/status', messageType: 'std_msgs/msg/String'
+  });
+  topicRepoStatus.subscribe(onRepoStatus);
+  // Manual bag recorder (bag_node): start/stop + live status. Records only.
+  topicBagCmd = new ROSLIB.Topic({
+    ros, name: '/bag/cmd', messageType: 'std_msgs/msg/String'
+  });
+  topicBagStatus = new ROSLIB.Topic({
+    ros, name: '/bag/status', messageType: 'std_msgs/msg/String'
+  });
+  topicBagStatus.subscribe(onBagStatus);
+  // Analytic reference path (recipe) — the follower subscribes this latched, so
+  // publish latched too (matches the sequencer's PUSH_RECIPE phase).
+  topicRefRecipe = new ROSLIB.Topic({
+    ros, name: '/reference_path_recipe', messageType: 'std_msgs/msg/String',
+    queue_length: 1, latch: true
+  });
+  refreshManualPins();
+
   // Path-follower v_const setter
   setParamsService = new ROSLIB.Service({
     ros, name: '/path_follower_node/set_parameters',
@@ -1370,6 +1487,7 @@ const STACK_LABELS = {
   reposition:   'reposition_node',
   sequencer:    'experiment_sequencer_node',
   ops:          'ops_node',
+  bag:          'bag_node (manual rec)',
 };
 function onOrchStatus(msg) {
   let state;
@@ -2081,6 +2199,8 @@ function drawVenue() {
     `corners: ${venue.corners.length} / 4${crossing ? ' — click order crosses; export normalized' : ''}`;
   $('venue-excl-state').textContent = `exclusions: ${venue.exclusions.length}`;
   $('venue-pin-state').textContent = `pins: ${venue.start_pins.length} start / ${venue.end_pins.length} end`;
+  // Keep the manual-run pin dropdown in sync with venue pin edits.
+  if (typeof refreshManualPins === 'function') refreshManualPins();
 }
 
 // Drag pos to move pin; drag tip to set heading (compass deg). Mutates the
@@ -2496,6 +2616,147 @@ $('btn-reanchor-rtk').onclick = () => {
   if (topicOdomReset) topicOdomReset.publish(new ROSLIB.Message({ data: true }));
   $('reanchor-state').innerHTML = '<span class="ok">anchor snapped to RTK; /odom_zero/reset sent</span>';
 };
+
+// ============================================================
+// Manual run (per-phase) — button wiring. Publishers are created in
+// subscribeAll(); handlers guard on null so they no-op until connected.
+// Each control maps to one sequencer phase (see DOC/experiment.md §3.10).
+// ============================================================
+function refreshManualPins() {
+  const sel = $('mr-pin');
+  if (!sel) return;
+  manualPins = [];
+  (venue.start_pins || []).forEach(p =>
+    manualPins.push({ label: `start ${p.id}`, lat: p.lat, lon: p.lon, heading_deg: p.heading_deg }));
+  (venue.end_pins || []).forEach(p =>
+    manualPins.push({ label: `end ${p.id}`, lat: p.lat, lon: p.lon, heading_deg: p.heading_deg }));
+  const prev = sel.value;
+  if (!manualPins.length) {
+    sel.innerHTML = '<option value="">(no venue pins — add them in Venue panel)</option>';
+    return;
+  }
+  sel.innerHTML = manualPins.map((p, i) => {
+    const h = (p.heading_deg != null) ? `${p.heading_deg.toFixed(0)}°` : '?';
+    return `<option value="${i}">${p.label} (${h})</option>`;
+  }).join('');
+  if (prev !== '' && manualPins[prev]) sel.value = prev;
+}
+function onRepoStatus(msg) {
+  let d; try { d = JSON.parse(msg.data); } catch (e) { return; }
+  const el = $('mr-repo-state'); if (!el) return;
+  const state = d.state || '?';
+  const em = (d.err_m != null) ? ` err=${(+d.err_m).toFixed(2)}m` : '';
+  const ed = (d.err_deg != null) ? ` ${(+d.err_deg).toFixed(0)}°` : '';
+  const reason = d.reason ? ` — ${d.reason}` : '';
+  const cls = state === 'arrived' ? 'ok' : (state === 'aborted' ? 'err' : '');
+  el.innerHTML = `<span class="${cls}">reposition: ${state}${em}${ed}${reason}</span>`;
+}
+function onBagStatus(msg) {
+  let d; try { d = JSON.parse(msg.data); } catch (e) { return; }
+  const el = $('mr-bag-state'); if (!el) return;
+  if (d.recording) {
+    const rtk = d.rtk_total_samples ? ` · RTK ${d.rtk_fixed_samples}/${d.rtk_total_samples} fixed` : '';
+    const name = (d.bag_path || '').split('/').pop();
+    el.innerHTML = `<span class="ok">&#9679; REC ${(+d.duration_s).toFixed(0)}s</span> ${name}${rtk}`;
+  } else {
+    el.innerHTML = `<span class="small">${d.last_result || 'not recording'}</span>`;
+  }
+}
+
+$('mr-goto').onclick = () => {
+  const sel = $('mr-pin');
+  const idx = sel ? sel.value : '';
+  if (idx === '' || idx == null || !manualPins[idx]) {
+    alert('Select a venue pin first (add pins in the Venue panel).'); return;
+  }
+  if (!topicRepoGoto) { alert('Not connected.'); return; }
+  const p = manualPins[idx];
+  const dry = $('mr-dry').checked;
+  if (!dry && !confirm(
+    `Drive the robot to ${sel.options[sel.selectedIndex].text}?\n` +
+    `This MOVES the robot (reposition_node, RTK go-to-pose). ` +
+    `Confirm the wheels are clear / on the floor as intended.`)) return;
+  topicRepoGoto.publish(new ROSLIB.Message({ data: JSON.stringify({
+    lat: p.lat, lon: p.lon, heading_deg: p.heading_deg, dry_run: dry
+  }) }));
+  $('mr-repo-state').innerHTML = `<span class="small">goto sent (${dry ? 'dry-run' : 'LIVE'})…</span>`;
+};
+// Explicit mover lifecycle (operator owns C6 ordering). The generic Node
+// control panel can do the same; these are inline in workflow order. The
+// confirm() on a mover *start* reminds the operator to kill the other first.
+$('mr-repo-start').onclick = () => {
+  if (!topicOrchStart) { alert('Not connected.'); return; }
+  if (!confirm('Start the reposition node?\nKill the FOLLOWER first (C6 — only one mover may publish /cmd_vel_raw).')) return;
+  topicOrchStart.publish(new ROSLIB.Message({ data: 'reposition' }));
+  $('mr-repo-state').innerHTML = '<span class="small">reposition start sent</span>';
+};
+$('mr-repo-kill').onclick = () => {
+  if (!topicOrchKill) { alert('Not connected.'); return; }
+  topicOrchKill.publish(new ROSLIB.Message({ data: 'reposition' }));
+  $('mr-repo-state').innerHTML = '<span class="small">reposition kill sent</span>';
+};
+$('mr-foll-start').onclick = () => {
+  if (!topicOrchStart) { alert('Not connected.'); return; }
+  if (!confirm('Start the follower node?\nKill REPOSITION first (C6 — only one mover may publish /cmd_vel_raw).')) return;
+  topicOrchStart.publish(new ROSLIB.Message({ data: 'follower' }));
+};
+$('mr-foll-kill').onclick = () => {
+  if (!topicOrchKill) { alert('Not connected.'); return; }
+  topicOrchKill.publish(new ROSLIB.Message({ data: 'follower' }));
+};
+$('mr-odom-reset').onclick = () => {
+  if (!topicOdomReset) { alert('Not connected.'); return; }
+  topicOdomReset.publish(new ROSLIB.Message({ data: true }));
+  $('mr-odom-state').innerHTML =
+    '<span class="ok">/odom_zero/reset sent — origin latched at current pose</span>';
+};
+$('mr-setparams').onclick = () => {
+  const ctrl = $('mr-ctrl').value;
+  const v = parseFloat($('mr-v').value);
+  if (!setParamsService) { $('mr-param-state').innerHTML = '<span class="err">not connected</span>'; return; }
+  const req = new ROSLIB.ServiceRequest({ parameters: [
+    { name: 'controller_type', value: { type: 4, string_value: ctrl } },
+    { name: 'v_const', value: { type: 3, double_value: v } },
+  ]});
+  setParamsService.callService(req, (resp) => {
+    const ok = resp && resp.results && resp.results.every(r => r.successful);
+    $('mr-param-state').innerHTML = ok
+      ? `<span class="ok">${ctrl}, v_const = ${v.toFixed(2)} m/s set</span>`
+      : '<span class="err">set failed</span>';
+  }, (err) => { $('mr-param-state').innerHTML = `<span class="err">service error: ${err}</span>`; });
+};
+$('mr-push-recipe').onclick = () => {
+  if (!topicRefRecipe) { alert('Not connected.'); return; }
+  const type = $('mr-family').value;
+  const R = parseFloat($('mr-radius').value);
+  manualLastRecipe = { type, params: { R } };
+  topicRefRecipe.publish(new ROSLIB.Message({ data: JSON.stringify(manualLastRecipe) }));
+  $('mr-recipe-state').innerHTML =
+    `<span class="ok">pushed ${type} (R=${R.toFixed(2)}) to /reference_path_recipe</span>`;
+};
+$('mr-bag-start').onclick = () => {
+  if (!topicBagCmd) { alert('Not connected.'); return; }
+  const payload = {
+    action: 'start',
+    run_id: $('mr-runid').value || 'manual',
+    leg: 'manual',
+    controller_type: $('mr-ctrl').value,
+    v_const: parseFloat($('mr-v').value),
+    path_family: $('mr-family').value,
+    radius_m: parseFloat($('mr-radius').value),
+    venue_id: (typeof venue !== 'undefined' && venue.name) ? venue.name : null,
+  };
+  if (manualLastRecipe) payload.path_recipe = manualLastRecipe;
+  topicBagCmd.publish(new ROSLIB.Message({ data: JSON.stringify(payload) }));
+  $('mr-bag-state').innerHTML = '<span class="small">start sent…</span>';
+};
+$('mr-bag-stop').onclick = () => {
+  if (!topicBagCmd) { alert('Not connected.'); return; }
+  topicBagCmd.publish(new ROSLIB.Message({ data: JSON.stringify({ action: 'stop' }) }));
+  $('mr-bag-state').innerHTML = '<span class="small">stop sent…</span>';
+};
+refreshManualPins();
+
 $('teleop-close').onclick = () => setTeleopShown(false);
 $('estop-btn').onclick = toggleEstop;
 

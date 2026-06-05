@@ -50,6 +50,20 @@ def test_controllers_publish_only_to_cmd_vel_raw():
             f"{rel} does not publish to cmd_vel_raw: {topics}")
 
 
+def test_bag_node_records_only_never_publishes_cmd_vel():
+    # The manual-mode bag recorder must stay outside the motion chain: it
+    # records topics but never publishes cmd_vel or cmd_vel_raw. It exposes its
+    # state on /bag/status.
+    rel = "scalecar-vfg-h-infinite/ros2_bridge/limo_path_follower/bag_node.py"
+    topics = _published_topic_literals(_read(rel))
+    normalized = {t.lstrip("/") for t in topics}
+    assert "cmd_vel" not in normalized, f"{rel} must not publish cmd_vel: {topics}"
+    assert "cmd_vel_raw" not in normalized, (
+        f"{rel} must not publish cmd_vel_raw: {topics}")
+    assert "bag/status" in normalized, (
+        f"{rel} does not publish /bag/status: {topics}")
+
+
 def test_data_logger_records_required_topics():
     required = {
         "/wheel/odom",
@@ -100,5 +114,12 @@ def test_webui_uses_documented_control_topics():
         "/experiment/cmd",
         "/experiment/status",
         "/estop_trigger",
+        # Manual run (per-phase) controls — same robot contracts the sequencer
+        # uses, surfaced for hand-driving one leg from the browser.
+        "/reposition/goto",
+        "/reposition/status",
+        "/reference_path_recipe",
+        "/bag/cmd",
+        "/bag/status",
     ):
         assert topic in text

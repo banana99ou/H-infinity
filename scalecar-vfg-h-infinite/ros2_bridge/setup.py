@@ -25,6 +25,7 @@ setup(
             'reposition_node = limo_path_follower.reposition_node:main',
             'experiment_sequencer_node = limo_path_follower.experiment_sequencer_node:main',
             'ops_node = limo_path_follower.ops_node:main',
+            'bag_node = limo_path_follower.bag_node:main',
         ],
     },
 )

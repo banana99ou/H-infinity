@@ -32,6 +32,10 @@ ORCH_NAMES = {
     # republishes onto /orchestrator/*, /experiment/cmd, /estop_trigger, so it
     # is deliberately NOT in the motion-capable refuse-set in cmd_start().
     "ops",
+    # Manual-mode bag recorder (orchestrator_node.PROCS['bag'] ->
+    # ros2 run limo_path_follower bag_node). Records only (publishes /bag/status,
+    # never cmd_vel*), so like 'ops' it is NOT in the motion-capable refuse-set.
+    "bag",
 }
 
 

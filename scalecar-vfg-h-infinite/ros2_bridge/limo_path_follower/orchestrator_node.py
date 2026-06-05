@@ -83,6 +83,16 @@ PROCS = {
     'ops': [
         'ros2', 'run', 'limo_path_follower', 'ops_node',
     ],
+    # Manual-mode bag recorder (T7, operator flow): topic-controlled
+    # start/stop via /bag/cmd, status on /bag/status. Records the SAME D1
+    # topic set + sidecar as the sequencer, but driven by the battle-station
+    # for a hand-run leg instead of by the matrix state machine. Records only
+    # (never publishes cmd_vel*), so it is outside the safety chain. Soft
+    # mutually-exclusive with the sequencer (it refuses to start while a run
+    # is active) — start it only when the sequencer is idle.
+    'bag': [
+        'ros2', 'run', 'limo_path_follower', 'bag_node',
+    ],
 }
 
 EXCLUSIVE = {'base_vanilla', 'base_gnss'}

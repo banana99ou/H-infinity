@@ -123,9 +123,18 @@ blocked.
 ```
 bash ~/H-infinity/tools/orchestrator/start_battle.sh   # rosbridge :9090 + orchestrator
 ```
-Then start exactly these four processes (battle-station supervisor buttons, or
+Then start these processes (battle-station supervisor buttons, or
 `ros2 topic pub --once /orchestrator/start std_msgs/String '{data: <name>}'`):
-`base_gnss`, `estop`, `odom_zero`, `ops`.
+`base`, `gnss`, `heading`, `estop`, `odom_zero`, `ops`, `geofence`, `odom_watchdog`.
+(`tools/ops/field_smoke.sh` does this whole bring-up + gates + arm for you.)
+**`base` (chassis) and `gnss` (mavros+RTK) are split** so the `odom_watchdog` can
+respawn just the chassis driver on a base-serial dropout without dropping
+RTK/compass. The combined `base_gnss` is a legacy fallback (do not run it
+alongside `base`/`gnss`). **`heading`** is the always-on heading EKF
+(`heading_node`): it must be up before any reposition leg — `reposition` consumes
+its `/heading/fused` and HOLDs (zero output) without it; it publishes only
+`/heading/*`, never `cmd_vel*` (ADR-01). No pre-run reboot is needed — recovery
+is autonomous.
 Do **not** hand-start `sequencer_smoke`, `follower`, or `reposition` — the arm
 command (step 3) starts the sequencer, and the sequencer brings up
 `follower`/`reposition`/`odom_zero` itself in C6-safe order (exactly one

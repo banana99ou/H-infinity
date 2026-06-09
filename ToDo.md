@@ -5,6 +5,105 @@ Working checklist for getting the professor-provided H-infinity stack from
 
 ## Status
 
+**2026-06-08 base-serial dropout survival (laptop code; NUC offline — DEFERRED steps below).**
+Root cause from the 2026-06-05 field run: the chassis↔NUC USB (CP2102 `/dev/limo_base`)
+drops under **vibration** → `/wheel/odom` silent → preflight fails / would drive blind.
+Kernel re-enumerates `ttyUSB` each drop; reboot is the manual fix; driver self-heals
+intermittently. Operator ruled OUT: physical reseat (warranty), speed reduction (experiment
+var), pre-run reboot (time + a failure point). So: **survive in software, fully autonomous**.
+Implemented (laptop, build-clean: py_compile/bash -n/yaml all OK):
+- **Part 0 — split `base_gnss` → `base` (chassis) + `gnss` (mavros+RTK)** so recovery is
+  chassis-only and never drops RTK/compass (separate USB: CP2102 vs ttyACM). `orchestrator_node.py`
+  PROCS `base`/`gnss`/`odom_watchdog`; `EXCLUSIVE={base,base_vanilla,base_gnss}`. `field_smoke.sh`
+  brings up `base gnss estop odom_zero ops odom_watchdog`. `limo_ops.py` names updated. `base_gnss`
+  kept as legacy fallback.
+- **Part 1 — `tools/safety/odom_watchdog.py`** (geofence-pattern): on `/wheel/odom` silence while
+  `base` alive → grace(~3s self-heal) → respawn `base` → USB rebind → give-up+notify. Cooldown 20s.
+  `tools/safety/usb_rebind_limo_base.sh` (sudo helper; NOPASSWD setup needed; PORT derivation
+  best-effort — VERIFY on NUC).
+- **Part 2 — sequencer odom-loss pause + auto-resume** (mirrors RTK F2): subscribe `/wheel/odom`,
+  `odom_loss_wait_s` param (1.0s), `_tick` guard → `_request_pause("odom loss (base serial)")` in
+  leg-execution phases (robot stops fast), `_tick_paused` auto-resume when odom returns → re-does
+  the leg cleanly (data integrity preserved).
+- **Part 3 — failure tolerance**: `smoke.yaml`+`experiment.yaml` `max_retries:2`,
+  `circuit_breaker_k:3` (backstop for preflight-time drops). No speed/path change, no reboot.
+  `deployment.md` runbook bring-up set updated.
+
+VALIDATED ON ROBOT 2026-06-08 (NUC via LAN 192.168.0.54; Tailscale was down):
+- `gnss`-only launch `MAVROS+RTK_Node_Launcher.launch.py` created on NUC
+  (`~/agilex_ws/src/limo_ros2/limo_base/launch/`, = combined minus limo_base node), colcon-built,
+  resolves via `ros2 launch limo_base ...`. Repo copy: `tools/launch/` (+ README; manual-deploy).
+- `base` PROC = `limo_base.launch.py port_name:=limo_base` (pins udev symlink, not the launch's
+  bare ttyUSB1 default). Synced + colcon-built; limo-battle.service restarted to reload PROCS.
+- **Split bring-up PASS:** `base`+`gnss` come up as independent PROCs (status both true); chassis
+  topics from base (/wheel/odom 50 Hz, /limo_status batt 12.9 V, Ackermann), RTK+mavros from gnss.
+- **FAITHFUL device-drop test PASS (answers "does respawn fix it?" = YES):** drop the CP2102 from
+  the KERNEL via `echo <port> >/sys/bus/usb/drivers/usb/{unbind,bind}` (NOT `kill -STOP` — a process
+  freeze leaves the device present so a respawn trivially reconnects, proves nothing). On unbind:
+  `/dev/limo_base` GONE, ttyUSB1 removed, odom SILENT, **gnss/RTK stayed up** (separate ttyACM USB).
+  On rebind: **udev re-created `/dev/limo_base` → ttyUSB2** (number changed, by-port rule held). The
+  driver does NOT self-heal (holds dead fd) → a respawn is required. With the **watchdog live**, a
+  realistic transient drop (unbind→2s→rebind) → watchdog logged "recovering"→"recovered", odom back
+  in ~6 s, **single clean base node, RTK never dropped** — fully autonomous.
+- **Split bring-up PASS:** `base`+`gnss` independent PROCs (status both true); chassis topics from
+  base, RTK+mavros from gnss. (Note: 3 s `ros2 topic hz` + grep on truncated /orchestrator/status
+  gave false SILENT/DOWN reads — use ≥8 s hz + a JSON parse of the full status.)
+- **Operator paging on give-up (wired + path-verified):** odom_watchdog now Discord-pages ONCE per
+  outage if respawn+rebind both fail ("UNRECOVERABLE … manual reboot needed") via
+  `tools/notify/ntfy.py` `notify_discord` (resolves `discord.env`, verified configured), + an
+  all-clear on recovery. (Previously it only logged + published /odom_watchdog/status.) Live
+  webhook test to operator's phone not yet fired (avoid spam) — fire on request.
+
+STILL TODO (need motion / operator present, or extra setup):
+1. **Sequencer odom-F2 pause+resume during an armed RUN** — code-verified + mirrors RTK F2, but not
+   run-tested with wheels moving. Verify on the next live run.
+2. **USB-rebind escalation tier** — verify `usb_rebind_limo_base.sh` PORT derivation vs real sysfs
+   (`…/usb1/1-7/1-7.4/…`) + set NOPASSWD sudoers; only triggers if a plain respawn fails.
+3. Full smoke e2e (outdoors, RTK FIXED).
+
+**OPS LESSON:** restarting `limo-battle.service` to reload orchestrator PROCS **orphans** the
+running child procs (they keep running untracked) → manual re-starts then stack duplicates
+(hit 2× odom_watchdog / 3× ops during testing; cleaned via pkill). When changing PROCS: tear down
+all procs first (or reboot) before restarting the orchestrator. See [[project_orphan_odom_zero_hazard]].
+
+**2026-06-05 indoor prep #2 (laptop+NUC, non-motion) — for the next outdoor run.**
+- Phase 1 committed+pushed (f83ad91 compass, a96784a path_override, geofence tracked).
+- A1 fix: `_write_sidecar` referenced the removed `RTK_FIXED_TOKEN` → a swallowed NameError
+  that silently dropped EVERY leg's sidecar (PASS needs bag+sidecar). Now `ok_qualities`.
+- A2 fix: reposition reads `compass_offset_rad` from the venue JSON in `_load_venue` — the
+  sequencer kills/re-spawns reposition each leg so in-memory auto-cal doesn't survive, and
+  an on-pin reposition has no calibrating drive. VERIFIED on NUC (injected -1.2345 rad →
+  logged "compass offset loaded from venue: -70.7 deg").
+- A3 fix: reposition now PERSISTS its auto-cal back to the venue JSON (atomic write,
+  preserves all fields) the moment it self-calibrates. So the SYSTEM self-calibrates on
+  its first reposition drive and every later leg boots calibrated — NO manual cal-drive,
+  NO driving components by hand. Write logic unit-tested locally; live trigger is field-only.
+- A1/A2/A3 synced + colcon-built + confirmed INSTALLED on NUC; modules import clean.
+- `geofence` PROC was MISSING from the RUNNING orchestrator (it predated the commit);
+  restarted `limo-battle.service` → orchestrator now arms the 4-corner rooftop polygon.
+- Battery 12.6 V (full). `/wheel/odom` 49.9 Hz (dual-CP2102 udev fix holds).
+- **Pixhawk gotcha (finding):** indoors the FCU (connected:true) streams ONLY raw IMU
+  (imu/data_raw 50Hz, imu/mag 13Hz); ALL fused topics silent — `compass_hdg`, `imu/data`,
+  `global_position/*`, `rel_alt`. Per-msg (VFR_HUD) + bulk (set_stream_rate ALL) requests
+  had no effect. Treated as expected (EKF needs GPS; prior OUTDOOR reading 311.79°). The
+  one-shot GATES on compass_hdg being live. See [[project_pixhawk_compass_needs_gps]].
+- **One-shot field script `tools/ops/field_smoke.sh`** (+ `watch_experiment.py` monitor):
+  bring-up → RTK{4,5} gate → compass-live gate → preflight → geofence(after RTK) → arm
+  run_smoke_e2e → watch to terminal, safe-stop on anything but a clean done. Gate+abort
+  logic dry-run-validated indoors (correctly aborts at RTK gate, q=0). `--gates-only` =
+  non-motion dry run.
+
+NEXT OUTDOOR RUN — now ONE command + watch (stack idle: rosbridge+orchestrator up):
+1. Ackermann switch ON. Place robot at/near START pin S1 facing ~E1, wheels on floor,
+   RTK base up. (If reposition limit-cycles, place ~1-2 m back from S1 for a cal drive.)
+2. `bash ~/H-infinity/tools/ops/field_smoke.sh`  (add `--gates-only` first if you want a
+   no-motion check). It gates on RTK + a LIVE compass before any motion, self-calibrates
+   (A3) on the first reposition, then drives the legs. Watch the streamed phase log.
+3. PASS = phase=done, fail=0, bag + sidecar (A1) under `Experiment Data/`. The script
+   safe-stops (kill movers + estop) on any non-clean outcome.
+4. If compass_hdg is silent even under RTK → script aborts at the compass gate; that's the
+   real blocker to chase (autopilot stream/EKF, or COG/raw-mag fallback).
+
 **2026-06-05 field session END (robot rebooted on low battery; operator inside).**
 _Test location: the pedestrian road in front of the lab — the venue keeps its
 legacy `rooftop` codename (`scenarios/venues/rooftop.json`)._

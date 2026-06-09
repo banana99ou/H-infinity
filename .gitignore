@@ -12,6 +12,9 @@ tools/indoor_test/out/
 Experiment Data/
 tools/analysis/*_out/
 
+# Syncthing conflict copies (this repo syncs across MacBook/NUC/NAS)
+*.sync-conflict-*
+
 # Secrets — never commit (webhook URLs etc.)
 discord.env
 *.env

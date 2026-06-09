@@ -16,6 +16,7 @@ loop.
 | `DOC/system_spec.md` | **What the system must be** — locked requirements (ROC), the canonical interface contract (§4), acceptance criteria. Start here. |
 | `DOC/experiment.md` | **Why + how** — the curvature-sweep pivot, the experimental matrix, the per-cell operational model, orchestrator target state. |
 | `DOC/deployment.md` | NUC deployment caveats, support-script inventory, data-flow diagram, runbook. |
+| `DOC/agent_field_runbook.md` | **Agent runbook** — how an AI agent starts the autonomous test from a cold boot and supervises it live (monitor matrix + normal-vs-intervene table) so a rooftop run goes smoothly. Start procedure reconciles to `deployment.md`. |
 | `DOC/network_topology.md` | Field network (phone-on-robot + USB tether + LIMO AP) for outdoor RTK; RTK base subtopology (Pi + base F9P) for the helical F9P's RTCM source. |
 | `DOC/decisions/` | Architecture Decision Records. ADR-01: GPS stays out of the control loop. |
 | `DOC/paper_ijat.pdf` | The sim paper this work follows up on. |

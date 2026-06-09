@@ -48,7 +48,10 @@ gating:
 
 retry:
   # Auto-retry a failed leg this many times before skipping the cell (O4).
-  max_retries: 1
+  # 2 so a transient base-serial odom dropout that slips through as a leg-fail
+  # retries cleanly (in-run drops are handled by the sequencer odom pause+resume
+  # + odom_watchdog; this is the backstop for preflight-time drops).
+  max_retries: 2
   # Halt the whole batch after this many consecutive leg failures (F4).
   circuit_breaker_k: 3
 

@@ -51,6 +51,7 @@ from rcl_interfaces.srv import SetParameters
 from rcl_interfaces.msg import ParameterValue, ParameterType
 from rcl_interfaces.msg import Parameter as ParameterMsg
 from std_msgs.msg import String, Bool
+from nav_msgs.msg import Odometry
 
 # --- Recorder (T7) lives at the repo root, outside the colcon package. -------
 # CLAUDE.md / the shared contract say to import it by adding the repo root to
@@ -187,6 +188,12 @@ class ExperimentSequencer(Node):
         self.declare_parameter("orchestrator_settle_s", 3.0)
         # RTK persistent-loss wait (F2) before pausing the batch.
         self.declare_parameter("rtk_loss_wait_s", 30.0)
+        # Odom-loss wait before pausing: the chassis↔NUC USB (CP2102) drops under
+        # vibration -> /wheel/odom goes silent -> the follower would drive on a
+        # stale belief. SHORT (odom is ~50 Hz, so 1 s of silence is a real drop)
+        # so the robot stops fast; odom_watchdog respawns the chassis driver and
+        # we auto-resume. Mirrors the RTK F2 path.
+        self.declare_parameter("odom_loss_wait_s", 1.0)
         # Heartbeat interval for status republish + ntfy wallclock (M3).
         self.declare_parameter("heartbeat_s", 30.0)
 
@@ -200,6 +207,7 @@ class ExperimentSequencer(Node):
         self._run_timeout = float(self.get_parameter("run_timeout_s").value)
         self._settle_s = float(self.get_parameter("orchestrator_settle_s").value)
         self._rtk_loss_wait = float(self.get_parameter("rtk_loss_wait_s").value)
+        self._odom_loss_wait = float(self.get_parameter("odom_loss_wait_s").value)
         self._heartbeat_s = float(self.get_parameter("heartbeat_s").value)
 
         # -- Load config (experiment.yaml + venue json) ----------------
@@ -276,6 +284,9 @@ class ExperimentSequencer(Node):
 
         # RTK-loss tracking (F2/F3).
         self._rtk_lost_since = None
+        # Odom-loss tracking (base-serial dropout): wall-time of the last
+        # /wheel/odom message; staleness = no message for > odom_loss_wait.
+        self._last_odom_t = None
 
         # Odom-zero confirmation (closes the open-loop reset gap from the
         # 2026-05-27 B1 bring-up). _odom_reset_command_t is the ros-time when
@@ -315,6 +326,9 @@ class ExperimentSequencer(Node):
         self.create_subscription(Bool, "/estop", self._on_estop, 10)
         self.create_subscription(
             String, "/gps_rtk_f9p_helical/gps/rtk_status", self._on_rtk, 10)
+        # /wheel/odom health (base-serial dropout watchdog). limo_base publishes
+        # it RELIABLE, so a default sub matches (unlike the mavros compass).
+        self.create_subscription(Odometry, "/wheel/odom", self._on_odom, 10)
         # Odom-zero latch confirmation -- latched so we see the current state on
         # subscribe even if the overlay has been up since before us.
         self.create_subscription(
@@ -527,6 +541,17 @@ class ExperimentSequencer(Node):
         elif self._rtk_lost_since is None:
             self._rtk_lost_since = time.monotonic()
 
+    def _on_odom(self, msg):
+        # Base-serial dropout watchdog: just stamp arrival; staleness is judged
+        # in _tick. (Presence, not content — a frozen-but-arriving stream is a
+        # separate concern handled by the follower's own logic.)
+        self._last_odom_t = time.monotonic()
+
+    def _odom_stale(self):
+        """True once we've seen odom and it has since gone silent past the wait."""
+        return (self._last_odom_t is not None
+                and (time.monotonic() - self._last_odom_t) > self._odom_loss_wait)
+
     def _on_limo(self, msg):
         try:
             self._battery_v = float(msg.battery_voltage)
@@ -738,6 +763,22 @@ class ExperimentSequencer(Node):
                 f"[{self.run_id}] RTK FIXED lost > {self._rtk_loss_wait:.0f}s — "
                 "paused; will auto-resume on reacquire.",
                 title="H-inf RTK loss", priority="high", tags="satellite")
+            return
+
+        # Odom loss (base-serial dropout under vibration): pause FAST so the
+        # follower never drives on a stale belief. Fires in any leg-execution
+        # phase (PREFLIGHT excluded — preflight.sh gates odom there and a fail
+        # retries cleanly). odom_watchdog respawns the chassis driver; we
+        # auto-resume below when /wheel/odom returns. RTK/compass stay up (separate
+        # USB), so the RTK F2 path does not also fire.
+        if (self._odom_stale()
+                and self.phase not in (Phase.IDLE, Phase.PREFLIGHT, Phase.NEXT,
+                                       Phase.DONE, Phase.ABORTED, Phase.PAUSED)):
+            self._request_pause("odom loss (base serial)")
+            _notify(
+                f"[{self.run_id}] /wheel/odom lost > {self._odom_loss_wait:.1f}s — "
+                "paused; odom_watchdog recovering, will auto-resume.",
+                title="H-inf odom loss", priority="high", tags="warning")
             return
 
         # Dispatch on phase.
@@ -1057,6 +1098,15 @@ class ExperimentSequencer(Node):
             _notify(f"[{self.run_id}] RTK reacquired — resuming.",
                     title="H-inf resume", tags="satellite")
             self._resume()
+            return
+        # Odom auto-resume: paused for a base-serial drop and /wheel/odom is back
+        # (odom_watchdog respawned the chassis driver). Re-does the leg cleanly.
+        if (self._pause_reason and "odom" in self._pause_reason
+                and self._last_odom_t is not None and not self._odom_stale()):
+            self.get_logger().info("odom recovered — auto-resuming")
+            _notify(f"[{self.run_id}] /wheel/odom recovered — resuming.",
+                    title="H-inf resume", tags="white_check_mark")
+            self._resume()
 
     # ==================================================================
     # Leg outcome handling: classify, retry, advance
@@ -1229,7 +1279,10 @@ class ExperimentSequencer(Node):
                 "fixed_pct": classification.get("rtk_fixed_pct"),
                 "fixed_samples": self._leg_rtk_fixed_samples,
                 "total_samples": self._leg_rtk_total_samples,
-                "token": RTK_FIXED_TOKEN,
+                # Accepted RTK qualities for this run (FIXED=4, FLOAT=5 TEMP).
+                # Was RTK_FIXED_TOKEN, removed in the {4,5} rename -> NameError
+                # that silently killed every sidecar write.
+                "ok_qualities": list(RTK_OK_QUALITIES),
             }
             wallclock = {
                 "start_utc": self._leg_start_utc,

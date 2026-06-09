@@ -27,12 +27,31 @@ from std_msgs.msg import String
 
 # Each entry is the bare command + args (excluding env sourcing). The
 # orchestrator wraps the call in `bash -lc 'source ...; <cmd>'` so the
-# child sees the ROS environment. base_vanilla and base_gnss are
-# mutually exclusive — starting one auto-kills the other.
+# child sees the ROS environment. Only ONE chassis-driver PROC may run at a time
+# (base / base_vanilla / base_gnss all open the chassis serial) — see EXCLUSIVE.
 PROCS = {
     'base_vanilla': [
         'ros2', 'launch', 'limo_base', 'limo_base.launch.py',
     ],
+    # Chassis driver ONLY (limo_base_node -> /wheel/odom, /limo_status, /cmd_vel),
+    # split out from mavros+RTK ('gnss') so the odom_watchdog can respawn JUST the
+    # chassis on a base-serial (CP2102) dropout WITHOUT dropping RTK/compass
+    # (those are on separate ttyACM* USB). The canonical field bring-up is
+    # `base` + `gnss` (not the combined base_gnss).
+    'base': [
+        # port_name:=limo_base pins the udev symlink (the launch defaults to the
+        # bare 'ttyUSB1', which can be the WRONG CP2102 after a re-enumeration —
+        # the dual-CP2102 hazard). The launch already remaps odom -> /wheel/odom.
+        'ros2', 'launch', 'limo_base', 'limo_base.launch.py', 'port_name:=limo_base',
+    ],
+    # mavros + RTK/GNSS ONLY (-> /pixhawk/* compass_hdg, /gps_rtk_*/gps/{fix,
+    # rtk_status}); the combined launcher minus the limo_base chassis node.
+    # NUC step: create this launch by factoring LIMO+MAVROS+RTK_Node_Launcher.
+    'gnss': [
+        'ros2', 'launch', 'limo_base', 'MAVROS+RTK_Node_Launcher.launch.py',
+    ],
+    # Combined chassis+mavros+RTK (legacy/fallback; prefer base+gnss so recovery
+    # can be chassis-only). Kept for backward compatibility.
     'base_gnss': [
         'ros2', 'launch', 'limo_base', 'LIMO+MAVROS+RTK_Node_Launcher.launch.py',
     ],
@@ -102,9 +121,19 @@ PROCS = {
         'python3', '/home/agilex/H-infinity/tools/safety/geofence_watchdog.py',
         '--venue', '/home/agilex/H-infinity/scenarios/venues/rooftop.json',
     ],
+    # Base-serial dropout recovery: watches /wheel/odom; when it goes silent
+    # while 'base' is alive (the vibration-induced CP2102 drop), it respawns the
+    # chassis driver (grace -> kill/start base -> USB rebind -> give up) so an
+    # unattended batch self-recovers without a reboot. RTK/compass untouched.
+    'odom_watchdog': [
+        'python3', '/home/agilex/H-infinity/tools/safety/odom_watchdog.py',
+        '--base-proc', 'base',
+    ],
 }
 
-EXCLUSIVE = {'base_vanilla', 'base_gnss'}
+# Only one chassis-driver PROC at a time (all open the chassis serial). 'gnss'
+# (mavros+RTK) is NOT here — it runs alongside 'base' in the split bring-up.
+EXCLUSIVE = {'base', 'base_vanilla', 'base_gnss'}
 
 LOG_DIR = '/tmp/limo_orchestrator'
 

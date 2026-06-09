@@ -35,8 +35,12 @@ gating:
   rtk_run_window_pct: 50  # relaxed for smoke; matrix wants 95
 
 retry:
-  max_retries: 0          # smoke: no auto-retry, surface every failure
-  circuit_breaker_k: 1    # halt after a single leg failure
+  # Tolerate the known intermittent base-serial (CP2102) odom dropout: a drop
+  # that slips through as a leg-fail (e.g. at preflight) retries cleanly instead
+  # of halting. In-run/setup drops are handled earlier by the sequencer odom
+  # pause+auto-resume + odom_watchdog, so these rarely fire.
+  max_retries: 2
+  circuit_breaker_k: 3    # halt only after 3 consecutive fails, not one drop
 
 ntfy:
   server: https://ntfy.sh

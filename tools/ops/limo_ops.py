@@ -19,6 +19,9 @@ import time
 ORCH_NAMES = {
     "base_vanilla",
     "base_gnss",
+    # Split chassis driver (motion-capable: it's the actuator) + mavros/RTK only.
+    "base",
+    "gnss",
     "estop",
     "odom_zero",
     "follower",
@@ -36,6 +39,10 @@ ORCH_NAMES = {
     # ros2 run limo_path_follower bag_node). Records only (publishes /bag/status,
     # never cmd_vel*), so like 'ops' it is NOT in the motion-capable refuse-set.
     "bag",
+    # Safety watchdogs (publish /estop_trigger or respawn 'base'; never cmd_vel*),
+    # so NOT in the motion-capable refuse-set.
+    "geofence",
+    "odom_watchdog",
 }
 
 
@@ -100,7 +107,7 @@ def cmd_start(args) -> int:
     if args.name not in ORCH_NAMES:
         print(f"unknown orchestrator process '{args.name}'. Known: {sorted(ORCH_NAMES)}", file=sys.stderr)
         return 2
-    if args.name in {"base_vanilla", "base_gnss", "follower", "reposition", "sequencer", "sequencer_smoke"} and not args.allow_motion_capable:
+    if args.name in {"base", "base_vanilla", "base_gnss", "follower", "reposition", "sequencer", "sequencer_smoke"} and not args.allow_motion_capable:
         print(
             f"REFUSE: '{args.name}' is motion-capable or can lead to motion. "
             "Pass --allow-motion-capable after confirming the robot state.",

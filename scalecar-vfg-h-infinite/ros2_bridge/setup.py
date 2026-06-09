@@ -27,6 +27,8 @@ setup(
             'experiment_sequencer_node = limo_path_follower.experiment_sequencer_node:main',
             'ops_node = limo_path_follower.ops_node:main',
             'bag_node = limo_path_follower.bag_node:main',
+            'venue_loader_node = limo_path_follower.venue_loader_node:main',
+            'run_executor_node = limo_path_follower.run_executor_node:main',
         ],
     },
 )

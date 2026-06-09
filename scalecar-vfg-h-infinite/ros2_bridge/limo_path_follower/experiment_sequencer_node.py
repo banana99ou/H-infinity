@@ -196,6 +196,18 @@ class ExperimentSequencer(Node):
         self.declare_parameter("odom_loss_wait_s", 1.0)
         # Heartbeat interval for status republish + ntfy wallclock (M3).
         self.declare_parameter("heartbeat_s", 30.0)
+        # System-level venue-containment gate. BEFORE any motion, verify every
+        # planned movement stays inside the venue polygon minus margins: the
+        # follower reference path for EACH leg (the step curve the robot actually
+        # drives), plus a clearance disc bounding reposition + the turnaround at
+        # each pin. Refuses to start the batch if anything would leave the box —
+        # instead of only catching it reactively (R3 / geofence) after the robot
+        # has already crossed the edge. Margins are tunable; set
+        # containment_check:=false to disable.
+        self.declare_parameter("containment_check", True)
+        self.declare_parameter("robot_footprint_radius_m", 0.30)
+        self.declare_parameter("path_tracking_margin_m", 0.30)
+        self.declare_parameter("maneuver_clearance_m", 1.0)
 
         self._yaml_path = self.get_parameter("experiment_yaml").value
         self._preflight_path = self.get_parameter("preflight_path").value
@@ -209,6 +221,10 @@ class ExperimentSequencer(Node):
         self._rtk_loss_wait = float(self.get_parameter("rtk_loss_wait_s").value)
         self._odom_loss_wait = float(self.get_parameter("odom_loss_wait_s").value)
         self._heartbeat_s = float(self.get_parameter("heartbeat_s").value)
+        self._containment_check = bool(self.get_parameter("containment_check").value)
+        self._footprint_r = float(self.get_parameter("robot_footprint_radius_m").value)
+        self._track_margin = float(self.get_parameter("path_tracking_margin_m").value)
+        self._maneuver_clr = float(self.get_parameter("maneuver_clearance_m").value)
 
         # -- Load config (experiment.yaml + venue json) ----------------
         self._cfg = self._load_yaml(self._yaml_path)
@@ -668,6 +684,147 @@ class ExperimentSequencer(Node):
         return {"type": "step", "params": params}
 
     # ==================================================================
+    # Venue containment (system-level preflight gate)
+    # ==================================================================
+    @staticmethod
+    def _latlon_to_en(lat, lon, lat0, lon0):
+        """Equirectangular lat/lon -> local (East, North) metres about (lat0,lon0)."""
+        mlat = 111320.0
+        mlon = 111320.0 * math.cos(math.radians(lat0))
+        return ((lon - lon0) * mlon, (lat - lat0) * mlat)
+
+    @staticmethod
+    def _pt_in_poly(pt, poly):
+        x, y = pt
+        inside = False
+        n = len(poly)
+        for i in range(n):
+            x1, y1 = poly[i]
+            x2, y2 = poly[(i + 1) % n]
+            if ((y1 > y) != (y2 > y)) and \
+                    (x < (x2 - x1) * (y - y1) / (y2 - y1) + x1):
+                inside = not inside
+        return inside
+
+    @staticmethod
+    def _dist_to_seg(p, a, b):
+        px, py = p
+        ax, ay = a
+        bx, by = b
+        dx, dy = bx - ax, by - ay
+        if dx == 0.0 and dy == 0.0:
+            return math.hypot(px - ax, py - ay)
+        t = max(0.0, min(1.0, ((px - ax) * dx + (py - ay) * dy) / (dx * dx + dy * dy)))
+        return math.hypot(px - (ax + t * dx), py - (ay + t * dy))
+
+    def _clearance(self, pt, poly):
+        """Signed clearance to the polygon boundary: + inside, - outside (metres)."""
+        d = min(self._dist_to_seg(pt, poly[i], poly[(i + 1) % len(poly)])
+                for i in range(len(poly)))
+        return d if self._pt_in_poly(pt, poly) else -d
+
+    def _recipe_points_en(self, recipe, pin, lat0, lon0, StepCls):
+        """Sample a leg recipe's analytic path and place it at the pin pose
+        (+x along heading_deg), returning [(E, N, s_arclen), ...] in local metres.
+        Mirrors the follower's build_path_from_recipe placement (path_overlay
+        convention) so we check the exact curve the robot drives."""
+        if StepCls is None:
+            return []
+        params = recipe.get("params", {}) or {}
+        ptype = str(recipe.get("type", "")).lower()
+
+        def _f(k, d):
+            return float(params.get(k, d))
+
+        def _i(k, d):
+            return int(params.get(k, d))
+
+        if ptype == "step":
+            path = StepCls(L1=_f("L1", 5.0), R=_f("R", 0.5),
+                           theta_arc=_f("theta_arc", math.pi / 2),
+                           L2=_f("L2", 5.0), direction=_i("direction", 1))
+        elif ptype == "uturn":
+            path = StepCls(L1=_f("L1", 1.0), R=_f("R", 0.5),
+                           theta_arc=math.pi, L2=_f("L2", 1.0),
+                           direction=_i("direction", 1))
+        else:
+            return []  # slalom / unknown: not geometry-checked here
+        total = float(path.total_length)
+        h = math.radians(float(pin.get("heading_deg", 0.0)))
+        # local +x (forward) at compass bearing h E-of-N -> (E,N)=(sin h, cos h);
+        # +y (left) is +90 deg CCW -> (-cos h, sin h). Matches path_overlay.
+        fE, fN = math.sin(h), math.cos(h)
+        lE, lN = -math.cos(h), math.sin(h)
+        e0, n0 = self._latlon_to_en(pin["lat"], pin["lon"], lat0, lon0)
+        n = max(2, int(total / 0.10))
+        out = []
+        for i in range(n + 1):
+            s = total * i / n
+            p = path.position(s)
+            px, py = float(p[0]), float(p[1])
+            out.append((e0 + px * fE + py * lE, n0 + px * fN + py * lN, s))
+        return out
+
+    def _check_venue_containment(self):
+        """System-level gate run BEFORE any motion: verify every planned movement
+        fits inside the venue polygon minus margins. Checks each leg's follower
+        path precisely, plus a reposition/turnaround clearance disc at each pin.
+        Returns (ok: bool, human_report: str)."""
+        if not self._containment_check:
+            return True, "containment check disabled (containment_check=false)"
+        corners = self._venue.get("corners_wgs84") or []
+        if len(corners) < 3:
+            return True, "no venue polygon (corners_wgs84) — containment UNCHECKED"
+        lat0, lon0 = corners[0]["lat"], corners[0]["lon"]
+        poly = [self._latlon_to_en(c["lat"], c["lon"], lat0, lon0) for c in corners]
+        margin = float(self._venue.get("safety_margin_m", 0.0))
+        req_path = margin + self._footprint_r + self._track_margin
+        req_disc = margin + self._maneuver_clr
+        try:
+            from vfg_pathfollowing.paths.step_curvature import StepCurvaturePath
+        except Exception as exc:
+            self.get_logger().warn(
+                f"containment: StepCurvaturePath import failed ({exc}); "
+                "follower-path geometry UNVERIFIED (disc check still applies).")
+            StepCurvaturePath = None
+        legs = [(Leg.A_TO_B, self._pin_A), (Leg.B_TO_A, self._pin_B)]
+        viol = []          # (label, deficit_m, clearance_m)
+        worst = None       # tightest path clearance seen (for the OK report)
+        for cell in self._cells:
+            for leg, anchor in legs:
+                if anchor is None:
+                    continue
+                recipe = self._recipe_for_leg(cell, leg)
+                for (e, nn, s) in self._recipe_points_en(
+                        recipe, anchor, lat0, lon0, StepCurvaturePath):
+                    cl = self._clearance((e, nn), poly)
+                    worst = cl if worst is None else min(worst, cl)
+                    if cl < req_path:
+                        viol.append((f"{cell.get('cell_id', '?')} {leg.value} @s={s:.1f}m",
+                                     req_path - cl, cl))
+        for pin in (self._pin_A, self._pin_B):
+            if pin is None:
+                continue
+            cl = self._clearance(
+                self._latlon_to_en(pin["lat"], pin["lon"], lat0, lon0), poly)
+            if cl < req_disc:
+                viol.append((f"pin {pin.get('id', '?')} maneuver-disc(r={self._maneuver_clr:.1f}m)",
+                             req_disc - cl, cl))
+        head = (f"margin={margin:.2f} footprint={self._footprint_r:.2f} "
+                f"track={self._track_margin:.2f} -> path needs {req_path:.2f}m clear; "
+                f"disc needs {req_disc:.2f}m")
+        if viol:
+            viol.sort(key=lambda v: -v[1])
+            lines = [head, f"{len(viol)} containment violation(s); worst {viol[0][1]:.2f}m short:"]
+            lines += [f"  - {lbl}: {cl:+.2f}m clearance ({d:.2f}m short)"
+                      for (lbl, d, cl) in viol[:6]]
+            if len(viol) > 6:
+                lines.append(f"  ... +{len(viol) - 6} more")
+            return False, "\n".join(lines)
+        ok_tail = f"; OK (tightest path clearance {worst:.2f}m)" if worst is not None else "; OK"
+        return True, head + ok_tail
+
+    # ==================================================================
     # State machine
     # ==================================================================
 
@@ -689,6 +846,18 @@ class ExperimentSequencer(Node):
             self.get_logger().error("no cells to run — check experiment.yaml matrix")
             self._enter(Phase.DONE)
             return
+        # System-level containment gate: refuse to arm if any planned movement
+        # would leave the venue (vs. catching it after the robot crosses the edge).
+        ok, report = self._check_venue_containment()
+        if not ok:
+            self.get_logger().error(
+                "VENUE CONTAINMENT FAILED — refusing to start (no motion):\n" + report)
+            _notify("Run REFUSED — a planned movement leaves the venue:\n" + report,
+                    title="H-inf experiment", tags="warning")
+            self._publish_status(message="refused: planned path leaves venue (see log)")
+            self._enter(Phase.ABORTED)
+            return
+        self.get_logger().info("venue containment OK — " + report)
         if not self._batch_start_notified:
             _notify(
                 f"Batch '{self.run_id}' starting: {self.n_cells} cells.",

@@ -124,14 +124,32 @@ PROCS = {
     'bag': [
         'ros2', 'run', 'limo_path_follower', 'bag_node',
     ],
+    # Operator-authored leg-batch flow (replaces the autonomous pin/matrix path
+    # on tight/noisy venues). venue_loader receives the WebUI 'Send to NUC'
+    # payload (/venue/load), validates + persists active.json, and auto-restarts
+    # 'geofence' on a polygon change. Publishes nothing to cmd_vel* (safe always).
+    'venue_loader': [
+        'ros2', 'run', 'limo_path_follower', 'venue_loader_node',
+    ],
+    # run_executor runs the persisted leg batch on a single /run/go (Start),
+    # resuming at the first incomplete leg. It drives reposition (drawn curve,
+    # RTK) + follower (analytic recipe, odom) through the SAME C6 mover-exclusion
+    # as the sequencer; it never publishes cmd_vel* itself. Mutually exclusive in
+    # spirit with 'sequencer' (both drive the movers) — run only one.
+    'run_executor': [
+        'ros2', 'run', 'limo_path_follower', 'run_executor_node',
+    ],
     # Run-time venue geofence (safety): watches the live RTK fix and latches a
     # hard E-stop via /estop_trigger if the robot leaves the venue polygon (or
     # RTK goes blind). The follower has no area guard during a recorded leg, so
     # this is the only thing that stops a mis-aimed leg before the roof edge.
     # Records/publishes nothing but /estop_trigger; safe alongside any leg.
+    # --venue points at active.json (the venue_loader-maintained current venue),
+    # so a 'Send to NUC' that changes the polygon + a geofence restart reload the
+    # new boundary. venue_loader auto-restarts this PROC on a polygon change.
     'geofence': [
         'python3', '/home/agilex/H-infinity/tools/safety/geofence_watchdog.py',
-        '--venue', '/home/agilex/H-infinity/scenarios/venues/rooftop.json',
+        '--venue', '/home/agilex/H-infinity/scenarios/venues/active.json',
     ],
     # Base-serial dropout recovery: watches /wheel/odom; when it goes silent
     # while 'base' is alive (the vibration-induced CP2102 drop), it respawns the

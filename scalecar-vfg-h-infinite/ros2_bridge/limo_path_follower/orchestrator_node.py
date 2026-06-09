@@ -77,9 +77,21 @@ PROCS = {
         'ros2', 'run', 'limo_path_follower', 'path_follower_node',
         '--ros-args', '-r', '/wheel/odom:=/wheel/odom_zeroed',
     ],
+    # Always-on yaw-heading EKF (heading_node). Fuses LIMO gyro + Pixhawk
+    # compass/mag + RTK course-over-ground into /heading/fused (compass bearing
+    # deg E-of-N), consumed by 'reposition' to converge arrival heading without
+    # the COG limit-cycle. UNLIKE reposition this is NOT per-leg: bring it up WITH
+    # the sensor stack (after 'base'+'gnss') and leave it running so its filter
+    # stays warm across the sequencer's per-leg kill/respawn of reposition — each
+    # new leg gets an already-converged heading. Publishes only /heading/* — never
+    # cmd_vel* (ADR-01). It also owns the venue compass_offset_rad calibration.
+    'heading': [
+        'ros2', 'run', 'limo_path_follower', 'heading_node',
+    ],
     # T4 (R1-R4, P3): RTK go-to-pose between recorded runs. Publishes cmd_vel_raw
     # only while repositioning. MUST NOT run concurrently with 'follower' (C6) —
-    # the sequencer enforces exactly one cmd_vel_raw publisher.
+    # the sequencer enforces exactly one cmd_vel_raw publisher. Consumes
+    # /heading/fused from 'heading' (bring 'heading' up first).
     'reposition': [
         'ros2', 'run', 'limo_path_follower', 'reposition_node',
     ],

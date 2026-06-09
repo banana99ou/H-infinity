@@ -410,6 +410,77 @@
       polygon = corners minus margin; curves must fit it and clear exclusions.
     </div>
 
+    <!-- ============================================================
+         Leg batch (operator runs) — author venue + ordered legs (each a
+         reposition Bézier + a step recipe), Send to NUC, press Start. The
+         system runs the next incomplete leg onward. /venue/load + /run/*.
+         ============================================================ -->
+    <details id="legbatch-details" style="margin-top:10px;">
+      <summary><b>Leg batch (operator runs)</b></summary>
+      <div class="small" style="color:#6cf;">
+        Author legs (reposition Bézier &rarr; step recipe), Send to NUC, press
+        Start. Curves are fit-checked here with the SAME clearance the NUC
+        enforces (margin + footprint + tracking).
+      </div>
+
+      <h4 style="margin:8px 0 4px;">1 &middot; Reposition Bézier (glue, RTK)</h4>
+      <div class="row">
+        <button id="lb-bez-draw" class="primary">Draw Bézier (click map)</button>
+        <button id="lb-bez-clear">Clear points</button>
+      </div>
+      <div class="row" style="margin-top:4px;">
+        <label style="margin:0;">v <input type="number" id="lb-bez-v" value="0.40" step="0.05" min="0.05" max="0.6" style="width:58px;"> m/s</label>
+        <label style="margin:0;">pos tol <input type="number" id="lb-bez-postol" value="0.15" step="0.01" min="0.05" max="0.5" style="width:58px;"> m</label>
+      </div>
+      <div class="row" style="margin-top:4px;">
+        <label style="margin:0;">end heading <input type="number" id="lb-bez-heading" placeholder="auto" step="1" style="width:70px;"> deg</label>
+      </div>
+      <div class="stat" id="lb-bez-state">(no Bézier — click "Draw" then click &ge;2 map points)</div>
+      <button id="lb-bez-set" class="primary" style="margin-top:4px;">Set as leg reposition</button>
+
+      <h4 style="margin:10px 0 4px;">2 &middot; Step recipe (scored, odom)</h4>
+      <div class="row">
+        <label style="margin:0;">type
+          <select id="lb-rec-type"><option value="step">step</option><option value="uturn">uturn</option></select>
+        </label>
+        <label style="margin:0;">ctrl
+          <select id="lb-rec-ctrl"><option value="lpv-hinf">lpv-hinf</option><option value="pid-ff">pid-ff</option></select>
+        </label>
+      </div>
+      <div class="row" style="margin-top:4px;">
+        <label style="margin:0;">R <input type="number" id="lb-rec-R" value="0.50" step="0.05" min="0.3" style="width:55px;"></label>
+        <label style="margin:0;">L1 <input type="number" id="lb-rec-L1" value="1.0" step="0.1" min="0" style="width:55px;"></label>
+        <label style="margin:0;">&theta; <input type="number" id="lb-rec-theta" value="90" step="1" style="width:55px;">&deg;</label>
+      </div>
+      <div class="row" style="margin-top:4px;">
+        <label style="margin:0;">L2 <input type="number" id="lb-rec-L2" value="1.0" step="0.1" min="0" style="width:55px;"></label>
+        <label style="margin:0;">dir <select id="lb-rec-dir"><option value="1">left (+1)</option><option value="-1">right (-1)</option></select></label>
+        <label style="margin:0;">v <input type="number" id="lb-rec-v" value="0.50" step="0.05" min="0.05" max="1.5" style="width:55px;"></label>
+      </div>
+      <label style="margin-top:4px;"><input type="checkbox" id="lb-rec-scored" checked> scored (record bag + sidecar)</label>
+      <div class="small" id="lb-rec-startpose">start pose: (set a reposition Bézier first)</div>
+      <div class="stat" id="lb-rec-state">(set reposition to preview the recipe)</div>
+      <button id="lb-rec-set" class="primary" style="margin-top:4px;">Set as leg experiment</button>
+
+      <h4 style="margin:10px 0 4px;">3 &middot; Legs</h4>
+      <div class="row">
+        <button id="lb-add-leg" class="primary">Add leg</button>
+        <button id="lb-dup-ctrl">Dup last w/ other ctrl</button>
+        <button id="lb-clear-legs">Clear legs</button>
+      </div>
+      <div class="stat" id="lb-legs">legs: 0</div>
+
+      <h4 style="margin:10px 0 4px;">4 &middot; Send + run</h4>
+      <button id="lb-send" class="primary">Send to NUC</button>
+      <div class="small" id="lb-send-state"></div>
+      <div class="row" style="margin-top:6px;">
+        <button id="lb-start" class="primary">Start</button>
+        <button id="lb-pause">Pause</button>
+        <button id="lb-abort" class="estop" style="font-size:14px;padding:8px;">ABORT</button>
+      </div>
+      <div class="stat" id="lb-run-status" style="margin-top:6px;">(waiting for /run/status)</div>
+    </details>
+
     <h3>Manual control</h3>
     <div class="row">
       <button id="btn-stop">Stop scenario</button>
@@ -1104,6 +1175,9 @@ let topicOrchStart = null, topicOrchKill = null, topicOrchStatus = null;
 let topicRtkFix = null, topicPixhawkFix = null;
 let topicLimoStatus = null;                      // /limo_status (battery, motion mode)
 let topicExpStatus = null, topicExpCmd = null;   // T10 — /experiment/{status,cmd}
+// T12 — operator leg-batch flow (venue_loader + run_executor)
+let topicVenueLoad = null, topicVenueLoadStatus = null, topicVenueLoaded = null;
+let topicRunGo = null, topicRunCmd = null, topicRunStatus = null;
 let setParamsService = null;
 let lastOdomTime = 0, lastStatusTime = 0, odomCount = 0, statusCount = 0;
 let lastExpTime = 0, expCount = 0;                // T10 — sequencer freshness
@@ -1466,6 +1540,28 @@ function subscribeAll() {
     ros, name: '/reference_path_recipe', messageType: 'std_msgs/msg/String',
     queue_length: 1, latch: true
   });
+
+  // T12 — operator leg-batch flow. We PUBLISH the authored venue+legs to
+  // /venue/load and the Start/Pause/Abort triggers to /run/{go,cmd}; we
+  // SUBSCRIBE the latched confirmations + live run status (venue_loader +
+  // run_executor publish these TRANSIENT_LOCAL, so rosbridge replays the last
+  // sample on subscribe).
+  topicVenueLoad = new ROSLIB.Topic({
+    ros, name: '/venue/load', messageType: 'std_msgs/msg/String' });
+  topicVenueLoadStatus = new ROSLIB.Topic({
+    ros, name: '/venue/load_status', messageType: 'std_msgs/msg/String' });
+  topicVenueLoadStatus.subscribe(onVenueLoadStatus);
+  topicVenueLoaded = new ROSLIB.Topic({
+    ros, name: '/venue/loaded', messageType: 'std_msgs/msg/String' });
+  topicVenueLoaded.subscribe(onVenueLoaded);
+  topicRunGo = new ROSLIB.Topic({
+    ros, name: '/run/go', messageType: 'std_msgs/msg/String' });
+  topicRunCmd = new ROSLIB.Topic({
+    ros, name: '/run/cmd', messageType: 'std_msgs/msg/String' });
+  topicRunStatus = new ROSLIB.Topic({
+    ros, name: '/run/status', messageType: 'std_msgs/msg/String' });
+  topicRunStatus.subscribe(onRunStatus);
+
   refreshManualPins();
 
   // Path-follower v_const setter
@@ -1484,6 +1580,7 @@ const STACK_LABELS = {
   estop:        'estop_cli',
   odom_zero:    'odom_zero_node',
   follower:     'path_follower_node',
+  heading:      'heading_node (fused heading)',
   reposition:   'reposition_node',
   sequencer:    'experiment_sequencer_node',
   ops:          'ops_node',
@@ -2381,6 +2478,7 @@ function venuePlaceAt(latlng) {
   $('venue-place-hint').textContent = venueHintText();
 }
 map.on('click', (e) => {
+  if (lbBezEditMode) { lbBezierClickAt(e.latlng); return; }   // leg-batch Bézier authoring
   if (venuePlaceMode) { venuePlaceAt(e.latlng); return; }
   if (selectedVenueHandle) { selectedVenueHandle = null; drawVenue(); }   // background click clears selection
 });
@@ -2984,6 +3082,364 @@ setTimeout(() => {
   const lat0 = parseFloat($('lat').value), lon0 = parseFloat($('lon').value);
   if (isFinite(lat0) && isFinite(lon0)) map.setView([lat0, lon0], 20);
 }, 200);
+
+// ============================================================
+// T12 — Leg batch (operator runs). Author venue + ordered legs (each a
+// reposition Bézier + a step recipe), Send to NUC (/venue/load), Start
+// (/run/go). The recipe preview + fit-check use the SAME math as the NUC's
+// venue_geom + StepCurvaturePath, so green-in-browser == accepted-on-Send.
+// ============================================================
+const LB_FOOTPRINT_M = 0.30;   // matches run_executor/venue_loader params
+const LB_TRACK_M     = 0.30;
+
+// ---- geometry helpers (mirror venue_geom.py) ----
+function lbLatlonToEN(lat, lon, lat0, lon0) {
+  const mlat = 111320.0, mlon = 111320.0 * Math.cos(lat0 * Math.PI / 180);
+  return [(lon - lon0) * mlon, (lat - lat0) * mlat];
+}
+function lbDistToSeg(p, a, b) {
+  const dx = b[0]-a[0], dy = b[1]-a[1];
+  if (dx === 0 && dy === 0) return Math.hypot(p[0]-a[0], p[1]-a[1]);
+  let t = ((p[0]-a[0])*dx + (p[1]-a[1])*dy) / (dx*dx + dy*dy);
+  t = Math.max(0, Math.min(1, t));
+  return Math.hypot(p[0]-(a[0]+t*dx), p[1]-(a[1]+t*dy));
+}
+function lbClearanceEN(pt, poly) {
+  let d = Infinity;
+  for (let i = 0; i < poly.length; i++)
+    d = Math.min(d, lbDistToSeg(pt, poly[i], poly[(i+1)%poly.length]));
+  return pointInPolygon(pt, poly) ? d : -d;   // pointInPolygon (generic [x,y]) reused
+}
+// Validate a list of [lat,lon] points with the FULL required clearance the NUC
+// enforces (safety_margin + footprint + track), against the normalized polygon.
+function lbValidate(latlonPts) {
+  const nc = normalizedVenueCorners();
+  if (nc.length < 3) return { ok: false, reason: `need >= 3 corners (have ${venue.corners.length})` };
+  const lat0 = nc[0].lat, lon0 = nc[0].lon;
+  const poly = nc.map(c => lbLatlonToEN(c.lat, c.lon, lat0, lon0));
+  const req = (venue.safety_margin_m || 0) + LB_FOOTPRINT_M + LB_TRACK_M;
+  let mn = Infinity;
+  for (const [la, lo] of latlonPts)
+    mn = Math.min(mn, lbClearanceEN(lbLatlonToEN(la, lo, lat0, lon0), poly));
+  return { ok: mn >= req, minClear: mn, req,
+           reason: mn >= req ? `clear ${mn.toFixed(2)}m (need ${req.toFixed(2)}m)`
+                             : `${(req-mn).toFixed(2)}m short (clear ${mn.toFixed(2)}m, need ${req.toFixed(2)}m)` };
+}
+function lbPolylineLenM(pts) {  // pts = [[lat,lon]...]
+  if (pts.length < 2) return 0;
+  const lat0 = pts[0][0]; let L = 0;
+  for (let i = 1; i < pts.length; i++) {
+    const a = lbLatlonToEN(pts[i-1][0], pts[i-1][1], lat0, pts[0][1]);
+    const b = lbLatlonToEN(pts[i][0],   pts[i][1],   lat0, pts[0][1]);
+    L += Math.hypot(b[0]-a[0], b[1]-a[1]);
+  }
+  return L;
+}
+// Compass bearing (deg E-of-N) of the tangent from p0 -> p1 (both [lat,lon]).
+function lbHeadingDeg(p0, p1) {
+  const lat0 = p0[0];
+  const dE = (p1[1]-p0[1]) * 111320.0 * Math.cos(lat0*Math.PI/180);
+  const dN = (p1[0]-p0[0]) * 111320.0;
+  let d = Math.atan2(dE, dN) * 180/Math.PI;
+  return (d < 0) ? d + 360 : d;
+}
+
+// ---- Bézier (de Casteljau over [lat,lon] control points) ----
+function lbDeCast(ctrl, t) {
+  let pts = ctrl.map(c => [c.lat, c.lon]);
+  while (pts.length > 1) {
+    const nx = [];
+    for (let i = 0; i < pts.length-1; i++)
+      nx.push([pts[i][0]+(pts[i+1][0]-pts[i][0])*t, pts[i][1]+(pts[i+1][1]-pts[i][1])*t]);
+    pts = nx;
+  }
+  return pts[0];
+}
+function lbBezierSample(ctrl, n) {
+  const out = [];
+  for (let i = 0; i <= n; i++) out.push(lbDeCast(ctrl, i/n));
+  return out;
+}
+
+// ---- StepCurvaturePath.position(s) reimplemented (mirror step_curvature.py) ----
+function lbStepRecipeLocal(recipe) {
+  const p = recipe.params || {};
+  const dir = (Number(p.direction) >= 0) ? 1 : -1;
+  const R = Number(p.R) || 0.5, L1 = Number(p.L1) || 0, L2 = Number(p.L2) || 0;
+  const theta = (recipe.type === 'uturn') ? Math.PI
+                : (p.theta_arc != null ? Number(p.theta_arc) : Math.PI/2);
+  const arcLen = R * theta, total = L1 + arcLen + L2;
+  const center = [L1, dir*R];
+  const headEnd = dir*theta;
+  const posEndArc = [center[0] + R*Math.sin(dir*theta), center[1] - dir*R*Math.cos(dir*theta)];
+  const pos = (s) => {
+    if (s <= L1) return [s, 0];
+    if (s <= L1 + arcLen) { const sl = s-L1, ang = dir*sl/R;
+      return [center[0] + R*Math.sin(ang), center[1] - dir*R*Math.cos(ang)]; }
+    const sl = s - L1 - arcLen;
+    return [posEndArc[0] + sl*Math.cos(headEnd), posEndArc[1] + sl*Math.sin(headEnd)];
+  };
+  const n = Math.max(2, Math.round(total / 0.10));
+  const out = [];
+  for (let i = 0; i <= n; i++) out.push(pos(total * i / n));
+  return out;
+}
+// Place local (px,py) [+x fwd, +y left] at start={lat,lon,heading_deg}.
+// Mirrors venue_geom.recipe_points_en: E=px·sinh − py·cosh; N=px·cosh + py·sinh.
+function lbPlaceAtStartPose(localPts, start) {
+  const h = (start.heading_deg||0) * Math.PI/180;
+  const sh = Math.sin(h), ch = Math.cos(h);
+  const mlat = 111320.0, mlon = 111320.0 * Math.cos(start.lat*Math.PI/180);
+  return localPts.map(([px, py]) => {
+    const E = px*sh - py*ch, N = px*ch + py*sh;
+    return [start.lat + N/mlat, start.lon + E/mlon];
+  });
+}
+
+// ---- leg-batch state ----
+let lbBezEditMode = false;
+let lbBezCtrl = [];                 // [{lat,lon}] control points
+let lbBezMarkers = [], lbBezCurveLayer = null, lbBezCtrlLayer = null, lbRecLayer = null;
+let lbCurRepo = null, lbCurRecipe = null;   // current leg buffers (backend shapes)
+let lbLegs = [];                    // [{id, curves:[...]}]
+
+function lbBezDrawToggle() {
+  lbBezEditMode = !lbBezEditMode;
+  $('lb-bez-draw').style.outline = lbBezEditMode ? '2px solid #6cf' : '';
+  $('lb-bez-draw').textContent = lbBezEditMode ? 'Click map… (stop)' : 'Draw Bézier (click map)';
+}
+function lbBezierClickAt(latlng) { lbBezCtrl.push({ lat: latlng.lat, lon: latlng.lng }); lbBezierRedraw(); }
+function lbBindBezDrag(m, idx) {
+  m.on('mousedown', () => {
+    map.dragging.disable();
+    const move = (ev) => { lbBezCtrl[idx] = { lat: ev.latlng.lat, lon: ev.latlng.lng }; lbBezierRedraw(); };
+    const up = () => { map.off('mousemove', move); map.off('mouseup', up); map.dragging.enable(); };
+    map.on('mousemove', move); map.on('mouseup', up);
+  });
+}
+function lbBezSamplesDense() {
+  if (lbBezCtrl.length < 2) return [];
+  const coarse = lbBezierSample(lbBezCtrl, 40);
+  const len = lbPolylineLenM(coarse);
+  const n = Math.max(12, Math.min(300, Math.round(len / 0.3)));
+  return lbBezierSample(lbBezCtrl, n);
+}
+function lbBezEndHeading(samples) {
+  const ov = parseFloat($('lb-bez-heading').value);
+  if (isFinite(ov)) return ((ov % 360) + 360) % 360;
+  if (samples.length >= 2) return lbHeadingDeg(samples[samples.length-2], samples[samples.length-1]);
+  return 0;
+}
+function lbBezierRedraw() {
+  [lbBezCurveLayer, lbBezCtrlLayer].forEach(l => { if (l) map.removeLayer(l); });
+  lbBezCurveLayer = lbBezCtrlLayer = null;
+  lbBezMarkers.forEach(m => map.removeLayer(m)); lbBezMarkers = [];
+  if (lbBezCtrl.length >= 1) {
+    lbBezCtrlLayer = L.polyline(lbBezCtrl.map(c => [c.lat, c.lon]),
+      { color: '#0ff', weight: 1, dashArray: '3 5', interactive: false }).addTo(map);
+    lbBezCtrl.forEach((c, i) => {
+      const m = L.circleMarker([c.lat, c.lon], { radius: 6, color: '#0ff', weight: 2,
+        fillColor: '#0ff', fillOpacity: 0.5, pane: 'markerPane', interactive: true })
+        .addTo(map).bindTooltip(`P${i}`);
+      lbBindBezDrag(m, i); lbBezMarkers.push(m);
+    });
+  }
+  if (lbBezCtrl.length >= 2) {
+    const samples = lbBezSamplesDense();
+    lbBezCurveLayer = L.polyline(samples, { color: '#3cf', weight: 3 }).addTo(map);
+    const len = lbPolylineLenM(samples), hd = lbBezEndHeading(samples);
+    const v = lbValidate(samples);
+    $('lb-bez-state').innerHTML =
+      `${lbBezCtrl.length} pts &middot; ${len.toFixed(2)} m &middot; end ${hd.toFixed(0)}&deg; &nbsp; ` +
+      (v.ok ? `<span class="ok">fits (${v.reason})</span>` : `<span class="err">${v.reason}</span>`);
+  } else {
+    $('lb-bez-state').textContent = `${lbBezCtrl.length} pt — need >=2`;
+  }
+}
+function lbBezClear() { lbBezCtrl = []; lbBezierRedraw(); }
+function lbSetRepo() {
+  if (lbBezCtrl.length < 2) { alert('draw a Bézier with >= 2 control points first'); return; }
+  const samples = lbBezSamplesDense();
+  const v = lbValidate(samples);
+  if (!v.ok && !confirm(`Reposition curve FAILS fit (${v.reason}). Add anyway?`)) return;
+  lbCurRepo = {
+    name: 'repo', kind: 'reposition',
+    waypoints_wgs84: samples.map(p => ({ lat: p[0], lon: p[1] })),
+    end_heading_deg: lbBezEndHeading(samples),
+    v_const: parseFloat($('lb-bez-v').value) || 0.4,
+    pos_tol_m: parseFloat($('lb-bez-postol').value) || 0.15,
+  };
+  $('lb-bez-state').innerHTML += `<br><span class="ok">set as leg reposition</span>`;
+  lbRecipeRedraw();
+}
+
+// ---- recipe ----
+function lbRecipeDef() {
+  const type = $('lb-rec-type').value;
+  const params = { L1: parseFloat($('lb-rec-L1').value) || 0, R: parseFloat($('lb-rec-R').value) || 0.5,
+                   L2: parseFloat($('lb-rec-L2').value) || 0, direction: parseInt($('lb-rec-dir').value, 10) };
+  if (type === 'step') params.theta_arc = (parseFloat($('lb-rec-theta').value) || 90) * Math.PI/180;
+  return { type, params };
+}
+function lbRecipeStartPose() {
+  if (lbCurRepo && lbCurRepo.waypoints_wgs84.length) {
+    const last = lbCurRepo.waypoints_wgs84[lbCurRepo.waypoints_wgs84.length-1];
+    return { lat: last.lat, lon: last.lon, heading_deg: lbCurRepo.end_heading_deg };
+  }
+  // Fallback: the cyan path-anchor marker (odom pose) -> lat/lon + compass heading.
+  const a = venueAnchor();
+  const ll = localToLatLon([pathAnchor.x, pathAnchor.y], a.lat0, a.lon0, a.bearing);
+  return { lat: ll[0], lon: ll[1], heading_deg: ((a.bearing - pathAnchor.theta*180/Math.PI) % 360 + 360) % 360 };
+}
+function lbRecipeRedraw() {
+  if (lbRecLayer) { map.removeLayer(lbRecLayer); lbRecLayer = null; }
+  const start = lbRecipeStartPose();
+  $('lb-rec-startpose').textContent =
+    `start pose: ${start.lat.toFixed(7)}, ${start.lon.toFixed(7)} @ ${start.heading_deg.toFixed(0)}°` +
+    (lbCurRepo ? ' (from reposition end)' : ' (from cyan anchor — set a reposition Bézier)');
+  const recipe = lbRecipeDef();
+  const latlon = lbPlaceAtStartPose(lbStepRecipeLocal(recipe), start);
+  lbRecLayer = L.polyline(latlon, { color: '#fa0', weight: 3 }).addTo(map);
+  const v = lbValidate(latlon);
+  $('lb-rec-state').innerHTML = v.ok
+    ? `<span class="ok">fits (${v.reason})</span>` : `<span class="err">${v.reason}</span>`;
+}
+function lbSetRecipe() {
+  const start = lbRecipeStartPose();
+  const recipe = lbRecipeDef();
+  const latlon = lbPlaceAtStartPose(lbStepRecipeLocal(recipe), start);
+  const v = lbValidate(latlon);
+  if (!v.ok && !confirm(`Recipe FAILS fit (${v.reason}). Add anyway?`)) return;
+  const R = recipe.params.R;
+  lbCurRecipe = {
+    name: `exp_${recipe.type}_R${('' + R).replace('.', 'p')}`,
+    kind: 'recipe', scored: $('lb-rec-scored').checked,
+    controller: $('lb-rec-ctrl').value, v_const: parseFloat($('lb-rec-v').value) || 0.5,
+    start_pose: start, recipe,
+  };
+  $('lb-rec-state').innerHTML += `<br><span class="ok">set as leg experiment (${lbCurRecipe.controller})</span>`;
+}
+
+// ---- leg assembly ----
+function lbAddLeg() {
+  const curves = [];
+  if (lbCurRepo) curves.push(lbCurRepo);
+  if (lbCurRecipe) curves.push(lbCurRecipe);
+  if (!curves.length) { alert('set a reposition and/or recipe first'); return; }
+  lbLegs.push({ id: `leg_${lbLegs.length+1}`, curves });
+  lbCurRepo = null; lbCurRecipe = null;
+  lbBezClear();
+  if (lbRecLayer) { map.removeLayer(lbRecLayer); lbRecLayer = null; }
+  $('lb-rec-state').textContent = '(set reposition to preview the recipe)';
+  lbRenderLegs();
+}
+function lbDupLeg() {
+  if (!lbLegs.length) { alert('no legs to duplicate'); return; }
+  const src = lbLegs[lbLegs.length-1];
+  const clone = JSON.parse(JSON.stringify(src));
+  clone.id = `leg_${lbLegs.length+1}`;
+  clone.curves.forEach(c => { if (c.kind === 'recipe')
+    c.controller = (c.controller === 'pid-ff') ? 'lpv-hinf' : 'pid-ff'; });
+  lbLegs.push(clone);
+  lbRenderLegs();
+}
+function lbRenderLegs() {
+  if (!lbLegs.length) { $('lb-legs').textContent = 'legs: 0'; return; }
+  let html = `legs: ${lbLegs.length}<br>`;
+  lbLegs.forEach((lg, i) => {
+    const rec = lg.curves.find(c => c.kind === 'recipe');
+    const rep = lg.curves.find(c => c.kind === 'reposition');
+    const tag = rec ? `${rec.controller} ${rec.recipe.type} R${rec.recipe.params.R}` : 'reposition-only';
+    html += `<div class="row" style="justify-content:space-between;align-items:center;">` +
+      `<span>${i+1}. ${lg.id} — ${rep ? 'bézier+' : ''}${tag}</span>` +
+      `<button data-lb-del="${i}" style="padding:2px 6px;">✕</button></div>`;
+  });
+  $('lb-legs').innerHTML = html;
+  $('lb-legs').querySelectorAll('[data-lb-del]').forEach(b => {
+    b.onclick = () => { lbLegs.splice(parseInt(b.dataset.lbDel, 10), 1);
+      lbLegs.forEach((lg, k) => lg.id = `leg_${k+1}`); lbRenderLegs(); };
+  });
+}
+function lbClearLegs() { if (confirm('Clear all authored legs?')) { lbLegs = []; lbRenderLegs(); } }
+
+// ---- send + run ----
+function lbBuildPayload() {
+  const v = venueToJSON();
+  const a = venueAnchor();
+  v.schema_version = 2;
+  v.anchor = { lat0: a.lat0, lon0: a.lon0, bearing_deg: a.bearing };
+  v.legs = lbLegs.map((lg, i) => ({ id: lg.id || `leg_${i+1}`, curves: lg.curves }));
+  return v;
+}
+function lbSend() {
+  if (!ros || !topicVenueLoad) { alert('not connected'); return; }
+  if (!lbLegs.length) { alert('author at least one leg first'); return; }
+  topicVenueLoad.publish(new ROSLIB.Message({ data: JSON.stringify(lbBuildPayload()) }));
+  $('lb-send-state').innerHTML = `<span class="pill">sent ${lbLegs.length} legs @ ${new Date().toLocaleTimeString()} — awaiting /venue/load_status</span>`;
+}
+function lbStart() {
+  if (!ros || !topicRunGo) { alert('not connected'); return; }
+  if (!confirm('START the run? The robot will move (wheels on floor). Confirm clear + safe.')) return;
+  topicRunGo.publish(new ROSLIB.Message({ data: '' }));
+  if (topicEstop) topicEstop.publish(new ROSLIB.Message({ data: false }));  // auto-clear estop
+}
+function lbRunCmd(action) {
+  if (!ros || !topicRunCmd) { alert('not connected'); return; }
+  topicRunCmd.publish(new ROSLIB.Message({ data: JSON.stringify({ action }) }));
+}
+function lbAbort() {
+  if (!confirm('ABORT the run and latch E-stop?')) return;
+  lbRunCmd('abort');
+  if (topicEstop) topicEstop.publish(new ROSLIB.Message({ data: true }));
+}
+
+// ---- status callbacks ----
+function onVenueLoadStatus(msg) {
+  let d; try { d = JSON.parse(msg.data); } catch (e) { return; }
+  $('lb-send-state').innerHTML = d.ok
+    ? `<span class="ok">loaded: ${d.message || 'ok'}</span>`
+    : `<span class="err">REJECTED: ${d.message || 'validation failed'}</span>`;
+  if (!d.ok) raiseAlert('venue_load', 'warn', 'Venue/legs rejected', d.message || 'validation failed');
+  else clearAlert('venue_load');
+}
+function onVenueLoaded(msg) {
+  let d; try { d = JSON.parse(msg.data); } catch (e) { return; }
+  if (d && d.name) $('lb-send-state').title =
+    `active: ${d.name} — ${d.n_legs} legs, ${d.n_complete} complete, ${d.total_scored} scored`;
+}
+function onRunStatus(msg) {
+  let d; try { d = JSON.parse(msg.data); } catch (e) {
+    $('lb-run-status').innerHTML = '<span class="err">bad /run/status JSON</span>'; return; }
+  const phase = d.phase || '--';
+  const leg = (d.n_legs) ? `leg ${Math.min((d.leg_index||0)+1, d.n_legs)}/${d.n_legs}` : 'leg --';
+  $('lb-run-status').innerHTML =
+    `<span class="pill">${phase}</span> &nbsp; ${leg} &nbsp; done ${d.n_complete||0}/${d.n_legs||0}<br>` +
+    `curve: ${d.curve_name || '--'} (${d.curve_kind || '--'}) &nbsp; rtk q=${d.rtk_q != null ? d.rtk_q : '--'}` +
+    (d.battery_v != null ? ` &nbsp; batt ${Number(d.battery_v).toFixed(2)}V` : '') +
+    (d.message ? `<br><span class="small">${d.message}</span>` : '');
+  if (phase === 'paused')
+    raiseAlert('run_paused', 'critical', 'Run PAUSED', d.pause_reason || d.message || 'operator action needed');
+  else if (phase === 'aborted')
+    raiseAlert('run_paused', 'critical', 'Run ABORTED', d.message || 'aborted');
+  else clearAlert('run_paused');
+}
+
+// ---- wire-up ----
+$('lb-bez-draw').onclick  = lbBezDrawToggle;
+$('lb-bez-clear').onclick = lbBezClear;
+$('lb-bez-set').onclick   = lbSetRepo;
+$('lb-bez-heading').oninput = lbBezierRedraw;
+['lb-rec-type','lb-rec-ctrl','lb-rec-R','lb-rec-L1','lb-rec-theta','lb-rec-L2','lb-rec-dir','lb-rec-v']
+  .forEach(id => { const el = $(id); if (el) el.addEventListener('input', () => { if (lbCurRepo || true) lbRecipeRedraw(); }); });
+$('lb-rec-set').onclick   = lbSetRecipe;
+$('lb-add-leg').onclick   = lbAddLeg;
+$('lb-dup-ctrl').onclick  = lbDupLeg;
+$('lb-clear-legs').onclick = lbClearLegs;
+$('lb-send').onclick      = lbSend;
+$('lb-start').onclick     = lbStart;
+$('lb-pause').onclick     = () => lbRunCmd('pause');
+$('lb-abort').onclick     = lbAbort;
+lbRenderLegs();
 </script>
 </body>
 </html>

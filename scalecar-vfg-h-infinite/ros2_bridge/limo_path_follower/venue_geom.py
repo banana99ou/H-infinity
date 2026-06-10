@@ -7,8 +7,9 @@ trivially unit-testable off the robot.
 
 Every move in a leg batch is an EXPLICIT curve, so it can be checked against the
 venue polygon BEFORE the robot moves:
-  - a ``recipe`` curve is the follower's analytic path (step/uturn), sampled and
-    placed at its ``start_pose`` exactly as the follower lays it down;
+  - a ``recipe`` curve is the follower's analytic path (step/slalom/uturn),
+    sampled and placed at its ``start_pose`` exactly as the follower lays it
+    down;
   - a ``reposition`` curve is the operator-drawn waypoint polyline.
 Both are required to keep a clearance of
 ``safety_margin_m + robot_footprint + path_tracking_margin`` inside the polygon.
@@ -67,19 +68,13 @@ def poly_en(corners_wgs84, lat0, lon0):
     return [latlon_to_en(c["lat"], c["lon"], lat0, lon0) for c in corners_wgs84]
 
 
-def recipe_points_en(recipe, start_pose, lat0, lon0, spacing_m=0.10):
-    """Sample an analytic recipe and place it at start_pose, in EN metres.
+def recipe_path(recipe):
+    """Build the analytic path object for a recipe dict, or None.
 
-    Mirrors path_follower.build_path_from_recipe + the path_overlay placement so
-    the checked geometry is the exact curve the robot drives. ``start_pose`` is
-    {lat, lon, heading_deg} (compass bearing E-of-N). Returns [(E, N, s), ...].
-    Returns [] if StepCurvaturePath is unavailable or the type is not geometry-
-    checkable here (e.g. slalom).
+    Mirrors path_follower.build_path_from_recipe (same classes, same param
+    defaults) so checked geometry == driven geometry. Returns None when the
+    type is unknown or the vfg path classes are unavailable.
     """
-    try:
-        from vfg_pathfollowing.paths.step_curvature import StepCurvaturePath
-    except Exception:
-        return []
     params = recipe.get("params", {}) or {}
     ptype = str(recipe.get("type", "")).lower()
 
@@ -89,16 +84,39 @@ def recipe_points_en(recipe, start_pose, lat0, lon0, spacing_m=0.10):
     def _i(k, d):
         return int(params.get(k, d))
 
-    if ptype == "step":
-        path = StepCurvaturePath(L1=_f("L1", 5.0), R=_f("R", 0.5),
-                                 theta_arc=_f("theta_arc", math.pi / 2),
-                                 L2=_f("L2", 5.0), direction=_i("direction", 1))
-    elif ptype == "uturn":
-        path = StepCurvaturePath(L1=_f("L1", 1.0), R=_f("R", 0.5),
-                                 theta_arc=math.pi, L2=_f("L2", 1.0),
-                                 direction=_i("direction", 1))
-    else:
-        return []  # slalom / unknown: not geometry-checked here
+    try:
+        if ptype == "step":
+            from vfg_pathfollowing.paths.step_curvature import StepCurvaturePath
+            return StepCurvaturePath(L1=_f("L1", 5.0), R=_f("R", 0.5),
+                                     theta_arc=_f("theta_arc", math.pi / 2),
+                                     L2=_f("L2", 5.0), direction=_i("direction", 1))
+        if ptype == "uturn":
+            from vfg_pathfollowing.paths.step_curvature import StepCurvaturePath
+            return StepCurvaturePath(L1=_f("L1", 1.0), R=_f("R", 0.5),
+                                     theta_arc=math.pi, L2=_f("L2", 1.0),
+                                     direction=_i("direction", 1))
+        if ptype == "slalom":
+            from vfg_pathfollowing.paths.slalom import SlalomPath
+            return SlalomPath(R=_f("R", 0.5),
+                              theta_arc=_f("theta_arc", math.pi / 2),
+                              L1=_f("L1", 5.0), L_mid=_f("L_mid", 2.0),
+                              n_arcs=_i("n_arcs", 6), L_end=_f("L_end", 25.0))
+    except Exception:
+        return None
+    return None  # unknown type: not geometry-checkable
+
+
+def recipe_points_en(recipe, start_pose, lat0, lon0, spacing_m=0.10):
+    """Sample an analytic recipe and place it at start_pose, in EN metres.
+
+    Mirrors path_follower.build_path_from_recipe + the path_overlay placement so
+    the checked geometry is the exact curve the robot drives. ``start_pose`` is
+    {lat, lon, heading_deg} (compass bearing E-of-N). Returns [(E, N, s), ...].
+    Returns [] if the vfg path classes are unavailable or the type is unknown.
+    """
+    path = recipe_path(recipe)
+    if path is None:
+        return []
     total = float(path.total_length)
     h = math.radians(float(start_pose.get("heading_deg", 0.0)))
     # local +x (forward) at compass bearing h E-of-N -> (E,N)=(sin h, cos h);
@@ -179,7 +197,7 @@ def check_legs_containment(legs, venue, footprint_r, track_margin, spacing_m=0.2
                 if not pts:
                     # Geometry not checkable (import/type) — flag, do not silently pass.
                     viol.append((f"{leg_id}/{name}: recipe geometry UNVERIFIED "
-                                 "(StepCurvaturePath unavailable or non-step type)",
+                                 "(vfg path classes unavailable or unknown type)",
                                  0.0, 0.0))
                     continue
                 for (e, nn, s) in pts:

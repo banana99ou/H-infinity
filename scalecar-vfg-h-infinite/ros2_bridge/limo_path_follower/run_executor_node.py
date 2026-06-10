@@ -35,8 +35,18 @@ ground truth and a quality gate on scored runs only.
 
   sub  /run/go      std_msgs/String  (any message = Start / resume)
   sub  /run/cmd     std_msgs/String  JSON {action: pause|resume|abort}
+  sub  /plan/request std_msgs/String JSON {venue}  (auto-planner; refused
+                     while a batch is actively driving)
+  pub  /plan/result  std_msgs/String JSON (latched) — experiment_planner
+                     stages for the WebUI to render/accept
   pub  /run/status  std_msgs/String  JSON (latched)
   + the orchestrator / reposition / odom_zero / follower contracts (see imports).
+
+Multi-stage batches (auto-planner): active.json may carry ``plan_stages`` =
+[{name, legs}, ...] covering the whole remaining matrix. v.legs stays stage
+1's legs for stage-unaware consumers. Start selects the FIRST stage with
+remaining treatments (manifest-driven, restart-safe); when a stage fills,
+the executor containment-gates the next stage and advances unattended.
 """
 import json
 import os
@@ -77,6 +87,14 @@ try:
     from limo_path_follower import venue_geom
 except Exception:  # pragma: no cover
     import venue_geom
+
+try:
+    from limo_path_follower import experiment_planner
+except Exception:  # pragma: no cover
+    try:
+        import experiment_planner  # type: ignore
+    except Exception:
+        experiment_planner = None
 
 # manifest.py (tools/analysis) lives outside the colcon package. It is the source
 # of truth for "which (controller, v_const, rep) cells already passed" — the
@@ -206,11 +224,14 @@ class RunExecutor(Node):
         # -- Batch state -----------------------------------------------
         self._venue = {}
         self._legs = []
+        self._stages = []        # [{name, legs}] from active.json plan_stages
+        self._stage_idx = 0      # index into _stages (when non-empty)
         self._run_id = "run"
         self._leg_idx = 0
         self._curve_idx = 0
         self._cur_curve = None
         self._cur_recipe = {}
+        self._matrix_doc = {}    # raw experiment.yaml (planner input)
 
         # -- Matrix / treatment sweep (system chooses controller x v x rep) ---
         # The operator authors only GEOMETRY (step shape at radius R); the system
@@ -276,9 +297,11 @@ class RunExecutor(Node):
         self.pub_odom_reset = self.create_publisher(Bool, "/odom_zero/reset", 10)
         self.pub_recipe = self.create_publisher(
             String, "/reference_path_recipe", latched)
+        self.pub_plan = self.create_publisher(String, "/plan/result", latched)
 
         self.create_subscription(String, "/run/go", self._on_go, 10)
         self.create_subscription(String, "/run/cmd", self._on_cmd, 10)
+        self.create_subscription(String, "/plan/request", self._on_plan_request, 10)
         self.create_subscription(
             String, "/orchestrator/status", self._on_orch_status, 10)
         self.create_subscription(
@@ -354,6 +377,54 @@ class RunExecutor(Node):
             self._orch_status = json.loads(msg.data) or {}
         except (ValueError, TypeError):
             pass
+
+    def _on_plan_request(self, msg):
+        """Auto-plan request from the WebUI: {venue: {...}} in, the planner's
+        stage list out on /plan/result (latched). Planning is synchronous
+        (~5 s) so it is REFUSED while a batch is actively driving — the tick
+        state machine must not stall under a moving robot."""
+        def _fail(why):
+            self.get_logger().warn(f"/plan/request refused: {why}")
+            self.pub_plan.publish(String(data=json.dumps(
+                {"ok": False, "stages": [], "unfittable": [], "notes": [why]})))
+
+        if self.phase not in (Phase.IDLE, Phase.PAUSED, Phase.DONE,
+                              Phase.ABORTED):
+            _fail(f"batch is active (phase={self.phase.value}) — "
+                  "pause or finish before planning")
+            return
+        if experiment_planner is None or manifest is None:
+            _fail("planner/manifest tooling unavailable on this host")
+            return
+        try:
+            req = json.loads(msg.data) or {}
+        except (ValueError, TypeError) as exc:
+            _fail(f"bad /plan/request JSON: {exc}")
+            return
+        venue = req.get("venue") or {}
+        if len(venue.get("corners_wgs84") or []) < 3:
+            _fail("request venue has no polygon (corners_wgs84)")
+            return
+        if not self._load_matrix():
+            _fail("experiment.yaml unreadable — cannot plan")
+            return
+        run_id = str(venue.get("name") or "run")
+        counts = self._counts_for(run_id)
+        try:
+            plan = experiment_planner.plan_stages(
+                venue, self._matrix_doc, counts,
+                footprint_r=self._footprint_r,
+                track_margin=self._track_margin,
+                key_fn=manifest.cell_key)
+        except Exception as exc:  # noqa: BLE001 - never die in a callback
+            _fail(f"planner crashed: {exc!r}")
+            return
+        plan["venue_name"] = run_id
+        plan["counts_runs_done"] = sum(counts.values())
+        self.pub_plan.publish(String(data=json.dumps(plan)))
+        self.get_logger().info(
+            f"plan for '{run_id}': {len(plan.get('stages') or [])} stage(s), "
+            f"{len(plan.get('unfittable') or [])} unfittable.")
 
     def _on_repo_status(self, msg):
         try:
@@ -469,10 +540,21 @@ class RunExecutor(Node):
                 v = json.load(f)
         except (FileNotFoundError, ValueError):
             self._venue, self._legs, self._run_id = {}, [], "run"
+            self._stages, self._stage_idx = [], 0
             return
         self._venue = v
-        self._legs = v.get("legs") or []
         self._run_id = str(v.get("name") or "run")
+        # Multi-stage plan (auto-planner): plan_stages = [{name, legs}, ...].
+        # v.legs stays the FIRST stage's legs for backward compatibility, so
+        # a stage-unaware consumer still sees a valid single-stage batch.
+        self._stages = [
+            {"name": str(st.get("name") or f"stage_{i + 1}"),
+             "legs": st.get("legs") or []}
+            for i, st in enumerate(v.get("plan_stages") or [])
+            if st.get("legs")]
+        self._stage_idx = 0
+        self._legs = (self._stages[0]["legs"] if self._stages
+                      else (v.get("legs") or []))
 
     # -- Matrix + manifest (the treatment brain) -----------------------
 
@@ -487,6 +569,7 @@ class RunExecutor(Node):
         except Exception as exc:
             self.get_logger().error(f"load_experiment failed: {exc}")
             return False
+        self._matrix_doc = doc or {}
         matrix = doc.get("matrix") or {}
         self._controllers = [str(c) for c in (matrix.get("controller") or [])]
         self._speeds = [float(v) for v in (matrix.get("v_const") or [])]
@@ -500,28 +583,33 @@ class RunExecutor(Node):
             return False
         return True
 
-    def _rebuild_counts(self):
-        """Count passing scored runs for THIS venue from the bag-root manifest.
-        Keyed by cell_key(controller, v_const, path_family, radius_m)."""
-        self._completed_counts = {}
+    def _counts_for(self, run_id):
+        """Passing scored runs for a given run_id from the bag-root manifest,
+        keyed by cell_key(controller, v_const, path_family, radius_m)."""
+        counts = {}
         if manifest is None:
-            return
+            return counts
         try:
             legs = manifest.discover_legs(self._bag_root)
             rows = manifest.build_rows(legs)
         except Exception as exc:
             self.get_logger().warn(f"manifest scan failed: {exc}")
-            return
+            return counts
         for r in rows:
             if r.get("sidecar_pass") is not True:
                 continue
-            if str(r.get("run_id")) != str(self._run_id):
+            if str(r.get("run_id")) != str(run_id):
                 continue          # other venue/batch — must not mark us done
             k = manifest.cell_key({
                 "controller": r.get("controller"), "v_const": r.get("v_const"),
                 "path_family": r.get("path_family"), "radius_m": r.get("radius_m")})
             if k is not None:
-                self._completed_counts[k] = self._completed_counts.get(k, 0) + 1
+                counts[k] = counts.get(k, 0) + 1
+        return counts
+
+    def _rebuild_counts(self):
+        """Count passing scored runs for THIS venue (the resume mechanism)."""
+        self._completed_counts = self._counts_for(self._run_id)
 
     def _leg_id(self, idx):
         if 0 <= idx < len(self._legs):
@@ -596,13 +684,80 @@ class RunExecutor(Node):
     def _all_geometries_done(self):
         return all(self._next_treatment_for(lg) is None for lg in self._legs)
 
+    def _all_leg_lists(self):
+        """Every stage's legs (global progress scope); [current] when the
+        batch is a legacy single-stage venue."""
+        if self._stages:
+            return [st["legs"] for st in self._stages]
+        return [self._legs]
+
+    def _stage_name(self):
+        if self._stages and 0 <= self._stage_idx < len(self._stages):
+            return self._stages[self._stage_idx]["name"]
+        return None
+
+    def _select_stage_with_work(self):
+        """Point _legs at the first stage that still has remaining
+        treatments (manifest-driven — survives restarts with no extra
+        state). Returns False when every stage is full/exhausted."""
+        if not self._stages:
+            return not self._all_geometries_done()
+        for i, st in enumerate(self._stages):
+            self._legs = st["legs"]
+            if not self._all_geometries_done():
+                if i != self._stage_idx:
+                    self.get_logger().info(
+                        f"stage select: '{st['name']}' ({i + 1}/"
+                        f"{len(self._stages)}) has remaining treatments.")
+                self._stage_idx = i
+                return True
+        self._stage_idx = len(self._stages) - 1
+        self._legs = self._stages[self._stage_idx]["legs"]
+        return False
+
+    def _advance_stage(self):
+        """After the current stage's geometries fill: move to the next stage
+        with work, containment-gate it, and continue the batch unattended.
+        Returns 'advanced' | 'paused' | 'none'."""
+        if not self._stages:
+            return "none"
+        for i in range(self._stage_idx + 1, len(self._stages)):
+            st = self._stages[i]
+            self._legs = st["legs"]
+            if self._all_geometries_done():
+                continue
+            ok, report = venue_geom.check_legs_containment(
+                self._legs, self._venue, self._footprint_r, self._track_margin)
+            if not ok:
+                self.get_logger().error(
+                    f"stage '{st['name']}' CONTAINMENT FAILED:\n" + report)
+                self._pause(f"next stage '{st['name']}' violates containment "
+                            "— re-plan, Send, then Start")
+                return "paused"
+            self._stage_idx = i
+            self._leg_idx = 0
+            self._curve_idx = 0
+            self.get_logger().info(
+                f"stage advance -> '{st['name']}' "
+                f"({i + 1}/{len(self._stages)}).")
+            _notify_discord(
+                f"STAGE ADVANCE: '{st['name']}' ({i + 1}/{len(self._stages)}) "
+                f"— sweep {self._runs_done()}/{self._runs_target()}.",
+                title="H-inf run_executor")
+            self._publish_status(message=f"stage advance: {st['name']}")
+            return "advanced"
+        # Nothing ahead; restore the current stage's legs.
+        self._legs = self._stages[self._stage_idx]["legs"]
+        return "none"
+
     def _scored_geometries(self):
         seen, out = set(), []
-        for lg in self._legs:
-            geom = self._geometry_of(lg)
-            if geom is not None and geom not in seen:
-                seen.add(geom)
-                out.append(geom)
+        for legs in self._all_leg_lists():
+            for lg in legs:
+                geom = self._geometry_of(lg)
+                if geom is not None and geom not in seen:
+                    seen.add(geom)
+                    out.append(geom)
         return out
 
     def _runs_target(self):
@@ -671,7 +826,7 @@ class RunExecutor(Node):
         self._done_notified = False
         self._leg_idx = 0
         self._curve_idx = 0
-        if self._all_geometries_done():
+        if not self._select_stage_with_work():
             self._enter(Phase.DONE)
             return
         ok, report = venue_geom.check_legs_containment(
@@ -682,9 +837,10 @@ class RunExecutor(Node):
             self._pause("refused: a planned curve leaves the venue (see log)")
             return
         self.get_logger().info("venue containment OK — " + report)
+        stage = f" stage '{self._stage_name()}'" if self._stages else ""
         self.get_logger().info(
-            f"sweep: {self._runs_done()}/{self._runs_target()} scored runs done "
-            f"across {len(self._scored_geometries())} geometries; "
+            f"sweep{stage}: {self._runs_done()}/{self._runs_target()} scored "
+            f"runs done across {len(self._scored_geometries())} geometries; "
             f"controllers={self._controllers} speeds={self._speeds} N={self._target_n}.")
         self._enter(Phase.PREFLIGHT)
 
@@ -749,13 +905,18 @@ class RunExecutor(Node):
         self.get_logger().info(
             f"leg '{lid}' done — sweep {self._runs_done()}/{self._runs_target()}.")
         self._publish_status(message=f"leg '{lid}' done")
-        # Cycle the authored legs ("fill gaps"); finish when no geometry has a
-        # remaining treatment (every cell passed or retry-exhausted).
+        # Cycle the authored legs ("fill gaps"); when no geometry in THIS
+        # stage has a remaining treatment, auto-advance to the next planned
+        # stage (the unattended multi-stage batch) or finish.
         self._leg_idx = (self._leg_idx + 1) % len(self._legs)
         self._curve_idx = 0
         if self._all_geometries_done():
-            self._enter(Phase.DONE)
-            return
+            res = self._advance_stage()
+            if res == "paused":
+                return
+            if res == "none":
+                self._enter(Phase.DONE)
+                return
         # M2 battery gate between legs: never start a new leg below halt.
         if self._battery_v is not None and self._battery_v < self._batt_halt:
             self._pause(
@@ -1288,6 +1449,9 @@ class RunExecutor(Node):
             "run_id": self._run_id,
             "venue": self._venue.get("name"),
             "phase": self.phase.value,
+            "stage": self._stage_name(),
+            "stage_index": self._stage_idx if self._stages else None,
+            "n_stages": len(self._stages) or None,
             "leg_index": self._leg_idx,
             "n_legs": len(self._legs),
             "n_complete": runs_done,

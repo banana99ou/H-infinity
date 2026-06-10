@@ -146,17 +146,22 @@ class VenueLoaderNode(Node):
             return
 
         legs = v.get("legs") or []
+        stages = v.get("plan_stages") or []
         total_scored = sum(
-            1 for lg in legs
+            1 for lgs in ([legs] if not stages
+                          else [st.get("legs") or [] for st in stages])
+            for lg in lgs
             for c in (lg.get("curves") or [])
             if str(c.get("kind", "")).lower() == "recipe" and c.get("scored", True))
-        self._publish_loaded(name, len(legs), total_scored, error="")
+        self._publish_loaded(name, len(legs), total_scored, error="",
+                             n_stages=len(stages))
+        staged = f" in {len(stages)} stages" if stages else ""
         self._load_status(
             True, f"loaded '{name}': {len(legs)} legs, {total_scored} scored "
-            f"geometries. Press Start to run.")
+            f"geometries{staged}. Press Start to run.")
         self.get_logger().info(
-            f"venue '{name}' persisted: {len(legs)} legs ({total_scored} scored). "
-            f"polygon_changed={polygon_changed}.")
+            f"venue '{name}' persisted: {len(legs)} legs ({total_scored} scored"
+            f"{staged}). polygon_changed={polygon_changed}.")
 
         if polygon_changed and self._geofence_auto:
             self._restart_geofence_if_running()
@@ -179,48 +184,68 @@ class VenueLoaderNode(Node):
             return True
         return not (math.isfinite(lat) and math.isfinite(lon))
 
+    def _validate_legs(self, legs, v, label=""):
+        """Structural + containment checks for one leg list. ``label``
+        prefixes errors so a multi-stage payload pinpoints the bad stage."""
+        if not legs:
+            return False, f"{label}no legs"
+        for li, leg in enumerate(legs):
+            curves = leg.get("curves") or []
+            if not curves:
+                return False, f"{label}leg {leg.get('id', li)} has no curves"
+            for ci, c in enumerate(curves):
+                kind = str(c.get("kind", "")).lower()
+                if kind not in VALID_KINDS:
+                    return False, f"{label}leg {li} curve {ci}: bad kind '{kind}'"
+                if kind == "reposition":
+                    wps = c.get("waypoints_wgs84") or []
+                    if len(wps) < 1:
+                        return False, (f"{label}leg {li} curve {ci}: "
+                                       "reposition needs waypoints")
+                    for wi, w in enumerate(wps):
+                        if self._bad_latlon(w):
+                            return False, (f"{label}leg {li} curve {ci}: "
+                                           f"waypoint {wi} lacks finite lat/lon")
+                elif kind == "recipe":
+                    if not c.get("start_pose"):
+                        return False, (f"{label}leg {li} curve {ci}: "
+                                       "recipe needs start_pose")
+                    if self._bad_latlon(c.get("start_pose")):
+                        return False, (f"{label}leg {li} curve {ci}: "
+                                       "start_pose lacks finite lat/lon")
+                    rt = str((c.get("recipe") or {}).get("type", "")).lower()
+                    if rt not in VALID_RECIPE_TYPES:
+                        return False, (f"{label}leg {li} curve {ci}: "
+                                       f"bad recipe type '{rt}'")
+                    ctrl = str(c.get("controller", "lpv-hinf")).lower()
+                    if ctrl not in VALID_CONTROLLERS:
+                        return False, (f"{label}leg {li} curve {ci}: "
+                                       f"bad controller '{ctrl}'")
+        # Containment: every curve must fit the polygon minus margins.
+        ok, report = venue_geom.check_legs_containment(
+            legs, v, self._footprint_r, self._track_margin)
+        if not ok:
+            return False, f"{label}containment: " + report.replace("\n", " | ")
+        return True, "ok"
+
     def _validate(self, v):
         if not isinstance(v, dict):
             return False, "payload is not an object"
         corners = v.get("corners_wgs84") or []
         if len(corners) < 3:
             return False, "polygon needs >= 3 corners_wgs84"
-        legs = v.get("legs") or []
-        if not legs:
-            return False, "no legs"
-        for li, leg in enumerate(legs):
-            curves = leg.get("curves") or []
-            if not curves:
-                return False, f"leg {leg.get('id', li)} has no curves"
-            for ci, c in enumerate(curves):
-                kind = str(c.get("kind", "")).lower()
-                if kind not in VALID_KINDS:
-                    return False, f"leg {li} curve {ci}: bad kind '{kind}'"
-                if kind == "reposition":
-                    wps = c.get("waypoints_wgs84") or []
-                    if len(wps) < 1:
-                        return False, f"leg {li} curve {ci}: reposition needs waypoints"
-                    for wi, w in enumerate(wps):
-                        if self._bad_latlon(w):
-                            return False, (f"leg {li} curve {ci}: waypoint {wi} "
-                                           "lacks finite lat/lon")
-                elif kind == "recipe":
-                    if not c.get("start_pose"):
-                        return False, f"leg {li} curve {ci}: recipe needs start_pose"
-                    if self._bad_latlon(c.get("start_pose")):
-                        return False, (f"leg {li} curve {ci}: start_pose lacks "
-                                       "finite lat/lon")
-                    rt = str((c.get("recipe") or {}).get("type", "")).lower()
-                    if rt not in VALID_RECIPE_TYPES:
-                        return False, f"leg {li} curve {ci}: bad recipe type '{rt}'"
-                    ctrl = str(c.get("controller", "lpv-hinf")).lower()
-                    if ctrl not in VALID_CONTROLLERS:
-                        return False, f"leg {li} curve {ci}: bad controller '{ctrl}'"
-        # Containment: every curve must fit the polygon minus margins.
-        ok, report = venue_geom.check_legs_containment(
-            legs, v, self._footprint_r, self._track_margin)
+        ok, why = self._validate_legs(v.get("legs") or [], v)
         if not ok:
-            return False, "containment: " + report.replace("\n", " | ")
+            return False, why
+        # Auto-planned multi-stage batch: every LATER stage is validated with
+        # the same gates NOW — the run_executor re-checks at each stage
+        # advance, but a bad stage must be rejected at Send, not at 2 a.m.
+        for si, st in enumerate(v.get("plan_stages") or []):
+            ok, why = self._validate_legs(
+                st.get("legs") or [], v,
+                label=f"stage {st.get('name', si + 1)}: ")
+            if not ok:
+                return False, why
         return True, "ok"
 
     # ------------------------------------------------------------------
@@ -295,16 +320,21 @@ class VenueLoaderNode(Node):
             return
         name = str(v.get("name") or "venue")
         legs = v.get("legs") or []
+        stages = v.get("plan_stages") or []
         total_scored = sum(
-            1 for lg in legs
+            1 for lgs in ([legs] if not stages
+                          else [st.get("legs") or [] for st in stages])
+            for lg in lgs
             for c in (lg.get("curves") or [])
             if str(c.get("kind", "")).lower() == "recipe" and c.get("scored", True))
-        self._publish_loaded(name, len(legs), total_scored, error="")
+        self._publish_loaded(name, len(legs), total_scored, error="",
+                             n_stages=len(stages))
 
-    def _publish_loaded(self, name, n_legs, total_scored, error=""):
+    def _publish_loaded(self, name, n_legs, total_scored, error="", n_stages=0):
         self.pub_loaded.publish(String(data=json.dumps({
             "name": name,
             "n_legs": n_legs,
+            "n_stages": n_stages,
             "total_scored": total_scored,
             "active_venue_file": self._active_file,
             "error": error,

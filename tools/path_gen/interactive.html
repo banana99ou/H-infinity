@@ -89,7 +89,10 @@
   .alert.warn     { background: #7a5b00; border-color: #ffb300; }
   .alert.critical { background: #8a0d0d; border-color: #ff3b3b;
                     animation: alertpulse 1s ease-in-out infinite; }
-  .alert.acked    { opacity: 0.5; animation: none; }
+  /* Acked (X-dismissed) cards are fully hidden: removed from layout so they can
+     never intercept clicks on buttons behind them (fix B). Ack state is kept in
+     _alerts (no re-beep on a steady condition); an escalation un-acks -> reshows. */
+  .alert.acked    { display: none; }
   @keyframes alertpulse {
     0%,100% { box-shadow: 0 0 4px rgba(255,0,0,0.4); }
     50%     { box-shadow: 0 0 16px rgba(255,40,40,0.9); }
@@ -210,6 +213,11 @@
     <div id="estop-banner" class="estop-banner">&#9888; WHEELS DISABLED &mdash; E-STOP LATCHED</div>
     <button id="estop-btn" class="estop">E-STOP</button>
     <div class="small" id="estop-state">state: unknown (not connected)</div>
+    <!-- The geofence watchdog latches /estop_trigger=true at 5 Hz forever once it
+         trips (left polygon, or RTK stale/blind), overriding any CLEAR. Restarting
+         the proc re-arms it fresh so CLEAR E-STOP takes (fix A). It re-trips at
+         once if the robot is genuinely outside the venue, so the failsafe stands. -->
+    <button id="geofence-restart-btn" style="margin-top:4px;font-size:12px;padding:5px;">Restart geofence (clear latch)</button>
 
     <h3>Connection</h3>
     <label>rosbridge ws URL
@@ -242,7 +250,16 @@
     <div class="small">
       Magenta dot = RTK FIXED truth; amber = FLOAT/other. Orange dot = Pixhawk
       raw GPS. Divergence between the two reveals base-survey or correction
-      issues. Blue dot = controller's odom-zeroed belief.
+      issues. Blue dot = controller's odom-zeroed belief; its dashed magenta
+      line is the fused heading (<code>/heading/fused</code>) so heading is
+      visible even when the RTK dot is absent.
+    </div>
+    <div style="margin-top:6px;">
+      <button id="btn-recal-heading" disabled
+              title="Arms heading_node compass recalibration; then drive the robot FORWARD a few meters under RTK.">
+        Recalibrate heading</button>
+      <div class="small" id="heading-cal-state" style="margin-top:4px;">
+        heading: (no /heading/fused_status yet)</div>
     </div>
 
     <h3>Telemetry</h3>
@@ -416,57 +433,55 @@
          system runs the next incomplete leg onward. /venue/load + /run/*.
          ============================================================ -->
     <details id="legbatch-details" style="margin-top:10px;">
-      <summary><b>Leg batch (operator runs)</b></summary>
+      <summary><b>Leg batch (operator authors geometry)</b></summary>
       <div class="small" style="color:#6cf;">
-        Author legs (reposition Bézier &rarr; step recipe), Send to NUC, press
-        Start. Curves are fit-checked here with the SAME clearance the NUC
-        enforces (margin + footprint + tracking).
+        Place the experiment curves to fit the venue, then draw reposition glue
+        between them (endpoints snap to the experiment ends). Send, press Start.
+        The <b>system</b> picks the controller + speed + repetition for each curve
+        from experiment.yaml + the run manifest — you author geometry only. Curves
+        are fit-checked here with the SAME clearance the NUC enforces.
       </div>
 
-      <h4 style="margin:8px 0 4px;">1 &middot; Reposition Bézier (glue, RTK)</h4>
+      <h4 style="margin:8px 0 4px;">1 &middot; Experiment curves (scored, odom)</h4>
       <div class="row">
-        <button id="lb-bez-draw" class="primary">Draw Bézier (click map)</button>
-        <button id="lb-bez-clear">Clear points</button>
+        <button id="lb-exp-add" class="primary">Place experiment (click map)</button>
+        <button id="lb-exp-del">Delete selected</button>
       </div>
       <div class="row" style="margin-top:4px;">
-        <label style="margin:0;">v <input type="number" id="lb-bez-v" value="0.40" step="0.05" min="0.05" max="0.6" style="width:58px;"> m/s</label>
-        <label style="margin:0;">pos tol <input type="number" id="lb-bez-postol" value="0.15" step="0.01" min="0.05" max="0.5" style="width:58px;"> m</label>
-      </div>
-      <div class="row" style="margin-top:4px;">
-        <label style="margin:0;">end heading <input type="number" id="lb-bez-heading" placeholder="auto" step="1" style="width:70px;"> deg</label>
-      </div>
-      <div class="stat" id="lb-bez-state">(no Bézier — click "Draw" then click &ge;2 map points)</div>
-      <button id="lb-bez-set" class="primary" style="margin-top:4px;">Set as leg reposition</button>
-
-      <h4 style="margin:10px 0 4px;">2 &middot; Step recipe (scored, odom)</h4>
-      <div class="row">
         <label style="margin:0;">type
           <select id="lb-rec-type"><option value="step">step</option><option value="uturn">uturn</option></select>
         </label>
-        <label style="margin:0;">ctrl
-          <select id="lb-rec-ctrl"><option value="lpv-hinf">lpv-hinf</option><option value="pid-ff">pid-ff</option></select>
-        </label>
+        <label style="margin:0;">R <input type="number" id="lb-rec-R" value="0.50" step="0.05" min="0.3" style="width:55px;"></label>
+        <label style="margin:0;">dir <select id="lb-rec-dir"><option value="1">left (+1)</option><option value="-1">right (-1)</option></select></label>
       </div>
       <div class="row" style="margin-top:4px;">
-        <label style="margin:0;">R <input type="number" id="lb-rec-R" value="0.50" step="0.05" min="0.3" style="width:55px;"></label>
         <label style="margin:0;">L1 <input type="number" id="lb-rec-L1" value="1.0" step="0.1" min="0" style="width:55px;"></label>
         <label style="margin:0;">&theta; <input type="number" id="lb-rec-theta" value="90" step="1" style="width:55px;">&deg;</label>
+        <label style="margin:0;">L2 <input type="number" id="lb-rec-L2" value="1.0" step="0.1" min="0" style="width:55px;"></label>
       </div>
       <div class="row" style="margin-top:4px;">
-        <label style="margin:0;">L2 <input type="number" id="lb-rec-L2" value="1.0" step="0.1" min="0" style="width:55px;"></label>
-        <label style="margin:0;">dir <select id="lb-rec-dir"><option value="1">left (+1)</option><option value="-1">right (-1)</option></select></label>
-        <label style="margin:0;">v <input type="number" id="lb-rec-v" value="0.50" step="0.05" min="0.05" max="1.5" style="width:55px;"></label>
+        <label style="margin:0;">heading <input type="number" id="lb-rec-heading" value="0" step="1" style="width:64px;">&deg;</label>
+        <span class="small">drag cyan = move &middot; green = rotate &middot; click cyan = select</span>
       </div>
-      <label style="margin-top:4px;"><input type="checkbox" id="lb-rec-scored" checked> scored (record bag + sidecar)</label>
-      <div class="small" id="lb-rec-startpose">start pose: (set a reposition Bézier first)</div>
-      <div class="stat" id="lb-rec-state">(set reposition to preview the recipe)</div>
-      <button id="lb-rec-set" class="primary" style="margin-top:4px;">Set as leg experiment</button>
+      <div class="stat" id="lb-exp-state">(no experiment placed)</div>
 
-      <h4 style="margin:10px 0 4px;">3 &middot; Legs</h4>
+      <h4 style="margin:10px 0 4px;">2 &middot; Reposition glue (Bézier, between experiments)</h4>
+      <div class="small">Pick a gap, click the map to add midpoints (ends snap to the
+        experiment end &rarr; next start). A straight glue is used if you add none.</div>
+      <div class="row" style="margin-top:4px;">
+        <select id="lb-repo-gap"></select>
+        <button id="lb-repo-draw" class="primary">Draw glue (click map)</button>
+        <button id="lb-repo-clear">Clear midpoints</button>
+      </div>
+      <div class="row" style="margin-top:4px;">
+        <label style="margin:0;">v <input type="number" id="lb-repo-v" value="0.40" step="0.05" min="0.05" max="0.6" style="width:58px;"> m/s</label>
+        <label style="margin:0;">pos tol <input type="number" id="lb-repo-postol" value="0.15" step="0.01" min="0.05" max="0.5" style="width:58px;"> m</label>
+      </div>
+      <div class="stat" id="lb-repo-state">(no glue)</div>
+
+      <h4 style="margin:10px 0 4px;">3 &middot; Legs (auto: glue &rarr; experiment, cyclic)</h4>
       <div class="row">
-        <button id="lb-add-leg" class="primary">Add leg</button>
-        <button id="lb-dup-ctrl">Dup last w/ other ctrl</button>
-        <button id="lb-clear-legs">Clear legs</button>
+        <button id="lb-clear-all">Clear all</button>
       </div>
       <div class="stat" id="lb-legs">legs: 0</div>
 
@@ -519,7 +534,7 @@
     <details style="margin-top:6px;">
       <summary>Map legend</summary>
       <div class="legend-row"><span class="legend-swatch" style="background:#39f"></span>controller belief (<code>/wheel/odom_zeroed</code>)</div>
-      <div class="legend-row"><span class="legend-swatch" style="background:#e91e63"></span>RTK FIXED (magenta)</div>
+      <div class="legend-row"><span class="legend-swatch" style="background:#e91e63"></span>RTK FIXED (magenta; line = fused heading <code>/heading/fused</code>)</div>
       <div class="legend-row"><span class="legend-swatch" style="background:#ffc107"></span>RTK FLOAT / other (amber)</div>
       <div class="legend-row"><span class="legend-swatch" style="background:#ff9800"></span>Pixhawk raw GPS (orange)</div>
       <div class="legend-row"><span class="legend-swatch" style="background:#0ff"></span>ad-hoc path anchor (cyan + arrow)</div>
@@ -888,6 +903,9 @@ $('basemap').onchange = (e) => {
 let pathLayer = null, trackPoly = null, anchorMarker = null, oppMarker = null;
 let startMarker = null, endMarker = null, robotMarker = null, robotHeadingLine = null;
 let rtkMarker = null, gpsRawMarker = null;
+let rtkHeadingLine = null;                      // fused-heading vector on the RTK marker
+let robotFusedLine = null;                      // fused-heading vector on the belief dot
+let lastFusedHeading = { deg: null, t: 0 };     // /heading/fused (compass deg E-of-N)
 let pathAnchorPosMarker = null, pathAnchorTipMarker = null, pathAnchorLine = null;
 
 // Pose at which the path's local origin is anchored in the odom frame.
@@ -1173,6 +1191,10 @@ let topicEstop = null, topicEstopState = null, topicRefPath = null, topicReset =
 let topicOdom = null, topicStatus = null;
 let topicOrchStart = null, topicOrchKill = null, topicOrchStatus = null;
 let topicRtkFix = null, topicPixhawkFix = null;
+let topicFusedHeading = null;     // /heading/fused (heading_node EKF, Float64 deg E-of-N)
+let topicHeadingCmd = null;       // /heading/cmd (explicit recalibration command)
+let topicHeadingStatus = null;    // /heading/fused_status (JSON diagnostics)
+let lastHeadingStatus = { d: null, t: 0 };
 let topicLimoStatus = null;                      // /limo_status (battery, motion mode)
 let topicExpStatus = null, topicExpCmd = null;   // T10 — /experiment/{status,cmd}
 // T12 — operator leg-batch flow (venue_loader + run_executor)
@@ -1220,6 +1242,7 @@ function setMarkerStale(marker, stale, liveColor) {
 function setConnUI(connected) {
   $('btn-connect').disabled = connected;
   $('btn-disconnect').disabled = !connected;
+  $('btn-recal-heading').disabled = !connected;
   $('conn-state').textContent = connected ? 'connected' : 'disconnected';
   setDot('conn-dot', connected ? 'ok' : 'bad');
   if (!connected) {
@@ -1238,12 +1261,15 @@ function setConnUI(connected) {
     // a fresh connect should start blank rather than mislead with stale dots.
     lastRtkFix = { lat: null, lon: null, status: null, t: 0 };
     lastRtkStatus = { quality: null, rtcm_state: null, fwd_age_s: null, raw: '', t: 0 };
+    lastFusedHeading = { deg: null, t: 0 };
     lastOdomTime = 0; lastPixhawkTime = 0; lastBattTime = 0;
     clearDataAlerts();   // their backing streams just went away
     if (rtkMarker)        { map.removeLayer(rtkMarker);        rtkMarker = null; }
+    if (rtkHeadingLine)   { map.removeLayer(rtkHeadingLine);   rtkHeadingLine = null; }
     if (gpsRawMarker)     { map.removeLayer(gpsRawMarker);     gpsRawMarker = null; }
     if (robotMarker)      { map.removeLayer(robotMarker);      robotMarker = null; }
     if (robotHeadingLine) { map.removeLayer(robotHeadingLine); robotHeadingLine = null; }
+    if (robotFusedLine)   { map.removeLayer(robotFusedLine);   robotFusedLine = null; }
     $('estop-state').textContent = 'state: unknown (not connected)';
     const _banner = $('estop-banner');
     if (_banner) _banner.classList.remove('latched');
@@ -1479,6 +1505,27 @@ function subscribeAll() {
   });
   topicRtkStatus.subscribe(onRtkStatus);
 
+  // Fused heading (heading_node EKF) — compass bearing deg E-of-N, drawn as a
+  // vector on the RTK marker so the operator sees which way the robot points
+  // in RTK truth (the blue belief line is odom-frame, not earth-frame).
+  topicFusedHeading = new ROSLIB.Topic({
+    ros, name: '/heading/fused', messageType: 'std_msgs/msg/Float64'
+  });
+  topicFusedHeading.subscribe(onFusedHeading);
+
+  // Operator command channel to heading_node (explicit compass recalibration —
+  // the node never recalibrates a known offset on its own).
+  topicHeadingCmd = new ROSLIB.Topic({
+    ros, name: '/heading/cmd', messageType: 'std_msgs/msg/String'
+  });
+
+  // Heading diagnostics: calibration state ("collecting n/5" during a recal,
+  // so the operator SEES samples accumulate while driving), offset, conflicts.
+  topicHeadingStatus = new ROSLIB.Topic({
+    ros, name: '/heading/fused_status', messageType: 'std_msgs/msg/String'
+  });
+  topicHeadingStatus.subscribe(onHeadingStatus);
+
   // Regular Pixhawk GPS (L5) — second marker on the map alongside RTK,
   // so divergence between RTK truth and regular GPS is visible.
   topicPixhawkFix = new ROSLIB.Topic({
@@ -1576,7 +1623,12 @@ function subscribeAll() {
 
 const STACK_LABELS = {
   base_vanilla: 'limo_base (vanilla)',
-  base_gnss:    'limo_base + GNSS',
+  // Canonical field bring-up is the SPLIT base + gnss (not the combined
+  // base_gnss launcher) so odom_watchdog can respawn chassis-only on a
+  // CP2102 vibration dropout without dropping RTK/compass. 'base' pins
+  // port_name:=limo_base (dual-CP2102 hazard); 'gnss' is mavros+RTK only.
+  base:         'limo_base (chassis, pinned port)',
+  gnss:         'MAVROS + RTK',
   estop:        'estop_cli',
   odom_zero:    'odom_zero_node',
   follower:     'path_follower_node',
@@ -1673,6 +1725,9 @@ function updateRates() {
   else if (lastBattTime)
     clearAlert('batt_stale');
   // Grey out frozen map markers so a dead stream can't look authoritative.
+  // The fused-heading arrow is removed outright when its stream (or the fix)
+  // goes stale — a frozen heading vector would mislead worse than none.
+  updateRtkHeadingArrow();
   setMarkerStale(rtkMarker,    rtkAge >= STALE_MS, rtkIsFixed() ? '#e91e63' : '#ffc107');
   setMarkerStale(gpsRawMarker, !!lastPixhawkTime && (now - lastPixhawkTime) >= STALE_MS, '#ff9800');
   setMarkerStale(robotMarker,  !!lastOdomTime && (now - lastOdomTime) >= STALE_MS, '#39f');
@@ -1730,6 +1785,30 @@ function drawRobot(x, y, yaw) {
   } else {
     robotMarker.setLatLng(ll);
     robotHeadingLine.setLatLngs([ll, head]);
+  }
+  updateRobotFusedArrow();
+}
+
+// Fused heading (heading_node EKF) on the belief dot: visible WITHOUT an RTK
+// fix (the RTK marker carries its own copy). The odom yaw line (solid blue)
+// is the controller's dead-reckoned belief; this dashed magenta line is the
+// EKF's compass bearing — when they disagree, trust this one.
+function updateRobotFusedArrow() {
+  if (!robotMarker || !fusedHeadingFresh()) {
+    if (robotFusedLine) { map.removeLayer(robotFusedLine); robotFusedLine = null; }
+    return;
+  }
+  const ll = robotMarker.getLatLng();
+  const th = lastFusedHeading.deg * Math.PI/180;          // compass deg E-of-N
+  const dlat = (HDG_ARROW_M * Math.cos(th) / EARTH_R) * 180/Math.PI;
+  const dlon = (HDG_ARROW_M * Math.sin(th) / (EARTH_R * Math.cos(ll.lat*Math.PI/180))) * 180/Math.PI;
+  const tip = [ll.lat + dlat, ll.lng + dlon];
+  if (!robotFusedLine) {
+    robotFusedLine = L.polyline([ll, tip], {
+      color: '#e91e63', weight: 3, dashArray: '4 4',
+    }).addTo(map).bindTooltip('fused heading (/heading/fused) on belief dot');
+  } else {
+    robotFusedLine.setLatLngs([ll, tip]);
   }
 }
 
@@ -1806,6 +1885,20 @@ function toggleEstop() {
   const want = !(estopActive === true); // if currently active, send false to clear; else true to stop
   const msg = new ROSLIB.Message({ data: want });
   topicEstop.publish(msg);
+}
+
+// Restart the geofence watchdog PROC (kill then start) to clear a latched
+// geofence E-stop. The watchdog re-publishes /estop_trigger=true at 5 Hz once
+// tripped, so CLEAR E-STOP alone cannot win until the proc restarts; a fresh
+// proc re-arms and re-trips only if the robot is genuinely outside the venue.
+function restartGeofence() {
+  if (!ros || !topicOrchKill || !topicOrchStart) { alert('not connected'); return; }
+  if (!confirm('Restart geofence watchdog?\nClears a latched geofence E-stop and re-arms it fresh. It will re-trip immediately if the robot is actually outside the venue.')) return;
+  topicOrchKill.publish(new ROSLIB.Message({ data: 'geofence' }));
+  $('estop-state').textContent = 'state: restarting geofence…';
+  setTimeout(() => {
+    if (topicOrchStart) topicOrchStart.publish(new ROSLIB.Message({ data: 'geofence' }));
+  }, 1500);
 }
 
 function setVConst(v) {
@@ -2026,8 +2119,10 @@ function onRtkFix(msg) {
     const cls = lastRtkStatus.rtcm_state === 'OK' ? 'ok' : 'err';
     rtcmLabel = ` <span class="${cls}">RTCM ${lastRtkStatus.rtcm_state} (${ageStr})</span>`;
   }
+  const hdgLabel = fusedHeadingFresh()
+    ? ` hdg ${lastFusedHeading.deg.toFixed(1)}&deg;` : '';
   $('rtk-state').innerHTML =
-    `${lastRtkFix.lat.toFixed(8)}, ${lastRtkFix.lon.toFixed(8)} — ${fixLabel}${rtcmLabel}`;
+    `${lastRtkFix.lat.toFixed(8)}, ${lastRtkFix.lon.toFixed(8)} — ${fixLabel}${rtcmLabel}${hdgLabel}`;
 
   // Render RTK position as a magenta (FIXED) or amber (FLOAT/other) circle.
   // Plots from raw lat/lon — independent of the odom-projected `robotMarker`,
@@ -2043,12 +2138,80 @@ function onRtkFix(msg) {
       rtkMarker.setLatLng(ll);
       rtkMarker.setStyle({ fillColor });
     }
+    updateRtkHeadingArrow();
+  }
+}
+
+function fusedHeadingFresh() {
+  return lastFusedHeading.deg !== null && (Date.now() - lastFusedHeading.t) < 2000;
+}
+
+function onFusedHeading(msg) {
+  lastFusedHeading = { deg: msg.data, t: Date.now() };
+  updateRtkHeadingArrow();
+  updateRobotFusedArrow();
+}
+
+// Live heading-node diagnostics under the recal button: fused value, mode,
+// calibration state (with sample count while a recal is collecting), and a
+// loud line when the node flags an absolute-source conflict.
+function onHeadingStatus(msg) {
+  let d;
+  try { d = JSON.parse(msg.data); } catch (e) { return; }
+  lastHeadingStatus = { d, t: Date.now() };
+  const el = $('heading-cal-state');
+  const btn = $('btn-recal-heading');
+  const collecting = (d.cal_state || '').startsWith('collecting');
+  if (btn && !btn.disabled) {
+    btn.textContent = collecting
+      ? `Cancel calibration (${d.cal_state})` : 'Recalibrate heading';
+  }
+  if (!el) return;
+  const off = (d.compass_offset_deg !== null && d.compass_offset_deg !== undefined)
+    ? `${d.compass_offset_deg.toFixed(1)}&deg; offset (${d.cal_source || '?'})`
+    : 'no offset';
+  let cal;
+  if (collecting) {
+    cal = `<span class="warn">${d.cal_state} — drive STRAIGHT FORWARD under RTK</span>`;
+  } else if (d.cal_state === 'calibrated') {
+    cal = `<span class="ok">calibrated</span>, ${off}`;
+  } else {
+    cal = `<span class="err">${d.cal_state || 'unknown'}</span>, ${off}`;
+  }
+  const conflict = d.src_conflict
+    ? ' <br><span class="err">SOURCE CONFLICT: compass vs mag disagree — heading NOT trustworthy; recalibrate under RTK</span>'
+    : '';
+  el.innerHTML =
+    `heading ${Number(d.fused_deg).toFixed(1)}&deg; &plusmn;${Number(d.heading_std_deg).toFixed(1)} ` +
+    `(${d.mode}) — ${cal}${conflict}`;
+}
+
+// Heading vector on the RTK marker. /heading/fused is already a compass
+// bearing (deg E-of-N, 0=N, CW+) per heading_node, so it converts straight to
+// an ENU offset (dN = cos θ, dE = sin θ) — no venue/local frame involved, so
+// the pin-arrow mirror bug class (fixed 2026-06-04) cannot apply here.
+const HDG_ARROW_M = 0.6;
+function updateRtkHeadingArrow() {
+  if (!rtkFresh() || !fusedHeadingFresh()) {
+    if (rtkHeadingLine) { map.removeLayer(rtkHeadingLine); rtkHeadingLine = null; }
+    return;
+  }
+  const th = lastFusedHeading.deg * Math.PI/180;
+  const lat = lastRtkFix.lat, lon = lastRtkFix.lon;
+  const dlat = (HDG_ARROW_M * Math.cos(th) / EARTH_R) * 180/Math.PI;
+  const dlon = (HDG_ARROW_M * Math.sin(th) / (EARTH_R * Math.cos(lat*Math.PI/180))) * 180/Math.PI;
+  const seg = [[lat, lon], [lat + dlat, lon + dlon]];
+  if (!rtkHeadingLine) {
+    rtkHeadingLine = L.polyline(seg, { color: '#e91e63', weight: 3 })
+      .addTo(map).bindTooltip('fused heading (/heading/fused)');
+  } else {
+    rtkHeadingLine.setLatLngs(seg);
   }
 }
 
 // Preflight gating from scenarios/*.yaml: warn at 10.8V, halt at 10.5V.
-const BATT_WARN_V = 10.8;
-const BATT_HALT_V = 10.5;
+const BATT_WARN_V = 10.5;
+const BATT_HALT_V = 10.2;
 
 function onLimoStatus(msg) {
   const v = msg.battery_voltage;
@@ -2478,7 +2641,8 @@ function venuePlaceAt(latlng) {
   $('venue-place-hint').textContent = venueHintText();
 }
 map.on('click', (e) => {
-  if (lbBezEditMode) { lbBezierClickAt(e.latlng); return; }   // leg-batch Bézier authoring
+  if (lbMode === 'placeExp') { lbPlaceExpAt(e.latlng); return; }  // leg-batch: place experiment
+  if (lbMode === 'repo') { lbRepoClickAt(e.latlng); return; }     // leg-batch: glue midpoint
   if (venuePlaceMode) { venuePlaceAt(e.latlng); return; }
   if (selectedVenueHandle) { selectedVenueHandle = null; drawVenue(); }   // background click clears selection
 });
@@ -2657,6 +2821,26 @@ $('btn-rospath').onclick = exportRosPath;
 $('btn-copy').onclick = copyLocal;
 $('btn-connect').onclick = connect;
 $('btn-disconnect').onclick = disconnect;
+$('btn-recal-heading').onclick = () => {
+  if (!ros || !topicHeadingCmd) { alert('not connected'); return; }
+  const st = lastHeadingStatus.d;
+  if (st && (st.cal_state || '').startsWith('collecting')) {
+    topicHeadingCmd.publish(new ROSLIB.Message(
+      { data: JSON.stringify({ action: 'cancel_cal' }) }));
+    return;
+  }
+  const cur = fusedHeadingFresh()
+    ? `Current fused heading: ${lastFusedHeading.deg.toFixed(1)} deg.\n` : '';
+  if (!confirm(
+      'Arm compass heading recalibration?\n\n' + cur +
+      'After OK: drive the robot STRAIGHT FORWARD a few meters under RTK ' +
+      '(teleop is fine). The status line under this button counts samples ' +
+      '(n/5) live and flips to "calibrated" when the new offset persists.\n\n' +
+      'Do NOT carry the robot or reverse while armed.'))
+    return;
+  topicHeadingCmd.publish(new ROSLIB.Message(
+    { data: JSON.stringify({ action: 'recalibrate' }) }));
+};
 // btn-push lives in the ad-hoc-curve <details> block; rebound below the
 // reorg so a missing element doesn't throw. The Experiment panel's Pause/
 // Resume buttons are wired further down — they talk to /experiment/cmd
@@ -2857,6 +3041,7 @@ refreshManualPins();
 
 $('teleop-close').onclick = () => setTeleopShown(false);
 $('estop-btn').onclick = toggleEstop;
+$('geofence-restart-btn').onclick = restartGeofence;
 
 // ---------------- Inline keyboard teleop ----------------
 let teleopShown = false;
@@ -3111,16 +3296,27 @@ function lbClearanceEN(pt, poly) {
   return pointInPolygon(pt, poly) ? d : -d;   // pointInPolygon (generic [x,y]) reused
 }
 // Validate a list of [lat,lon] points with the FULL required clearance the NUC
-// enforces (safety_margin + footprint + track), against the normalized polygon.
+// enforces (safety_margin + footprint + track), against the normalized polygon
+// AND every exclusion circle (mirror of venue_geom.check_legs_containment, so
+// green-in-browser == accepted-on-Send).
 function lbValidate(latlonPts) {
   const nc = normalizedVenueCorners();
   if (nc.length < 3) return { ok: false, reason: `need >= 3 corners (have ${venue.corners.length})` };
   const lat0 = nc[0].lat, lon0 = nc[0].lon;
   const poly = nc.map(c => lbLatlonToEN(c.lat, c.lon, lat0, lon0));
+  const excl = (venue.exclusions || []).map(e => {
+    const [ce, cn] = lbLatlonToEN(e.lat, e.lon, lat0, lon0);
+    return [ce, cn, e.radius_m];
+  });
   const req = (venue.safety_margin_m || 0) + LB_FOOTPRINT_M + LB_TRACK_M;
   let mn = Infinity;
-  for (const [la, lo] of latlonPts)
-    mn = Math.min(mn, lbClearanceEN(lbLatlonToEN(la, lo, lat0, lon0), poly));
+  for (const [la, lo] of latlonPts) {
+    const pt = lbLatlonToEN(la, lo, lat0, lon0);
+    let cl = lbClearanceEN(pt, poly);
+    for (const [ce, cn, r] of excl)
+      cl = Math.min(cl, Math.hypot(pt[0]-ce, pt[1]-cn) - r);
+    mn = Math.min(mn, cl);
+  }
   return { ok: mn >= req, minClear: mn, req,
            reason: mn >= req ? `clear ${mn.toFixed(2)}m (need ${req.toFixed(2)}m)`
                              : `${(req-mn).toFixed(2)}m short (clear ${mn.toFixed(2)}m, need ${req.toFixed(2)}m)` };
@@ -3196,186 +3392,285 @@ function lbPlaceAtStartPose(localPts, start) {
   });
 }
 
-// ---- leg-batch state ----
-let lbBezEditMode = false;
-let lbBezCtrl = [];                 // [{lat,lon}] control points
-let lbBezMarkers = [], lbBezCurveLayer = null, lbBezCtrlLayer = null, lbRecLayer = null;
-let lbCurRepo = null, lbCurRecipe = null;   // current leg buffers (backend shapes)
-let lbLegs = [];                    // [{id, curves:[...]}]
+// ---- leg-batch state (operator authors GEOMETRY; system sweeps treatments) ----
+let lbMode = null;             // null | 'placeExp' | 'repo'  (map-click target)
+let lbExps = [];               // [{id, recipe:{type,params}, start:{lat,lon,heading_deg}}]
+let lbRepos = [];              // lbRepos[g] = {mids:[{lat,lon}], v_const, pos_tol_m}
+                               //   gap g connects exp[g].end -> exp[(g+1)%n].start (cyclic)
+let lbSelExp = -1;             // selected experiment index
+let lbRepoGap = 0;             // gap selected for glue drawing
+let lbLayers = [];             // map layers to clear each redraw
 
-function lbBezDrawToggle() {
-  lbBezEditMode = !lbBezEditMode;
-  $('lb-bez-draw').style.outline = lbBezEditMode ? '2px solid #6cf' : '';
-  $('lb-bez-draw').textContent = lbBezEditMode ? 'Click map… (stop)' : 'Draw Bézier (click map)';
-}
-function lbBezierClickAt(latlng) { lbBezCtrl.push({ lat: latlng.lat, lon: latlng.lng }); lbBezierRedraw(); }
-function lbBindBezDrag(m, idx) {
-  m.on('mousedown', () => {
+function lbClearLayers() { lbLayers.forEach(l => { try { map.removeLayer(l); } catch (e) {} }); lbLayers = []; }
+function lbAdd(layer) { lbLayers.push(layer); return layer; }
+function lbBindDrag(marker, onMove) {
+  marker.on('mousedown', () => {
     map.dragging.disable();
-    const move = (ev) => { lbBezCtrl[idx] = { lat: ev.latlng.lat, lon: ev.latlng.lng }; lbBezierRedraw(); };
+    const move = (ev) => onMove(ev.latlng);
     const up = () => { map.off('mousemove', move); map.off('mouseup', up); map.dragging.enable(); };
     map.on('mousemove', move); map.on('mouseup', up);
   });
 }
-function lbBezSamplesDense() {
-  if (lbBezCtrl.length < 2) return [];
-  const coarse = lbBezierSample(lbBezCtrl, 40);
-  const len = lbPolylineLenM(coarse);
-  const n = Math.max(12, Math.min(300, Math.round(len / 0.3)));
-  return lbBezierSample(lbBezCtrl, n);
-}
-function lbBezEndHeading(samples) {
-  const ov = parseFloat($('lb-bez-heading').value);
-  if (isFinite(ov)) return ((ov % 360) + 360) % 360;
-  if (samples.length >= 2) return lbHeadingDeg(samples[samples.length-2], samples[samples.length-1]);
-  return 0;
-}
-function lbBezierRedraw() {
-  [lbBezCurveLayer, lbBezCtrlLayer].forEach(l => { if (l) map.removeLayer(l); });
-  lbBezCurveLayer = lbBezCtrlLayer = null;
-  lbBezMarkers.forEach(m => map.removeLayer(m)); lbBezMarkers = [];
-  if (lbBezCtrl.length >= 1) {
-    lbBezCtrlLayer = L.polyline(lbBezCtrl.map(c => [c.lat, c.lon]),
-      { color: '#0ff', weight: 1, dashArray: '3 5', interactive: false }).addTo(map);
-    lbBezCtrl.forEach((c, i) => {
-      const m = L.circleMarker([c.lat, c.lon], { radius: 6, color: '#0ff', weight: 2,
-        fillColor: '#0ff', fillOpacity: 0.5, pane: 'markerPane', interactive: true })
-        .addTo(map).bindTooltip(`P${i}`);
-      lbBindBezDrag(m, i); lbBezMarkers.push(m);
-    });
-  }
-  if (lbBezCtrl.length >= 2) {
-    const samples = lbBezSamplesDense();
-    lbBezCurveLayer = L.polyline(samples, { color: '#3cf', weight: 3 }).addTo(map);
-    const len = lbPolylineLenM(samples), hd = lbBezEndHeading(samples);
-    const v = lbValidate(samples);
-    $('lb-bez-state').innerHTML =
-      `${lbBezCtrl.length} pts &middot; ${len.toFixed(2)} m &middot; end ${hd.toFixed(0)}&deg; &nbsp; ` +
-      (v.ok ? `<span class="ok">fits (${v.reason})</span>` : `<span class="err">${v.reason}</span>`);
-  } else {
-    $('lb-bez-state').textContent = `${lbBezCtrl.length} pt — need >=2`;
-  }
-}
-function lbBezClear() { lbBezCtrl = []; lbBezierRedraw(); }
-function lbSetRepo() {
-  if (lbBezCtrl.length < 2) { alert('draw a Bézier with >= 2 control points first'); return; }
-  const samples = lbBezSamplesDense();
-  const v = lbValidate(samples);
-  if (!v.ok && !confirm(`Reposition curve FAILS fit (${v.reason}). Add anyway?`)) return;
-  lbCurRepo = {
-    name: 'repo', kind: 'reposition',
-    waypoints_wgs84: samples.map(p => ({ lat: p[0], lon: p[1] })),
-    end_heading_deg: lbBezEndHeading(samples),
-    v_const: parseFloat($('lb-bez-v').value) || 0.4,
-    pos_tol_m: parseFloat($('lb-bez-postol').value) || 0.15,
-  };
-  $('lb-bez-state').innerHTML += `<br><span class="ok">set as leg reposition</span>`;
-  lbRecipeRedraw();
-}
 
-// ---- recipe ----
-function lbRecipeDef() {
+// ---- experiment recipe inputs <-> the selected experiment ----
+function lbReadRecipeInputs() {
   const type = $('lb-rec-type').value;
   const params = { L1: parseFloat($('lb-rec-L1').value) || 0, R: parseFloat($('lb-rec-R').value) || 0.5,
                    L2: parseFloat($('lb-rec-L2').value) || 0, direction: parseInt($('lb-rec-dir').value, 10) };
   if (type === 'step') params.theta_arc = (parseFloat($('lb-rec-theta').value) || 90) * Math.PI/180;
   return { type, params };
 }
-function lbRecipeStartPose() {
-  if (lbCurRepo && lbCurRepo.waypoints_wgs84.length) {
-    const last = lbCurRepo.waypoints_wgs84[lbCurRepo.waypoints_wgs84.length-1];
-    return { lat: last.lat, lon: last.lon, heading_deg: lbCurRepo.end_heading_deg };
-  }
-  // Fallback: the cyan path-anchor marker (odom pose) -> lat/lon + compass heading.
-  const a = venueAnchor();
-  const ll = localToLatLon([pathAnchor.x, pathAnchor.y], a.lat0, a.lon0, a.bearing);
-  return { lat: ll[0], lon: ll[1], heading_deg: ((a.bearing - pathAnchor.theta*180/Math.PI) % 360 + 360) % 360 };
+function lbWriteRecipeInputs(e) {
+  if (!e) return;
+  $('lb-rec-type').value = e.recipe.type;
+  $('lb-rec-R').value = e.recipe.params.R;
+  $('lb-rec-L1').value = e.recipe.params.L1;
+  $('lb-rec-L2').value = e.recipe.params.L2;
+  $('lb-rec-dir').value = String(e.recipe.params.direction >= 0 ? 1 : -1);
+  if (e.recipe.params.theta_arc != null) $('lb-rec-theta').value = Math.round(e.recipe.params.theta_arc * 180/Math.PI);
+  $('lb-rec-heading').value = Math.round(e.start.heading_deg);
 }
-function lbRecipeRedraw() {
-  if (lbRecLayer) { map.removeLayer(lbRecLayer); lbRecLayer = null; }
-  const start = lbRecipeStartPose();
-  $('lb-rec-startpose').textContent =
-    `start pose: ${start.lat.toFixed(7)}, ${start.lon.toFixed(7)} @ ${start.heading_deg.toFixed(0)}°` +
-    (lbCurRepo ? ' (from reposition end)' : ' (from cyan anchor — set a reposition Bézier)');
-  const recipe = lbRecipeDef();
-  const latlon = lbPlaceAtStartPose(lbStepRecipeLocal(recipe), start);
-  lbRecLayer = L.polyline(latlon, { color: '#fa0', weight: 3 }).addTo(map);
-  const v = lbValidate(latlon);
-  $('lb-rec-state').innerHTML = v.ok
-    ? `<span class="ok">fits (${v.reason})</span>` : `<span class="err">${v.reason}</span>`;
-}
-function lbSetRecipe() {
-  const start = lbRecipeStartPose();
-  const recipe = lbRecipeDef();
-  const latlon = lbPlaceAtStartPose(lbStepRecipeLocal(recipe), start);
-  const v = lbValidate(latlon);
-  if (!v.ok && !confirm(`Recipe FAILS fit (${v.reason}). Add anyway?`)) return;
-  const R = recipe.params.R;
-  lbCurRecipe = {
-    name: `exp_${recipe.type}_R${('' + R).replace('.', 'p')}`,
-    kind: 'recipe', scored: $('lb-rec-scored').checked,
-    controller: $('lb-rec-ctrl').value, v_const: parseFloat($('lb-rec-v').value) || 0.5,
-    start_pose: start, recipe,
-  };
-  $('lb-rec-state').innerHTML += `<br><span class="ok">set as leg experiment (${lbCurRecipe.controller})</span>`;
+function lbApplyInputsToSel() {
+  if (lbSelExp < 0 || lbSelExp >= lbExps.length) return;
+  const e = lbExps[lbSelExp];
+  e.recipe = lbReadRecipeInputs();
+  const h = parseFloat($('lb-rec-heading').value);
+  if (isFinite(h)) e.start.heading_deg = ((h % 360) + 360) % 360;
+  lbRedrawAll();
 }
 
-// ---- leg assembly ----
-function lbAddLeg() {
-  const curves = [];
-  if (lbCurRepo) curves.push(lbCurRepo);
-  if (lbCurRecipe) curves.push(lbCurRecipe);
-  if (!curves.length) { alert('set a reposition and/or recipe first'); return; }
-  lbLegs.push({ id: `leg_${lbLegs.length+1}`, curves });
-  lbCurRepo = null; lbCurRecipe = null;
-  lbBezClear();
-  if (lbRecLayer) { map.removeLayer(lbRecLayer); lbRecLayer = null; }
-  $('lb-rec-state').textContent = '(set reposition to preview the recipe)';
-  lbRenderLegs();
+// ---- experiment geometry (mirror NUC placement) ----
+function lbExpLatLon(e) { return lbPlaceAtStartPose(lbStepRecipeLocal(e.recipe), e.start); }
+function lbExpEnd(e) { const p = lbExpLatLon(e); return p[p.length - 1]; }  // [lat,lon]
+
+// ---- place / select / delete experiments ----
+function lbPlaceExpToggle() {
+  lbMode = (lbMode === 'placeExp') ? null : 'placeExp';
+  $('lb-exp-add').style.outline = lbMode === 'placeExp' ? '2px solid #6cf' : '';
+  $('lb-exp-add').textContent = lbMode === 'placeExp' ? 'Click map to place… (stop)' : 'Place experiment (click map)';
+  map.getContainer().style.cursor = lbMode ? 'crosshair' : '';
 }
-function lbDupLeg() {
-  if (!lbLegs.length) { alert('no legs to duplicate'); return; }
-  const src = lbLegs[lbLegs.length-1];
-  const clone = JSON.parse(JSON.stringify(src));
-  clone.id = `leg_${lbLegs.length+1}`;
-  clone.curves.forEach(c => { if (c.kind === 'recipe')
-    c.controller = (c.controller === 'pid-ff') ? 'lpv-hinf' : 'pid-ff'; });
-  lbLegs.push(clone);
+function lbPlaceExpAt(latlng) {
+  const id = 'exp' + (lbExps.length + 1);
+  lbExps.push({ id, recipe: lbReadRecipeInputs(),
+                start: { lat: latlng.lat, lon: latlng.lng,
+                         heading_deg: parseFloat($('lb-rec-heading').value) || 0 } });
+  lbSelExp = lbExps.length - 1;
+  lbRebuildGapSelect();
+  lbRedrawAll();
+}
+function lbDelExp() {
+  if (lbSelExp < 0) { alert('select an experiment first (click its cyan anchor)'); return; }
+  lbExps.splice(lbSelExp, 1);
+  lbRepos = [];   // gaps renumbered — drawn glue is invalidated
+  lbSelExp = lbExps.length ? Math.min(lbSelExp, lbExps.length - 1) : -1;
+  if (lbSelExp >= 0) lbWriteRecipeInputs(lbExps[lbSelExp]);
+  lbRebuildGapSelect();
+  lbRedrawAll();
+}
+
+// ---- reposition glue (Bézier with snapped endpoints) ----
+function lbRepoDrawToggle() {
+  if (lbExps.length < 1) { alert('place at least one experiment first'); return; }
+  lbMode = (lbMode === 'repo') ? null : 'repo';
+  lbRepoGap = parseInt($('lb-repo-gap').value, 10) || 0;
+  $('lb-repo-draw').style.outline = lbMode === 'repo' ? '2px solid #6cf' : '';
+  $('lb-repo-draw').textContent = lbMode === 'repo' ? 'Click map for midpoints… (stop)' : 'Draw glue (click map)';
+  map.getContainer().style.cursor = lbMode ? 'crosshair' : '';
+}
+function lbRepo(g) {
+  if (!lbRepos[g]) lbRepos[g] = { mids: [], v_const: parseFloat($('lb-repo-v').value) || 0.4,
+                                  pos_tol_m: parseFloat($('lb-repo-postol').value) || 0.15 };
+  return lbRepos[g];
+}
+function lbRepoClickAt(latlng) { lbRepo(lbRepoGap).mids.push({ lat: latlng.lat, lon: latlng.lng }); lbRedrawAll(); }
+function lbRepoClearMids() {
+  const g = parseInt($('lb-repo-gap').value, 10) || 0;
+  if (lbRepos[g]) lbRepos[g].mids = [];
+  lbRedrawAll();
+}
+function lbRepoCtrl(g) {            // full Bézier control polygon (endpoints snapped)
+  const n = lbExps.length;
+  const a = lbExpEnd(lbExps[g]);
+  const b = lbExps[(g + 1) % n].start;
+  const mids = lbRepos[g] ? lbRepos[g].mids : [];
+  return [{ lat: a[0], lon: a[1] }, ...mids, { lat: b.lat, lon: b.lon }];
+}
+function lbRepoSamples(g) {
+  const ctrl = lbRepoCtrl(g);
+  const len = lbPolylineLenM(ctrl.map(c => [c.lat, c.lon]));
+  const n = Math.max(12, Math.min(300, Math.round(len / 0.3)));
+  return lbBezierSample(ctrl, n);
+}
+function lbRebuildGapSelect() {
+  const sel = $('lb-repo-gap'); if (!sel) return;
+  const n = lbExps.length, prev = parseInt(sel.value, 10);
+  sel.innerHTML = '';
+  for (let g = 0; g < n; g++) {
+    const to = (g + 1) % n;
+    const o = document.createElement('option');
+    o.value = g;
+    o.textContent = `${lbExps[g].id} → ${lbExps[to].id}` + (to === 0 ? ' (close loop)' : '');
+    sel.appendChild(o);
+  }
+  if (Number.isInteger(prev) && prev < n) sel.value = String(prev);
+}
+
+// ---- draw everything ----
+function lbRedrawAll() {
+  lbClearLayers();
+  const n = lbExps.length;
+  lbExps.forEach((e, i) => {
+    const latlon = lbExpLatLon(e), sel = (i === lbSelExp), v = lbValidate(latlon);
+    lbAdd(L.polyline(latlon, { color: v.ok ? '#fa0' : '#f55', weight: sel ? 5 : 3, opacity: sel ? 1 : 0.8 }).addTo(map));
+    // start anchor (cyan) — click selects, drag moves
+    const sm = L.circleMarker([e.start.lat, e.start.lon], { radius: 7, color: '#0ff', weight: 2,
+      fillColor: '#0ff', fillOpacity: sel ? 0.8 : 0.4, pane: 'markerPane', interactive: true })
+      .addTo(map).bindTooltip(`${e.id} start`);
+    sm.on('click', () => { lbSelExp = i; lbWriteRecipeInputs(e); lbRedrawAll(); });
+    lbBindDrag(sm, (ll) => { lbSelExp = i; e.start.lat = ll.lat; e.start.lon = ll.lng; lbRedrawAll(); });
+    lbAdd(sm);
+    // rotate handle (green) — 1 m along heading; drag sets heading
+    const hh = (e.start.heading_deg || 0) * Math.PI/180;
+    const hlat = e.start.lat + (Math.cos(hh) * 1.0) / 111320.0;
+    const hlon = e.start.lon + (Math.sin(hh) * 1.0) / (111320.0 * Math.cos(e.start.lat * Math.PI/180));
+    const hm = L.circleMarker([hlat, hlon], { radius: 5, color: '#3f3', weight: 2,
+      fillColor: '#3f3', fillOpacity: 0.6, pane: 'markerPane', interactive: true })
+      .addTo(map).bindTooltip(`${e.id} heading`);
+    lbBindDrag(hm, (ll) => { lbSelExp = i;
+      e.start.heading_deg = lbHeadingDeg([e.start.lat, e.start.lon], [ll.lat, ll.lng]);
+      $('lb-rec-heading').value = Math.round(e.start.heading_deg); lbRedrawAll(); });
+    lbAdd(hm);
+    const end = lbExpEnd(e);
+    lbAdd(L.circleMarker(end, { radius: 4, color: '#fa0', weight: 2, fillColor: '#fa0',
+      fillOpacity: 0.9, pane: 'markerPane', interactive: false }).addTo(map).bindTooltip(`${e.id} end`));
+  });
+  // reposition glue
+  for (let g = 0; g < n; g++) {
+    const active = (lbMode === 'repo' && g === lbRepoGap);
+    const drawn = !!lbRepos[g];
+    const s = lbRepoSamples(g), v = lbValidate(s);
+    lbAdd(L.polyline(s, { color: v.ok ? '#3cf' : '#f55', weight: active ? 4 : (drawn ? 3 : 2),
+      dashArray: (drawn || active) ? null : '4 6', opacity: (drawn || active) ? 1 : 0.6 }).addTo(map));
+    (lbRepos[g] ? lbRepos[g].mids : []).forEach((m) => {
+      const mm = L.circleMarker([m.lat, m.lon], { radius: 5, color: '#3cf', weight: 2,
+        fillColor: '#3cf', fillOpacity: 0.5, pane: 'markerPane', interactive: true }).addTo(map);
+      lbBindDrag(mm, (ll) => { m.lat = ll.lat; m.lon = ll.lng; lbRedrawAll(); });
+      lbAdd(mm);
+    });
+  }
+  lbUpdateReadouts();
   lbRenderLegs();
+  lbPersist();   // every mutation path ends here — keep the restore snapshot current
+}
+
+// ---- persistence (mirror restoreVenue: a browser reload must not eat the
+// operator-authored experiments + glue; the venue survived, these didn't) ----
+const LS_LB_KEY = 'limo_battle_last_legbatch';
+function lbPersist() {
+  try {
+    localStorage.setItem(LS_LB_KEY, JSON.stringify({
+      exps: lbExps, repos: lbRepos, repoGap: lbRepoGap,
+    }));
+  } catch (e) {}
+}
+function lbRestore() {
+  try {
+    const raw = localStorage.getItem(LS_LB_KEY);
+    if (!raw) return;
+    const d = JSON.parse(raw);
+    const finite = (v) => typeof v === 'number' && isFinite(v);
+    // Same corrupt-save guard idea as restoreVenue: drop entries that would
+    // draw at null island or crash lbExpLatLon.
+    lbExps = (Array.isArray(d.exps) ? d.exps : []).filter(e =>
+      e && e.start && finite(e.start.lat) && finite(e.start.lon) &&
+      Math.abs(e.start.lat) >= 1 && e.recipe && e.recipe.params);
+    lbRepos = Array.isArray(d.repos)
+      ? d.repos.map(r => (r && Array.isArray(r.mids)) ? r : undefined)
+      : [];
+    lbRepoGap = (finite(d.repoGap) && d.repoGap >= 0 && d.repoGap < lbExps.length)
+      ? d.repoGap : 0;
+    lbSelExp = -1;   // selection is session state, not worth restoring
+  } catch (e) { console.warn('leg-batch restore failed', e); }
+}
+function lbUpdateReadouts() {
+  if (lbSelExp >= 0 && lbSelExp < lbExps.length) {
+    const e = lbExps[lbSelExp], v = lbValidate(lbExpLatLon(e));
+    $('lb-exp-state').innerHTML = `selected ${e.id} (${e.recipe.type} R${e.recipe.params.R}) @ ${Math.round(e.start.heading_deg)}° — ` +
+      (v.ok ? `<span class="ok">${v.reason}</span>` : `<span class="err">${v.reason}</span>`);
+  } else {
+    $('lb-exp-state').textContent = lbExps.length ? `${lbExps.length} experiments (none selected)` : '(no experiment placed)';
+  }
+  const g = parseInt(($('lb-repo-gap') || {}).value, 10);
+  if (lbExps.length >= 1 && isFinite(g)) {
+    const s = lbRepoSamples(g), v = lbValidate(s), nm = lbRepos[g] ? lbRepos[g].mids.length : 0;
+    $('lb-repo-state').innerHTML = `glue ${lbExps[g].id}→${lbExps[(g + 1) % lbExps.length].id}: ${nm} midpts, ${lbPolylineLenM(s).toFixed(2)}m — ` +
+      (v.ok ? `<span class="ok">${v.reason}</span>` : `<span class="err">${v.reason}</span>`);
+  } else {
+    $('lb-repo-state').textContent = '(no glue)';
+  }
+}
+
+// ---- legs: auto-assembled cyclic [glue -> experiment] ----
+function lbBuiltLegs() {
+  const n = lbExps.length;
+  if (n < 1) return [];
+  return lbExps.map((e, i) => {
+    const gap = (i - 1 + n) % n;   // the glue that ARRIVES at exp[i].start
+    const samples = lbRepoSamples(gap);
+    const repo = {
+      name: `repo_to_${e.id}`, kind: 'reposition',
+      waypoints_wgs84: samples.map(p => ({ lat: p[0], lon: p[1] })),
+      end_heading_deg: e.start.heading_deg,
+      v_const: lbRepos[gap] ? lbRepos[gap].v_const : (parseFloat($('lb-repo-v').value) || 0.4),
+      pos_tol_m: lbRepos[gap] ? lbRepos[gap].pos_tol_m : (parseFloat($('lb-repo-postol').value) || 0.15),
+    };
+    const recipe = {                 // NO controller / v_const — the system sweeps them
+      name: `${e.id}_${e.recipe.type}_R${('' + e.recipe.params.R).replace('.', 'p')}`,
+      kind: 'recipe', scored: true,
+      start_pose: { lat: e.start.lat, lon: e.start.lon, heading_deg: e.start.heading_deg },
+      recipe: e.recipe,
+    };
+    return { id: `leg_${i + 1}`, curves: [repo, recipe] };
+  });
 }
 function lbRenderLegs() {
-  if (!lbLegs.length) { $('lb-legs').textContent = 'legs: 0'; return; }
-  let html = `legs: ${lbLegs.length}<br>`;
-  lbLegs.forEach((lg, i) => {
+  const legs = lbBuiltLegs();
+  if (!legs.length) { $('lb-legs').textContent = 'legs: 0'; return; }
+  let bad = 0;
+  lbExps.forEach(e => { if (!lbValidate(lbExpLatLon(e)).ok) bad++; });
+  for (let g = 0; g < lbExps.length; g++) if (!lbValidate(lbRepoSamples(g)).ok) bad++;
+  let html = `legs: ${legs.length} ` +
+    (bad ? `<span class="err">(${bad} curve(s) fail fit)</span>` : `<span class="ok">(all fit)</span>`) + '<br>';
+  legs.forEach((lg, i) => {
     const rec = lg.curves.find(c => c.kind === 'recipe');
-    const rep = lg.curves.find(c => c.kind === 'reposition');
-    const tag = rec ? `${rec.controller} ${rec.recipe.type} R${rec.recipe.params.R}` : 'reposition-only';
-    html += `<div class="row" style="justify-content:space-between;align-items:center;">` +
-      `<span>${i+1}. ${lg.id} — ${rep ? 'bézier+' : ''}${tag}</span>` +
-      `<button data-lb-del="${i}" style="padding:2px 6px;">✕</button></div>`;
+    html += `<div>${i + 1}. ${lg.id} — glue + ${rec.recipe.type} R${rec.recipe.params.R}</div>`;
   });
   $('lb-legs').innerHTML = html;
-  $('lb-legs').querySelectorAll('[data-lb-del]').forEach(b => {
-    b.onclick = () => { lbLegs.splice(parseInt(b.dataset.lbDel, 10), 1);
-      lbLegs.forEach((lg, k) => lg.id = `leg_${k+1}`); lbRenderLegs(); };
-  });
 }
-function lbClearLegs() { if (confirm('Clear all authored legs?')) { lbLegs = []; lbRenderLegs(); } }
+function lbClearAll() {
+  if (!confirm('Clear all experiments + glue?')) return;
+  lbExps = []; lbRepos = []; lbSelExp = -1; lbRepoGap = 0;
+  if (lbMode) { lbMode = null; map.getContainer().style.cursor = '';
+    $('lb-exp-add').style.outline = ''; $('lb-repo-draw').style.outline = ''; }
+  lbRebuildGapSelect(); lbRedrawAll();
+}
 
-// ---- send + run ----
+// ---- send ----
 function lbBuildPayload() {
   const v = venueToJSON();
   const a = venueAnchor();
   v.schema_version = 2;
   v.anchor = { lat0: a.lat0, lon0: a.lon0, bearing_deg: a.bearing };
-  v.legs = lbLegs.map((lg, i) => ({ id: lg.id || `leg_${i+1}`, curves: lg.curves }));
+  v.legs = lbBuiltLegs();
   return v;
 }
 function lbSend() {
   if (!ros || !topicVenueLoad) { alert('not connected'); return; }
-  if (!lbLegs.length) { alert('author at least one leg first'); return; }
+  if (!lbExps.length) { alert('place at least one experiment first'); return; }
+  const legs = lbBuiltLegs();
   topicVenueLoad.publish(new ROSLIB.Message({ data: JSON.stringify(lbBuildPayload()) }));
-  $('lb-send-state').innerHTML = `<span class="pill">sent ${lbLegs.length} legs @ ${new Date().toLocaleTimeString()} — awaiting /venue/load_status</span>`;
+  $('lb-send-state').innerHTML = `<span class="pill">sent ${legs.length} legs @ ${new Date().toLocaleTimeString()} — awaiting /venue/load_status</span>`;
 }
 function lbStart() {
   if (!ros || !topicRunGo) { alert('not connected'); return; }
@@ -3405,15 +3700,17 @@ function onVenueLoadStatus(msg) {
 function onVenueLoaded(msg) {
   let d; try { d = JSON.parse(msg.data); } catch (e) { return; }
   if (d && d.name) $('lb-send-state').title =
-    `active: ${d.name} — ${d.n_legs} legs, ${d.n_complete} complete, ${d.total_scored} scored`;
+    `active: ${d.name} — ${d.n_legs} legs, ${d.total_scored} scored (live progress: /run/status)`;
 }
 function onRunStatus(msg) {
   let d; try { d = JSON.parse(msg.data); } catch (e) {
     $('lb-run-status').innerHTML = '<span class="err">bad /run/status JSON</span>'; return; }
   const phase = d.phase || '--';
   const leg = (d.n_legs) ? `leg ${Math.min((d.leg_index||0)+1, d.n_legs)}/${d.n_legs}` : 'leg --';
+  const sweep = (d.runs_target) ? `sweep ${d.runs_done||0}/${d.runs_target}` : `done ${d.n_complete||0}`;
+  const t = d.treatment ? ` &nbsp; <span class="pill">${d.treatment.controller} v${d.treatment.v_const} rep${d.treatment.rep}</span>` : '';
   $('lb-run-status').innerHTML =
-    `<span class="pill">${phase}</span> &nbsp; ${leg} &nbsp; done ${d.n_complete||0}/${d.n_legs||0}<br>` +
+    `<span class="pill">${phase}</span> &nbsp; ${leg} &nbsp; ${sweep}${t}<br>` +
     `curve: ${d.curve_name || '--'} (${d.curve_kind || '--'}) &nbsp; rtk q=${d.rtk_q != null ? d.rtk_q : '--'}` +
     (d.battery_v != null ? ` &nbsp; batt ${Number(d.battery_v).toFixed(2)}V` : '') +
     (d.message ? `<br><span class="small">${d.message}</span>` : '');
@@ -3425,21 +3722,22 @@ function onRunStatus(msg) {
 }
 
 // ---- wire-up ----
-$('lb-bez-draw').onclick  = lbBezDrawToggle;
-$('lb-bez-clear').onclick = lbBezClear;
-$('lb-bez-set').onclick   = lbSetRepo;
-$('lb-bez-heading').oninput = lbBezierRedraw;
-['lb-rec-type','lb-rec-ctrl','lb-rec-R','lb-rec-L1','lb-rec-theta','lb-rec-L2','lb-rec-dir','lb-rec-v']
-  .forEach(id => { const el = $(id); if (el) el.addEventListener('input', () => { if (lbCurRepo || true) lbRecipeRedraw(); }); });
-$('lb-rec-set').onclick   = lbSetRecipe;
-$('lb-add-leg').onclick   = lbAddLeg;
-$('lb-dup-ctrl').onclick  = lbDupLeg;
-$('lb-clear-legs').onclick = lbClearLegs;
-$('lb-send').onclick      = lbSend;
-$('lb-start').onclick     = lbStart;
-$('lb-pause').onclick     = () => lbRunCmd('pause');
-$('lb-abort').onclick     = lbAbort;
-lbRenderLegs();
+$('lb-exp-add').onclick    = lbPlaceExpToggle;
+$('lb-exp-del').onclick    = lbDelExp;
+['lb-rec-type','lb-rec-R','lb-rec-L1','lb-rec-theta','lb-rec-L2','lb-rec-dir','lb-rec-heading']
+  .forEach(id => { const el = $(id); if (el) el.addEventListener('input', lbApplyInputsToSel); });
+$('lb-repo-draw').onclick  = lbRepoDrawToggle;
+$('lb-repo-clear').onclick = lbRepoClearMids;
+$('lb-repo-gap').onchange  = () => { lbRepoGap = parseInt($('lb-repo-gap').value, 10) || 0; lbRedrawAll(); };
+$('lb-clear-all').onclick  = lbClearAll;
+$('lb-send').onclick       = lbSend;
+$('lb-start').onclick      = lbStart;
+$('lb-pause').onclick      = () => lbRunCmd('pause');
+$('lb-abort').onclick      = lbAbort;
+lbRestore();             // bring back authored experiments + glue (like restoreVenue)
+lbRebuildGapSelect();
+if ($('lb-repo-gap') && lbRepoGap < lbExps.length) $('lb-repo-gap').value = String(lbRepoGap);
+lbRedrawAll();           // draws restored paths; no-op when nothing was saved
 </script>
 </body>
 </html>

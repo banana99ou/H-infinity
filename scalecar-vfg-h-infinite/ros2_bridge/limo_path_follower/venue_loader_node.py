@@ -11,21 +11,23 @@ recipe) on ``/venue/load``. This node:
      allowed if it was checkable before motion);
   2. atomically persists it to ``scenarios/venues/<name>.json`` and refreshes
      ``scenarios/venues/active.json`` — the single file run_executor + geofence read;
-  3. clears the leg-progress checkpoint so the next Start runs from leg 1;
-  4. if the polygon changed, auto-restarts the geofence proc (via the
+  3. if the polygon changed, auto-restarts the geofence proc (via the
      orchestrator) so the safety boundary reloads.
+
+(There is no leg checkpoint file: run_executor resumes by rescanning the bag
+manifest for passing runs; live progress is on /run/status.)
 
   sub  /venue/load         std_msgs/String  JSON   (the Send-to-NUC payload)
   pub  /venue/loaded       std_msgs/String  JSON (latched)
-       {name, n_legs, n_complete, total_scored, active_venue_file, error}
+       {name, n_legs, total_scored, active_venue_file, error}
   pub  /venue/load_status  std_msgs/String  JSON (latched)  {ok, message}
   pub  /orchestrator/{kill,start}  std_msgs/String   (geofence reload on polygon change)
   sub  /orchestrator/status        std_msgs/String   (confirm geofence down before restart)
 """
 import json
+import math
 import os
 import time
-from datetime import datetime, timezone
 
 import rclpy
 from rclpy.node import Node
@@ -67,9 +69,6 @@ class VenueLoaderNode(Node):
         self.declare_parameter(
             "active_file",
             os.path.join(_REPO_ROOT, "scenarios", "venues", "active.json"))
-        self.declare_parameter(
-            "checkpoint_path",
-            os.path.join(_REPO_ROOT, "Experiment Data", "run_checkpoint.json"))
         self.declare_parameter("robot_footprint_radius_m", 0.30)
         self.declare_parameter("path_tracking_margin_m", 0.30)
         self.declare_parameter("geofence_proc", "geofence")
@@ -79,7 +78,6 @@ class VenueLoaderNode(Node):
 
         self._venues_dir = str(self.get_parameter("venues_dir").value)
         self._active_file = str(self.get_parameter("active_file").value)
-        self._checkpoint_path = str(self.get_parameter("checkpoint_path").value)
         self._footprint_r = float(self.get_parameter("robot_footprint_radius_m").value)
         self._track_margin = float(self.get_parameter("path_tracking_margin_m").value)
         self._geofence_proc = str(self.get_parameter("geofence_proc").value)
@@ -147,18 +145,15 @@ class VenueLoaderNode(Node):
             self.get_logger().error(f"persist failed: {exc}")
             return
 
-        # A new batch starts fresh: clear the leg-progress checkpoint.
-        self._clear_checkpoint(name)
-
         legs = v.get("legs") or []
         total_scored = sum(
             1 for lg in legs
             for c in (lg.get("curves") or [])
             if str(c.get("kind", "")).lower() == "recipe" and c.get("scored", True))
-        self._publish_loaded(name, len(legs), 0, total_scored, error="")
+        self._publish_loaded(name, len(legs), total_scored, error="")
         self._load_status(
-            True, f"loaded '{name}': {len(legs)} legs, {total_scored} scored. "
-            f"Progress reset. Press Start to run.")
+            True, f"loaded '{name}': {len(legs)} legs, {total_scored} scored "
+            f"geometries. Press Start to run.")
         self.get_logger().info(
             f"venue '{name}' persisted: {len(legs)} legs ({total_scored} scored). "
             f"polygon_changed={polygon_changed}.")
@@ -169,6 +164,20 @@ class VenueLoaderNode(Node):
     # ------------------------------------------------------------------
     # Validation
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _bad_latlon(obj):
+        """True unless obj has finite numeric 'lat' and 'lon'. Guards the
+        downstream consumers (run_executor goto build, venue_geom) against a
+        hand-edited payload crashing them at run time."""
+        if not isinstance(obj, dict):
+            return True
+        try:
+            lat = float(obj["lat"])
+            lon = float(obj["lon"])
+        except (KeyError, TypeError, ValueError):
+            return True
+        return not (math.isfinite(lat) and math.isfinite(lon))
 
     def _validate(self, v):
         if not isinstance(v, dict):
@@ -188,11 +197,19 @@ class VenueLoaderNode(Node):
                 if kind not in VALID_KINDS:
                     return False, f"leg {li} curve {ci}: bad kind '{kind}'"
                 if kind == "reposition":
-                    if len(c.get("waypoints_wgs84") or []) < 1:
+                    wps = c.get("waypoints_wgs84") or []
+                    if len(wps) < 1:
                         return False, f"leg {li} curve {ci}: reposition needs waypoints"
+                    for wi, w in enumerate(wps):
+                        if self._bad_latlon(w):
+                            return False, (f"leg {li} curve {ci}: waypoint {wi} "
+                                           "lacks finite lat/lon")
                 elif kind == "recipe":
                     if not c.get("start_pose"):
                         return False, f"leg {li} curve {ci}: recipe needs start_pose"
+                    if self._bad_latlon(c.get("start_pose")):
+                        return False, (f"leg {li} curve {ci}: start_pose lacks "
+                                       "finite lat/lon")
                     rt = str((c.get("recipe") or {}).get("type", "")).lower()
                     if rt not in VALID_RECIPE_TYPES:
                         return False, f"leg {li} curve {ci}: bad recipe type '{rt}'"
@@ -230,23 +247,6 @@ class VenueLoaderNode(Node):
         except (FileNotFoundError, ValueError):
             return True
         return (cur.get("corners_wgs84") or []) != (new_v.get("corners_wgs84") or [])
-
-    def _clear_checkpoint(self, venue_name):
-        try:
-            self._atomic_write(self._checkpoint_path, {
-                "venue_name": venue_name,
-                "completed_leg_ids": [],
-                "updated_utc": datetime.now(timezone.utc).isoformat(),
-            })
-        except Exception as exc:
-            self.get_logger().warn(f"checkpoint clear failed: {exc}")
-
-    def _read_checkpoint(self):
-        try:
-            with open(self._checkpoint_path, "r", encoding="utf-8") as f:
-                return json.load(f) or {}
-        except (FileNotFoundError, ValueError):
-            return {}
 
     # ------------------------------------------------------------------
     # Geofence reload
@@ -291,7 +291,7 @@ class VenueLoaderNode(Node):
             with open(self._active_file, "r", encoding="utf-8") as f:
                 v = json.load(f)
         except (FileNotFoundError, ValueError):
-            self._publish_loaded(None, 0, 0, 0, error="no active venue loaded")
+            self._publish_loaded(None, 0, 0, error="no active venue loaded")
             return
         name = str(v.get("name") or "venue")
         legs = v.get("legs") or []
@@ -299,16 +299,12 @@ class VenueLoaderNode(Node):
             1 for lg in legs
             for c in (lg.get("curves") or [])
             if str(c.get("kind", "")).lower() == "recipe" and c.get("scored", True))
-        cp = self._read_checkpoint()
-        n_complete = (len(cp.get("completed_leg_ids", []))
-                      if cp.get("venue_name") == name else 0)
-        self._publish_loaded(name, len(legs), n_complete, total_scored, error="")
+        self._publish_loaded(name, len(legs), total_scored, error="")
 
-    def _publish_loaded(self, name, n_legs, n_complete, total_scored, error=""):
+    def _publish_loaded(self, name, n_legs, total_scored, error=""):
         self.pub_loaded.publish(String(data=json.dumps({
             "name": name,
             "n_legs": n_legs,
-            "n_complete": n_complete,
             "total_scored": total_scored,
             "active_venue_file": self._active_file,
             "error": error,

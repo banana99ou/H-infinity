@@ -377,6 +377,20 @@ class PathFollowerNode(Node):
             self.get_logger().error(f'Failed to parse recipe JSON: {exc}')
             return
 
+        # Explicit clear: run_executor latches {"type": "none"} before each
+        # follower (re)spawn so a fresh subscriber replays a harmless no-op
+        # instead of the PREVIOUS leg's curve (which would start this node
+        # driving at default params before set_parameters/the real recipe).
+        if isinstance(d, dict) and str(d.get('type', '')).lower().strip() == 'none':
+            if self.path is not None:
+                self.get_logger().info('Recipe "none": clearing loaded path.')
+            self.path = None
+            self.guidance = None
+            self._path_source = None
+            self._delta_prev = 0.0
+            self._publish_done(False)
+            return
+
         try:
             new_path = self.build_path_from_recipe(d)
         except Exception as exc:

@@ -5,11 +5,16 @@ The operator authors a venue + an ordered list of LEGS in the WebUI (each leg =
 a reposition glue curve + a scored experiment recipe), Sends it (venue_loader
 persists active.json), then presses ONE Start button (``/run/go``). This node:
 
-  - finds the first INCOMPLETE leg (resume point — "which leg to run"),
-  - re-checks containment of every remaining curve BEFORE any motion,
-  - runs a one-time preflight, then runs that leg and every leg after it, in
-    order, auto-advancing, until all legs finish OR the battery hits the halt
-    threshold (then Start again resumes at the next incomplete leg).
+  - rescans the bag-root manifest to count which (controller, v_const, rep)
+    cells already PASSED for each authored geometry (that is the resume
+    mechanism — there is no leg checkpoint file),
+  - re-checks containment of every curve BEFORE any motion,
+  - runs a one-time preflight, then CYCLES the authored legs from leg 0,
+    auto-advancing; each recipe traversal is assigned the least-done remaining
+    treatment for its geometry (geometry-full legs are driven UNSCORED so the
+    next reposition still lines up), until every geometry is filled or
+    retry-exhausted OR the battery hits the halt threshold (then Start again
+    rescans the manifest and continues filling the gaps).
 
 Per curve:
   reposition -> reposition_node follows the DRAWN waypoints under RTK +
@@ -73,6 +78,18 @@ try:
 except Exception:  # pragma: no cover
     import venue_geom
 
+# manifest.py (tools/analysis) lives outside the colcon package. It is the source
+# of truth for "which (controller, v_const, rep) cells already passed" — the
+# system (not the operator) chooses the treatment for each authored geometry by
+# reusing load_experiment/discover_legs/build_rows/cell_key here.
+_TOOLS_ANALYSIS = os.path.join(_REPO_ROOT, "tools", "analysis")
+if _TOOLS_ANALYSIS not in sys.path:
+    sys.path.insert(0, _TOOLS_ANALYSIS)
+try:
+    import manifest  # type: ignore
+except Exception:  # pragma: no cover
+    manifest = None
+
 
 PROC_REPOSITION = "reposition"
 PROC_ODOM_ZERO = "odom_zero"
@@ -83,8 +100,12 @@ RTK_FIXED = 4
 RTK_OK = (4, 5)
 
 DEFAULT_ACTIVE = os.path.join(_REPO_ROOT, "scenarios", "venues", "active.json")
-DEFAULT_CHECKPOINT = os.path.join(_REPO_ROOT, "Experiment Data", "run_checkpoint.json")
 DEFAULT_BAG_ROOT = os.path.join(_REPO_ROOT, "Experiment Data")
+
+# Neutral recipe published (latched) just before each follower spawn so a fresh
+# follower replays a harmless clear instead of the PREVIOUS leg's curve (which
+# would start it driving at default params before SET_PARAMS/PUSH_RECIPE).
+NEUTRAL_RECIPE = json.dumps({"type": "none"})
 
 
 class Phase(Enum):
@@ -111,13 +132,18 @@ class RunExecutor(Node):
         super().__init__("run_executor_node")
 
         self.declare_parameter("active_venue_file", DEFAULT_ACTIVE)
-        self.declare_parameter("checkpoint_path", DEFAULT_CHECKPOINT)
         self.declare_parameter("bag_root", DEFAULT_BAG_ROOT)
+        self.declare_parameter(
+            "experiment_yaml",
+            os.path.join(_REPO_ROOT, "scenarios", "experiment.yaml"))
         self.declare_parameter("preflight_timeout_s", 60.0)
         self.declare_parameter("reposition_timeout_s", 120.0)
         self.declare_parameter("run_timeout_s", 180.0)
         self.declare_parameter("orchestrator_settle_s", 3.0)
-        self.declare_parameter("odom_settle_s", 3.0)
+        # Confirm window for the odom_zero reset, timed from the FIRST reset
+        # send (not phase entry). Generous: it must absorb a cold odom_zero
+        # spawn whose subscription appears 1-2 s after the proc is "alive".
+        self.declare_parameter("odom_settle_s", 10.0)
         self.declare_parameter("rtk_fix_wait_s", 30.0)       # scored-run FIXED gate
         self.declare_parameter("rtk_loss_wait_s", 5.0)       # FIXED loss during scored run
         self.declare_parameter("heartbeat_s", 30.0)
@@ -125,10 +151,15 @@ class RunExecutor(Node):
         self.declare_parameter("rtk_run_window_pct", 95.0)
         self.declare_parameter("robot_footprint_radius_m", 0.30)
         self.declare_parameter("path_tracking_margin_m", 0.30)
+        # Max acceptable |heading error| (deg) reported by reposition at arrival.
+        # Larger => the analytic recipe would run ROTATED by that error in the
+        # world (odom is zeroed at the achieved heading), leaving the corridor
+        # the containment check verified -> pause for the operator instead.
+        self.declare_parameter("arrival_heading_tol_deg", 20.0)
 
         self._active_file = str(self.get_parameter("active_venue_file").value)
-        self._checkpoint_path = str(self.get_parameter("checkpoint_path").value)
         self._bag_root = str(self.get_parameter("bag_root").value)
+        self._experiment_yaml = str(self.get_parameter("experiment_yaml").value)
         self._preflight_timeout = float(self.get_parameter("preflight_timeout_s").value)
         self._reposition_timeout = float(self.get_parameter("reposition_timeout_s").value)
         self._run_timeout = float(self.get_parameter("run_timeout_s").value)
@@ -141,16 +172,33 @@ class RunExecutor(Node):
         self._rtk_window_pct = float(self.get_parameter("rtk_run_window_pct").value)
         self._footprint_r = float(self.get_parameter("robot_footprint_radius_m").value)
         self._track_margin = float(self.get_parameter("path_tracking_margin_m").value)
+        self._arrival_head_tol = float(
+            self.get_parameter("arrival_heading_tol_deg").value)
 
         # -- Batch state -----------------------------------------------
         self._venue = {}
         self._legs = []
         self._run_id = "run"
-        self._completed = set()
         self._leg_idx = 0
         self._curve_idx = 0
         self._cur_curve = None
         self._cur_recipe = {}
+
+        # -- Matrix / treatment sweep (system chooses controller x v x rep) ---
+        # The operator authors only GEOMETRY (step shape at radius R); the system
+        # fills controller x v_const x rep(N) per geometry from experiment.yaml +
+        # the success manifest. counts/attempts are keyed off manifest cell_key.
+        self._controllers = []          # matrix.controller, e.g. [lpv-hinf, pid]
+        self._speeds = []               # matrix.v_const,    e.g. [1.0, 0.5]
+        self._target_n = 0              # repetitions per cell
+        self._max_retries = 2           # retry.max_retries (per-cell classification)
+        self._breaker_k = 3             # retry.circuit_breaker_k (consecutive)
+        self._completed_counts = {}     # cell_key -> #passing runs (this venue)
+        self._attempts = {}             # (fam,R,c,v) -> consecutive failed attempts
+        self._consec_fail = 0           # consecutive scored-run classification fails
+        self._cur_treatment = None      # {controller, v_const, rep} or None (glue)
+        self._cur_scored = False        # effective scored flag for the current curve
+        self._leg_cell_id = None        # treatment-qualified cell id (bag dir + sidecar)
 
         self.phase = Phase.IDLE
         self._phase_entered = time.monotonic()
@@ -166,10 +214,14 @@ class RunExecutor(Node):
         self._leg_rtk_total_samples = 0
         self._run_end_reason = None
         self._goto_sent = False
+        self._goto_seq = 0            # monotonically increasing goto id; reposition
+                                      # echoes it so stale 'arrived' can't be honored
+        self._goto_last_send_t = 0.0  # monotonic time of last goto (re-)send
         self._params_sent = False
         self._params_future = None
         self._odom_reset_sent = False
-        self._odom_reset_command_t = None
+        self._odom_reset_command_t = None       # ROS time of first send (confirm gate)
+        self._odom_reset_first_sent_t = None    # monotonic time of first send (timeout)
         self._rtk_lost_since = None
 
         # -- Sensor snapshots ------------------------------------------
@@ -224,11 +276,12 @@ class RunExecutor(Node):
 
         # Load whatever is on disk so a fresh WebUI connect sees progress.
         self._reload_active()
-        self._completed = self._load_completed()
+        if self._load_matrix():
+            self._rebuild_counts()
         self.get_logger().info(
             f"run_executor_node up. active={self._active_file}: "
-            f"{len(self._legs)} legs, {len(self._completed)} complete. "
-            f"Waiting for /run/go (Start).")
+            f"{len(self._legs)} legs, {self._runs_done()}/{self._runs_target()} "
+            f"scored runs done. Waiting for /run/go (Start).")
         self._publish_status(message="loaded")
 
     # ==================================================================
@@ -240,8 +293,14 @@ class RunExecutor(Node):
             self._begin_run()
         elif self.phase == Phase.PAUSED:
             self._resume()
-        elif self.phase == Phase.DONE:
-            self.get_logger().info("Start ignored — batch DONE (re-Send to redo).")
+        elif self.phase in (Phase.DONE, Phase.ABORTED):
+            # Not terminal: Start re-reads active.json + the manifest and runs
+            # whatever remains (re-enters DONE cleanly if nothing does). This is
+            # what lets a re-Send venue / post-abort session continue without
+            # restarting this node.
+            self.get_logger().info(
+                f"Start from {self.phase.value}: reloading venue + manifest.")
+            self._start_or_resume()
         else:
             self.get_logger().info(f"Start ignored — phase={self.phase.value}")
 
@@ -377,56 +436,208 @@ class RunExecutor(Node):
         self._legs = v.get("legs") or []
         self._run_id = str(v.get("name") or "run")
 
-    def _load_completed(self):
-        try:
-            with open(self._checkpoint_path, "r", encoding="utf-8") as f:
-                cp = json.load(f)
-        except (FileNotFoundError, ValueError):
-            return set()
-        if str(cp.get("venue_name")) != str(self._run_id):
-            return set()
-        return set(cp.get("completed_leg_ids", []))
+    # -- Matrix + manifest (the treatment brain) -----------------------
 
-    def _save_completed(self):
+    def _load_matrix(self):
+        """Read controller/v_const/repetitions/retry from experiment.yaml.
+        Returns True iff a usable matrix was loaded."""
+        if manifest is None:
+            self.get_logger().error("manifest tooling unavailable — cannot sweep")
+            return False
         try:
-            os.makedirs(os.path.dirname(self._checkpoint_path) or ".", exist_ok=True)
-            tmp = self._checkpoint_path + ".tmp"
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump({
-                    "venue_name": self._run_id,
-                    "completed_leg_ids": sorted(self._completed),
-                    "updated_utc": datetime.now(timezone.utc).isoformat(),
-                }, f, indent=2)
-                f.write("\n")
-            os.replace(tmp, self._checkpoint_path)
+            _expected, reps, doc = manifest.load_experiment(self._experiment_yaml)
         except Exception as exc:
-            self.get_logger().error(f"checkpoint save failed: {exc}")
+            self.get_logger().error(f"load_experiment failed: {exc}")
+            return False
+        matrix = doc.get("matrix") or {}
+        self._controllers = [str(c) for c in (matrix.get("controller") or [])]
+        self._speeds = [float(v) for v in (matrix.get("v_const") or [])]
+        self._target_n = int(reps or 0)
+        retry = doc.get("retry") or {}
+        self._max_retries = int(retry.get("max_retries", 2))
+        self._breaker_k = int(retry.get("circuit_breaker_k", 3))
+        if not self._controllers or not self._speeds or self._target_n <= 0:
+            self.get_logger().error(
+                "experiment.yaml matrix missing controller/v_const/repetitions")
+            return False
+        return True
+
+    def _rebuild_counts(self):
+        """Count passing scored runs for THIS venue from the bag-root manifest.
+        Keyed by cell_key(controller, v_const, path_family, radius_m)."""
+        self._completed_counts = {}
+        if manifest is None:
+            return
+        try:
+            legs = manifest.discover_legs(self._bag_root)
+            rows = manifest.build_rows(legs)
+        except Exception as exc:
+            self.get_logger().warn(f"manifest scan failed: {exc}")
+            return
+        for r in rows:
+            if r.get("sidecar_pass") is not True:
+                continue
+            if str(r.get("run_id")) != str(self._run_id):
+                continue          # other venue/batch — must not mark us done
+            k = manifest.cell_key({
+                "controller": r.get("controller"), "v_const": r.get("v_const"),
+                "path_family": r.get("path_family"), "radius_m": r.get("radius_m")})
+            if k is not None:
+                self._completed_counts[k] = self._completed_counts.get(k, 0) + 1
 
     def _leg_id(self, idx):
         if 0 <= idx < len(self._legs):
             return self._legs[idx].get("id", f"leg_{idx}")
         return None
 
-    def _first_incomplete_leg(self):
-        for i in range(len(self._legs)):
-            if self._leg_id(i) not in self._completed:
-                return i
-        return len(self._legs)
+    def _recipe_curve(self, leg):
+        for c in (leg.get("curves") or []):
+            if str(c.get("kind", "")).lower() == "recipe":
+                return c
+        return None
 
-    def _begin_run(self):
+    def _geometry_of(self, leg):
+        """(path_family, R) for the leg's scored recipe, or None for glue /
+        unscored / non-recipe legs (never swept)."""
+        rec = self._recipe_curve(leg)
+        if not rec or not bool(rec.get("scored", True)):
+            return None
+        recipe = rec.get("recipe") or {}
+        fam = recipe.get("type")
+        R = (recipe.get("params") or {}).get("R")
+        if fam is None or R is None:
+            return None
+        return (str(fam), R)
+
+    def _cell_key_for(self, fam, R, c, v):
+        return manifest.cell_key({
+            "controller": c, "v_const": v, "path_family": fam, "radius_m": R})
+
+    def _cell_id_for(self, curve):
+        """Treatment-qualified id -> unique bag dir + sidecar cell_id per rep
+        (build_leg_dirname stamps only to the minute, so two reps in one minute
+        would otherwise collide)."""
+        base = curve.get("name", "curve")
+        t = self._cur_treatment
+        if t is None:
+            return base
+
+        def _g(x):
+            return ("%g" % float(x)).replace(".", "p")
+
+        return f"{base}_{t['controller']}_v{_g(t['v_const'])}_n{int(t['rep']):02d}"
+
+    def _next_treatment_for(self, leg):
+        """The next (controller, v_const, rep) to fill for this leg's geometry —
+        the least-done, non-exhausted cell (round-robin "fill gaps"). None when
+        the geometry is fully filled / retry-exhausted / not a scored recipe."""
+        geom = self._geometry_of(leg)
+        if geom is None:
+            return None
+        fam, R = geom
+        best = None   # (done, order, c, v)
+        order = 0
+        for c in self._controllers:
+            for v in self._speeds:
+                order += 1
+                key = self._cell_key_for(fam, R, c, v)
+                if key is None:
+                    continue
+                if self._completed_counts.get(key, 0) >= self._target_n:
+                    continue
+                if self._attempts.get((fam, R, c, v), 0) >= self._max_retries:
+                    continue   # retry-exhausted — skip so the cycle can finish
+                cand = (self._completed_counts.get(key, 0), order, c, v)
+                if best is None or cand[:2] < best[:2]:
+                    best = cand
+        if best is None:
+            return None
+        done, _order, c, v = best
+        return {"controller": c, "v_const": float(v), "rep": int(done)}
+
+    def _all_geometries_done(self):
+        return all(self._next_treatment_for(lg) is None for lg in self._legs)
+
+    def _scored_geometries(self):
+        seen, out = set(), []
+        for lg in self._legs:
+            geom = self._geometry_of(lg)
+            if geom is not None and geom not in seen:
+                seen.add(geom)
+                out.append(geom)
+        return out
+
+    def _runs_target(self):
+        per = len(self._controllers) * len(self._speeds) * max(self._target_n, 0)
+        return len(self._scored_geometries()) * per
+
+    def _runs_done(self):
+        total = 0
+        for fam, R in self._scored_geometries():
+            for c in self._controllers:
+                for v in self._speeds:
+                    key = self._cell_key_for(fam, R, c, v)
+                    if key is not None:
+                        total += min(self._completed_counts.get(key, 0),
+                                     self._target_n)
+        return total
+
+    def _record_treatment_result(self, passed):
+        """Update per-cell counts/attempts + the consecutive-failure breaker
+        after a scored run that REACHED the end (passed = classification.pass)."""
+        t = self._cur_treatment
+        if t is None:
+            return
+        geom = self._geometry_of(self._legs[self._leg_idx])
+        if geom is None:
+            return
+        fam, R = geom
+        k_cell = (fam, R, t["controller"], t["v_const"])
+        key = self._cell_key_for(fam, R, t["controller"], t["v_const"])
+        if passed:
+            if key is not None:
+                self._completed_counts[key] = self._completed_counts.get(key, 0) + 1
+            self._attempts[k_cell] = 0
+            self._consec_fail = 0
+            self.get_logger().info(
+                f"PASS {fam} R{R} {t['controller']} v{t['v_const']} rep{t['rep']} "
+                f"({self._completed_counts.get(key, 0)}/{self._target_n}).")
+        else:
+            self._attempts[k_cell] = self._attempts.get(k_cell, 0) + 1
+            self._consec_fail += 1
+            self.get_logger().warn(
+                f"FAIL-classification {fam} R{R} {t['controller']} v{t['v_const']} "
+                f"attempt {self._attempts[k_cell]}/{self._max_retries}, "
+                f"consec {self._consec_fail}/{self._breaker_k}.")
+            if self._consec_fail >= self._breaker_k:
+                self._pause(
+                    f"circuit breaker: {self._consec_fail} consecutive scored-run "
+                    "classification failures — check RTK/venue, then Start to resume")
+
+    def _start_or_resume(self):
+        """Shared Start/resume entry: reload venue + matrix + manifest counts,
+        reset session retry state, containment-gate, then PREFLIGHT (or DONE)."""
+        self.phase = Phase.IDLE   # so _pause/_enter below are not no-ops on resume
         self._reload_active()
         if not self._legs:
             self._publish_status(message="no legs loaded — Send a venue first")
             return
-        self._completed = self._load_completed()
-        self._leg_idx = self._first_incomplete_leg()
+        if not self._load_matrix():
+            self._pause("experiment.yaml unreadable — cannot choose treatments")
+            return
+        self._rebuild_counts()
+        self._attempts = {}
+        self._consec_fail = 0
+        self._pause_reason = None
+        self._rtk_lost_since = None
+        self._done_notified = False
+        self._leg_idx = 0
         self._curve_idx = 0
-        if self._leg_idx >= len(self._legs):
+        if self._all_geometries_done():
             self._enter(Phase.DONE)
             return
         ok, report = venue_geom.check_legs_containment(
-            self._legs[self._leg_idx:], self._venue,
-            self._footprint_r, self._track_margin)
+            self._legs, self._venue, self._footprint_r, self._track_margin)
         if not ok:
             self.get_logger().error(
                 "VENUE CONTAINMENT FAILED — refusing to run (no motion):\n" + report)
@@ -434,25 +645,18 @@ class RunExecutor(Node):
             return
         self.get_logger().info("venue containment OK — " + report)
         self.get_logger().info(
-            f"starting at leg {self._leg_idx + 1}/{len(self._legs)} "
-            f"('{self._leg_id(self._leg_idx)}').")
+            f"sweep: {self._runs_done()}/{self._runs_target()} scored runs done "
+            f"across {len(self._scored_geometries())} geometries; "
+            f"controllers={self._controllers} speeds={self._speeds} N={self._target_n}.")
         self._enter(Phase.PREFLIGHT)
+
+    def _begin_run(self):
+        self._start_or_resume()
 
     def _resume(self):
         if self.phase != Phase.PAUSED:
             return
-        self._completed = self._load_completed()
-        self._leg_idx = self._first_incomplete_leg()
-        self._curve_idx = 0
-        self._pause_reason = None
-        self._rtk_lost_since = None
-        if self._leg_idx >= len(self._legs):
-            self._enter(Phase.DONE)
-            return
-        self.get_logger().info(
-            f"resume at leg {self._leg_idx + 1}/{len(self._legs)} "
-            f"('{self._leg_id(self._leg_idx)}').")
-        self._enter(Phase.PREFLIGHT)
+        self._start_or_resume()
 
     def _begin_current_curve(self):
         if self._leg_idx >= len(self._legs):
@@ -465,8 +669,28 @@ class RunExecutor(Node):
         self._cur_curve = curves[self._curve_idx]
         kind = str(self._cur_curve.get("kind", "")).lower()
         if kind == "reposition":
+            self._cur_treatment = None   # glue move — no scored treatment
+            self._cur_scored = False
             self._enter(Phase.REPOSITION_START)
         elif kind == "recipe":
+            # The SYSTEM picks the treatment (controller x v_const x rep) for this
+            # geometry from the matrix + manifest. None => geometry already full /
+            # retry-exhausted / unscored => drive it UNSCORED as glue (no bag /
+            # sidecar / FIXED gate) so the next reposition still lines up.
+            self._cur_treatment = self._next_treatment_for(self._legs[self._leg_idx])
+            self._cur_scored = (self._cur_treatment is not None
+                                and bool(self._cur_curve.get("scored", True)))
+            if self._cur_treatment is not None:
+                t = self._cur_treatment
+                self.get_logger().info(
+                    f"leg '{self._leg_id(self._leg_idx)}' recipe "
+                    f"'{self._cur_curve.get('name')}': treatment "
+                    f"{t['controller']} v{t['v_const']} rep{t['rep']}.")
+            else:
+                self.get_logger().info(
+                    f"leg '{self._leg_id(self._leg_idx)}' recipe "
+                    f"'{self._cur_curve.get('name')}': geometry full — "
+                    "unscored traversal.")
             self._enter(Phase.KILL_REPOSITION)
         else:
             self._pause(f"unknown curve kind '{kind}'")
@@ -481,14 +705,14 @@ class RunExecutor(Node):
 
     def _complete_leg(self):
         lid = self._leg_id(self._leg_idx)
-        self._completed.add(lid)
-        self._save_completed()
         self.get_logger().info(
-            f"leg '{lid}' complete ({len(self._completed)}/{len(self._legs)}).")
-        self._publish_status(message=f"leg '{lid}' complete")
-        self._leg_idx += 1
+            f"leg '{lid}' done — sweep {self._runs_done()}/{self._runs_target()}.")
+        self._publish_status(message=f"leg '{lid}' done")
+        # Cycle the authored legs ("fill gaps"); finish when no geometry has a
+        # remaining treatment (every cell passed or retry-exhausted).
+        self._leg_idx = (self._leg_idx + 1) % len(self._legs)
         self._curve_idx = 0
-        if self._leg_idx >= len(self._legs):
+        if self._all_geometries_done():
             self._enter(Phase.DONE)
             return
         # M2 battery gate between legs: never start a new leg below halt.
@@ -509,6 +733,14 @@ class RunExecutor(Node):
             if phase == Phase.ODOM_RESET:
                 self._odom_reset_sent = False
                 self._odom_reset_command_t = None
+                self._odom_reset_first_sent_t = None
+            if phase == Phase.FOLLOWER_START:
+                # Neutralize the latched recipe BEFORE the follower spawns: a
+                # fresh follower replays the last latched message, and the
+                # previous leg's curve would start it driving at default params
+                # while we are still in SET_PARAMS. The real recipe follows in
+                # PUSH_RECIPE on this same latched publisher.
+                self.pub_recipe.publish(String(data=NEUTRAL_RECIPE))
         self.phase = phase
         self._phase_entered = time.monotonic()
         self._publish_status()
@@ -575,21 +807,65 @@ class RunExecutor(Node):
             return
         if self._in_phase_s() < self._settle_s and self._repo_state is None:
             return
-        if not self._goto_sent:
-            curve = self._cur_curve
-            wps = curve.get("waypoints_wgs84") or []
-            payload = {
-                "waypoints": [{"lat": w["lat"], "lon": w["lon"]} for w in wps],
-                "v_const": float(curve.get("v_const", 0.4)),
-                "pos_tol_m": float(curve.get("pos_tol_m", 0.15)),
-            }
-            if curve.get("end_heading_deg") is not None:
-                payload["end_heading_deg"] = float(curve["end_heading_deg"])
-            self.pub_goto.publish(String(data=json.dumps(payload)))
-            self._goto_sent = True
+        # Send the goto, then RE-SEND at ~1 Hz until /reposition/status echoes
+        # our seq (the ack). A single volatile publish races the fresh
+        # reposition's subscription DDS-matching after a respawn and is
+        # silently dropped (hw-observed 2026-06-10: leg-2 goto never arrived).
+        # Re-sending the SAME seq is idempotent: a duplicate inside the ~50 ms
+        # ack window just re-commits the identical mission. The seq echo also
+        # guarantees a stale 'arrived' (still streamed from the PREVIOUS goto
+        # while reposition stays alive across consecutive glue curves) can
+        # never be honored for THIS goto.
+        if not self._goto_sent or self._repo_status.get("seq") != self._goto_seq:
+            if (self.pub_goto.get_subscription_count() >= 1
+                    and time.monotonic() - self._goto_last_send_t >= 1.0):
+                curve = self._cur_curve
+                try:
+                    wps = curve.get("waypoints_wgs84") or []
+                    payload = {
+                        "waypoints": [{"lat": float(w["lat"]),
+                                       "lon": float(w["lon"])} for w in wps],
+                        "v_const": float(curve.get("v_const", 0.4)),
+                        "pos_tol_m": float(curve.get("pos_tol_m", 0.15)),
+                    }
+                    if curve.get("end_heading_deg") is not None:
+                        payload["end_heading_deg"] = float(curve["end_heading_deg"])
+                except (KeyError, TypeError, ValueError) as exc:
+                    # A malformed curve must pause, not kill this node from
+                    # inside the timer callback (venue_loader validates, but
+                    # active.json can be hand-edited).
+                    self._pause(f"malformed reposition curve "
+                                f"'{curve.get('name')}': {exc!r}")
+                    return
+                if not self._goto_sent:
+                    self._goto_seq += 1   # one id per curve, kept across re-sends
+                payload["seq"] = self._goto_seq
+                self.pub_goto.publish(String(data=json.dumps(payload)))
+                self._goto_sent = True
+                self._goto_last_send_t = time.monotonic()
+            if self._in_phase_s() > self._reposition_timeout:
+                self._goto_sent = False
+                self._pause("reposition goto timeout (goto never acked)")
             return
         if self._repo_state == "arrived":
             self._goto_sent = False
+            err_deg = self._repo_status.get("err_deg")
+            if (self._cur_curve.get("end_heading_deg") is not None
+                    and isinstance(err_deg, (int, float))
+                    and abs(float(err_deg)) > self._arrival_head_tol):
+                # The recipe runs in the odom frame zeroed at the ACHIEVED
+                # heading: a large arrival heading error rotates the whole
+                # checked path in the world. Don't run it.
+                self._pause(
+                    f"arrived with heading error {float(err_deg):.1f} deg > "
+                    f"{self._arrival_head_tol:.0f} deg — recipe would run rotated "
+                    "outside the checked corridor; re-author the glue tail, "
+                    "then Start")
+                return
+            if err_deg is None and self._cur_curve.get("end_heading_deg") is not None:
+                self.get_logger().warn(
+                    "arrived with UNKNOWN heading error (fused heading stale?) — "
+                    "proceeding; recipe heading unverified.")
             self._advance_curve()
         elif self._repo_state == "aborted":
             self._goto_sent = False
@@ -614,11 +890,22 @@ class RunExecutor(Node):
             if self._in_phase_s() > self._reposition_timeout:
                 self._pause("odom_zero failed to start")
             return
+        # Orchestrator "alive" means the PROCESS spawned; a cold odom_zero's
+        # /odom_zero/reset subscription appears 1-2 s later, and a volatile
+        # publish with no subscriber is silently dropped. So: wait for the
+        # subscription to exist, then RE-SEND every tick until the latched
+        # status confirms (the robot is stationary here — re-latching the same
+        # standstill pose is harmless; the confirm gate keys off the FIRST send
+        # time, so any latch at/after it counts).
+        if self.pub_odom_reset.get_subscription_count() < 1:
+            if self._in_phase_s() > self._reposition_timeout:
+                self._pause("odom_zero alive but /odom_zero/reset never subscribed")
+            return
         if not self._odom_reset_sent:
             self._odom_reset_command_t = self._ros_now_s()
-            self.pub_odom_reset.publish(Bool(data=True))
+            self._odom_reset_first_sent_t = time.monotonic()
             self._odom_reset_sent = True
-            return
+        self.pub_odom_reset.publish(Bool(data=True))
         s = self._odom_zero_status or {}
         if (s.get("has_reset") is True and s.get("stamp") is not None
                 and float(s["stamp"]) >= float(self._odom_reset_command_t)):
@@ -628,13 +915,14 @@ class RunExecutor(Node):
                 f"y={origin.get('y')}, yaw={origin.get('yaw')}).")
             self._enter(Phase.BAG_START)
             return
-        if self._in_phase_s() > self._odom_settle_s:
+        if time.monotonic() - self._odom_reset_first_sent_t > self._odom_settle_s:
             self._pause(
-                f"odom_zero reset not confirmed within {self._odom_settle_s:.1f}s")
+                f"odom_zero reset not confirmed within {self._odom_settle_s:.1f}s "
+                "of first send")
 
     def _tick_bag_start(self):
         curve = self._cur_curve
-        scored = bool(curve.get("scored", True))
+        scored = self._cur_scored
         # RTK FIXED(4) gate for scored runs: the bag's RTK is the post-hoc ground
         # truth, so do not start recording until FIXED.
         if scored and self._rtk_quality != RTK_FIXED:
@@ -646,13 +934,14 @@ class RunExecutor(Node):
                 f"RTK not FIXED(4) for scored run (q={self._rtk_quality})")
             return
         self._reset_run_scratch()
+        self._leg_cell_id = self._cell_id_for(curve)
         if scored:
             if Data_Logger is None:
                 self._pause("recorder unavailable (Data_Logger import failed)")
                 return
             try:
                 dirname = Data_Logger.build_leg_dirname(
-                    self._run_id, curve.get("name", "curve"),
+                    self._run_id, self._leg_cell_id,
                     self._leg_id(self._leg_idx))
                 self._leg_bag_path = os.path.join(self._bag_root, dirname)
                 self._recorder = Data_Logger.BagRecorder(
@@ -679,9 +968,17 @@ class RunExecutor(Node):
                 self._pause("follower not alive for set_params")
             return
         if not self._params_sent:
-            fut = self._set_follower_params(
-                curve.get("controller", "lpv-hinf"),
-                float(curve.get("v_const", 1.0)))
+            # Controller + v_const come from the SYSTEM-chosen treatment, not the
+            # authored curve. None (unscored traversal) -> any valid params drive.
+            if self._cur_treatment is not None:
+                ctrl = self._cur_treatment["controller"]
+                vc = float(self._cur_treatment["v_const"])
+            else:
+                # Unscored traversal: params are "don't care" for science, so
+                # pick the LEAST aggressive speed in the matrix, not the first.
+                ctrl = self._controllers[0] if self._controllers else "lpv-hinf"
+                vc = float(min(self._speeds)) if self._speeds else 0.5
+            fut = self._set_follower_params(ctrl, vc)
             if fut is None:
                 if self._in_phase_s() > self._reposition_timeout:
                     self._pause("follower set_parameters service never ready")
@@ -691,18 +988,32 @@ class RunExecutor(Node):
             return
         if self._params_future.done():
             self._params_sent = False
+            # future.done() != success: a rejected parameter (e.g. bad
+            # controller_type) returns successful=False per result.
+            try:
+                results = list(self._params_future.result().results)
+            except Exception as exc:
+                self._pause(f"follower set_parameters call failed: {exc}")
+                return
+            bad = [r.reason for r in results if not r.successful]
+            if bad:
+                self._pause("follower rejected params: " + "; ".join(bad))
+                return
             self._enter(Phase.PUSH_RECIPE)
 
     def _tick_push_recipe(self):
         curve = self._cur_curve
         self._cur_recipe = curve.get("recipe", {}) or {}
-        self.pub_recipe.publish(String(data=json.dumps(self._cur_recipe)))
+        # Clear the done flag BEFORE publishing: an in-flight stale done=True
+        # arriving after the clear-but-before-RUN would otherwise end the run
+        # instantly. (The follower also re-publishes done=False on path load.)
         self._done = False
         self._rtk_lost_since = None
+        self.pub_recipe.publish(String(data=json.dumps(self._cur_recipe)))
         self._enter(Phase.RUN)
 
     def _tick_run(self):
-        scored = bool(self._cur_curve.get("scored", True))
+        scored = self._cur_scored
         if self._estop or self._leg_estopped:
             self._end_run("estop during run")
             return
@@ -730,7 +1041,7 @@ class RunExecutor(Node):
 
     def _tick_stop_leg(self):
         curve = self._cur_curve
-        scored = bool(curve.get("scored", True))
+        scored = self._cur_scored
         info = {}
         if self._recorder is not None:
             try:
@@ -741,24 +1052,32 @@ class RunExecutor(Node):
         # Release cmd_vel_raw before anything else moves (C6).
         self._orch_kill(PROC_FOLLOWER)
         reached = (self._run_end_reason == "done")
-        if scored and self._leg_bag_path:
-            self._write_sidecar(curve, info, reached)
-        if reached:
-            self.get_logger().info(
-                f"curve '{curve.get('name')}' done "
-                f"(end_reason={self._run_end_reason}).")
-            self._publish_status(message=f"curve '{curve.get('name')}' done")
-            self._advance_curve()
-        else:
+        if not reached:
             self._pause(f"curve '{curve.get('name')}' failed: {self._run_end_reason}")
+            return
+        if scored and self._leg_bag_path:
+            passed = self._write_sidecar(curve, info, reached)
+            self._record_treatment_result(passed)
+            if self.phase == Phase.PAUSED:   # circuit breaker tripped
+                return
+        self.get_logger().info(
+            f"curve '{curve.get('name')}' done (end_reason={self._run_end_reason}).")
+        self._publish_status(message=f"curve '{curve.get('name')}' done")
+        self._advance_curve()
 
     def _tick_done(self):
         if not getattr(self, "_done_notified", False):
             self._done_notified = True
             self._safe_state()
-            self.get_logger().info(
-                f"batch COMPLETE: {len(self._completed)}/{len(self._legs)} legs.")
-            self._publish_status(message="batch complete")
+            done, target = self._runs_done(), self._runs_target()
+            exhausted = [k for k, n in self._attempts.items()
+                         if n >= self._max_retries]
+            msg = f"batch COMPLETE: {done}/{target} scored runs."
+            if exhausted:
+                msg += (f" {len(exhausted)} cell(s) retry-exhausted / incomplete: "
+                        f"{exhausted}")
+            self.get_logger().info(msg)
+            self._publish_status(message=msg)
 
     def _tick_aborted(self):
         pass
@@ -768,8 +1087,14 @@ class RunExecutor(Node):
     # ==================================================================
 
     def _write_sidecar(self, curve, bag_info, reached):
+        """Write the leg sidecar with the SYSTEM-chosen treatment. Returns the
+        classification.pass verdict (False on any failure to write)."""
         if Data_Logger is None or not self._leg_bag_path:
-            return
+            return False
+        t = self._cur_treatment or {}
+        ctrl = t.get("controller", "lpv-hinf")
+        vc = float(t.get("v_const", 1.0))
+        rep = int(t.get("rep", 0))
         try:
             if self._leg_rtk_total_samples > 0:
                 pct = 100.0 * self._leg_rtk_fixed_samples / self._leg_rtk_total_samples
@@ -789,7 +1114,7 @@ class RunExecutor(Node):
             path_frame_anchor = None
             if sp:
                 path_frame_anchor = {
-                    "pin_id": curve.get("name"),
+                    "pin_id": self._leg_cell_id,
                     "lat": float(sp["lat"]),
                     "lon": float(sp["lon"]),
                     "heading_deg": float(sp.get("heading_deg", 0.0)),
@@ -798,18 +1123,18 @@ class RunExecutor(Node):
             params = recipe.get("params", {}) or {}
             sidecar = Data_Logger.build_sidecar(
                 run_id=self._run_id,
-                cell_id=curve.get("name", "curve"),
+                cell_id=self._leg_cell_id or curve.get("name", "curve"),
                 leg=self._leg_id(self._leg_idx),
                 cell_params={
-                    "controller": curve.get("controller", "lpv-hinf"),
-                    "v_const": curve.get("v_const", 1.0),
+                    "controller": ctrl,
+                    "v_const": vc,
                     "radius_m": params.get("R"),
                     "path_family": recipe.get("type"),
-                    "rep": 0,
+                    "rep": rep,
                 },
                 path_recipe=recipe,
                 venue_id=self._venue.get("name"),
-                start_pin_id=curve.get("name"),
+                start_pin_id=self._leg_cell_id,
                 end_pin_id=None,
                 rtk_summary={
                     "fixed_pct": classification["rtk_fixed_pct"],
@@ -824,16 +1149,18 @@ class RunExecutor(Node):
                     "duration_s": bag_info.get("duration_s"),
                 },
                 controller_tuning={
-                    "controller_type": curve.get("controller", "lpv-hinf"),
-                    "v_const": curve.get("v_const", 1.0),
+                    "controller_type": ctrl,
+                    "v_const": vc,
                 },
                 bag_path=self._leg_bag_path,
                 topics=Data_Logger.TOPICS,
                 path_frame_anchor=path_frame_anchor,
             )
             Data_Logger.write_sidecar(self._leg_bag_path, sidecar)
+            return bool(classification["pass"])
         except Exception as exc:
             self.get_logger().error(f"sidecar write failed: {exc}")
+            return False
 
     # ==================================================================
     # Pause / abort / safe-state
@@ -878,6 +1205,7 @@ class RunExecutor(Node):
 
     def _reset_run_scratch(self):
         self._leg_bag_path = None
+        self._leg_cell_id = None
         self._leg_start_utc = None
         self._leg_estopped = False
         self._leg_rtk_fixed_samples = 0
@@ -897,13 +1225,17 @@ class RunExecutor(Node):
                             Phase.PUSH_RECIPE, Phase.RUN):
             cmd_owner = "follower"
         curve = self._cur_curve or {}
+        runs_done = self._runs_done()
         self.pub_status.publish(String(data=json.dumps({
             "run_id": self._run_id,
             "venue": self._venue.get("name"),
             "phase": self.phase.value,
             "leg_index": self._leg_idx,
             "n_legs": len(self._legs),
-            "n_complete": len(self._completed),
+            "n_complete": runs_done,
+            "runs_done": runs_done,
+            "runs_target": self._runs_target(),
+            "treatment": self._cur_treatment,
             "leg_id": self._leg_id(self._leg_idx),
             "curve_name": curve.get("name"),
             "curve_kind": curve.get("kind"),

@@ -118,11 +118,15 @@ def recipe_points_en(recipe, start_pose, lat0, lon0, spacing_m=0.10):
 
 def check_legs_containment(legs, venue, footprint_r, track_margin, spacing_m=0.25):
     """Verify every curve of every leg fits inside the venue polygon minus
-    margins. Returns (ok: bool, report: str).
+    margins AND clear of every exclusion circle. Returns (ok: bool, report: str).
 
-    Required clearance = safety_margin_m + footprint_r + track_margin. Recipe
-    curves are sampled+placed at their start_pose; reposition curves check each
-    waypoint and the segments between them.
+    Required clearance = safety_margin_m + footprint_r + track_margin, both to
+    the polygon boundary and to each exclusion circle's edge. This is the ONLY
+    layer that checks RECIPE curves against exclusions: the follower drives the
+    recipe on dead-reckoned odom with no area guard, and the geofence watchdog
+    checks the outer polygon only (reposition's own exclusion guard is dead
+    during a recipe). Recipe curves are sampled+placed at their start_pose;
+    reposition curves check each waypoint and the segments between them.
     """
     corners = (venue or {}).get("corners_wgs84") or []
     if len(corners) < 3:
@@ -135,9 +139,27 @@ def check_legs_containment(legs, venue, footprint_r, track_margin, spacing_m=0.2
     viol = []      # (label, deficit_m, clearance_m)
     worst = None
 
+    # Exclusion circles in the same EN frame. Fail CLOSED on a malformed entry:
+    # an exclusion we cannot parse must refuse the run, not silently vanish.
+    excl = []      # (cE, cN, radius_m)
+    for xi, ex in enumerate((venue or {}).get("exclusions") or []):
+        kind = str((ex or {}).get("kind", "")).lower()
+        if kind != "circle":
+            viol.append((f"exclusion {xi}: unsupported kind '{kind}' — "
+                         "cannot verify clearance", req, -req))
+            continue
+        try:
+            ce, cn = latlon_to_en(float(ex["lat"]), float(ex["lon"]), lat0, lon0)
+            excl.append((ce, cn, float(ex["radius_m"])))
+        except (KeyError, TypeError, ValueError):
+            viol.append((f"exclusion {xi}: malformed (lat/lon/radius_m)",
+                         req, -req))
+
     def _check_pt(label, e, nn):
         nonlocal worst
         cl = clearance((e, nn), poly)
+        for (ce, cn, r) in excl:
+            cl = min(cl, math.hypot(e - ce, nn - cn) - r)
         worst = cl if worst is None else min(worst, cl)
         if cl < req:
             viol.append((label, req - cl, cl))

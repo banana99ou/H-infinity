@@ -27,8 +27,11 @@ Sources (verified on the robot 2026-06-08)
   sub /gps_rtk_f9p_helical/gps/fix        sensor_msgs/NavSatFix RELIABLE (COG source)
   sub /gps_rtk_f9p_helical/gps/rtk_status std_msgs/String RELIABLE (quality gate)
   sub /wheel/odom                         nav_msgs/Odometry RELIABLE (fwd/rev for COG)
+  sub /heading/cmd                        std_msgs/String RELIABLE
+                                          ({"action":"recalibrate"|"cancel_cal"})
   pub /heading/fused                      std_msgs/Float64 (compass bearing deg E-of-N)
-  pub /heading/fused_status               std_msgs/String  (JSON diagnostics)
+  pub /heading/fused_status               std_msgs/String  (JSON diagnostics
+                                          incl. cal_state/cal_source/src_conflict)
 
 EKF
 ---
@@ -51,10 +54,22 @@ must decrease; if it increases, flip the sign).
 Compass offset (90 deg mount + declination + frame)
 ---------------------------------------------------
 ``true_bearing_deg = raw_hdg_deg - degrees(compass_offset_rad)``. heading_node OWNS
-this now: it boots from the venue JSON value, auto-calibrates against forward COG,
-and persists back (atomic). It is the SOLE writer of ``compass_offset_rad``.
+this: the offset is ROBOT state (Pixhawk mount + declination + frame), so it
+persists in a robot-level cal file (``cal_file`` param, default
+``config/heading_cal.json`` in the repo), stamped with when/where/how it was
+calibrated. Load order: explicit param > cal file > legacy ``compass_offset_rad``
+in the venue JSON (read-only fallback, migrated to the cal file on first load).
+The venue file is NEVER written by this node anymore — re-saving a venue from the
+WebUI cannot destroy the calibration (field regression 2026-06-10).
+
+Calibration is EXPLICIT: auto-cal against forward COG runs only (a) at bootstrap
+when no offset exists anywhere, or (b) when the operator arms it via
+``/heading/cmd {"action": "recalibrate"}`` (WebUI button). It never silently
+overwrites a known-good offset (field regression 2026-06-10: a manual restart
+re-armed autocal during non-forward motion and clobbered a verified offset).
 """
 
+import datetime
 import json
 import math
 import os
@@ -152,10 +167,31 @@ class HeadingNode(Node):
         self.declare_parameter(
             'venue_file',
             '/home/agilex/H-infinity/scenarios/venues/rooftop.json')
-        self.declare_parameter('compass_offset_rad', float('nan'))  # NaN -> venue
+        # Robot-level calibration store (NOT the venue file: the offset is robot
+        # state — Pixhawk mount + declination — and must survive venue re-saves).
+        self.declare_parameter(
+            'cal_file', '/home/agilex/H-infinity/config/heading_cal.json')
+        self.declare_parameter('cmd_topic', '/heading/cmd')
+        self.declare_parameter('compass_offset_rad', float('nan'))  # NaN -> cal file
         self.declare_parameter('compass_autocal', True)
         self.declare_parameter('compass_cal_min_samples', 5)
         self.declare_parameter('compass_disagree_warn_deg', 30.0)
+        # Persistent compass-vs-mag split above this -> src_conflict (deg).
+        self.declare_parameter('src_conflict_deg', 45.0)
+        # LIMO-gyro referee for absolute references (compass/mag): a reference
+        # whose own rotation rate disagrees with the trusted gyro by more than
+        # ref_rate_max_dps for ref_bad_s is SUSPENDED (not fused) until it
+        # agrees again for ref_good_s. Catches a post-bad-boot Pixhawk whose
+        # AHRS yaw spins at standstill (field regression 2026-06-10: fused
+        # followed a compass_hdg drifting -3.6 deg/s while parked).
+        self.declare_parameter('ref_rate_max_dps', 2.0)
+        self.declare_parameter('ref_bad_s', 3.0)
+        self.declare_parameter('ref_good_s', 5.0)
+        # Physical bound on the gyro-bias states (deg/s). A MEMS gyro at rest is
+        # well under 1 dps; the EKF dumping a source conflict into the bias state
+        # (field regression 2026-06-10: 16.9 dps -> heading spins at -bias) is
+        # clamped here instead of integrating into a runaway.
+        self.declare_parameter('gyro_bias_max_dps', 3.0)
 
         # -- Parameters: variances / process noise -----------------------
         self.declare_parameter('R_compass_deg', 5.0)
@@ -212,13 +248,25 @@ class HeadingNode(Node):
         self._raw_compass_deg = None
         self._rtk_quality = None
         self._fix_prev = None                  # (lat, lon)
+        self._fix_last = None                  # latest accepted (lat, lon)
         self._vx = 0.0
         self._cal_acc = []                     # forward (raw - cog) offset samples
+        self._last_compass_z = None            # offset-corrected compass (rad)
+        self._last_mag_z = None                # tilt-comp mag heading (rad)
+        # Per-reference rate-referee state (see ref_rate_max_dps).
+        self._ref_rate = {
+            k: {'prev_z': None, 'prev_t': None, 'rate': None,
+                'bad_since': None, 'good_since': None, 'suspended': False}
+            for k in ('compass', 'mag')}
 
         # -- Compass offset ----------------------------------------------
         self._compass_offset = 0.0
         self._compass_offset_known = False
+        self._cal_source = None                # 'param'|'cal_file'|'venue-legacy'
+        self._cal_armed = False                # explicit recal in progress
         self._load_compass_offset()
+        if not self._compass_offset_known and self._autocal:
+            self._cal_armed = True             # bootstrap: nothing to protect
 
         # -- ROS interfaces ----------------------------------------------
         be = QoSProfile(depth=10, history=QoSHistoryPolicy.KEEP_LAST,
@@ -238,6 +286,7 @@ class HeadingNode(Node):
         self.create_subscription(String, self._rtk_status_topic,
                                  self._rtk_cb, rel)
         self.create_subscription(Odometry, self._odom_topic, self._odom_cb, rel)
+        self.create_subscription(String, self._cmd_topic, self._cmd_cb, rel)
 
         self.pub_fused = self.create_publisher(Float64, self._fused_topic, latched)
         self.pub_status = self.create_publisher(String, self._status_topic, latched)
@@ -290,10 +339,17 @@ class HeadingNode(Node):
                     float(g('mag_hard_iron_z').value))
 
         self._venue_file = str(g('venue_file').value)
+        self._cal_file = str(g('cal_file').value)
+        self._cmd_topic = str(g('cmd_topic').value)
         self._autocal = bool(g('compass_autocal').value)
         self._cal_min = int(g('compass_cal_min_samples').value)
         self._disagree_warn = math.radians(
             float(g('compass_disagree_warn_deg').value))
+        self._src_conflict = math.radians(float(g('src_conflict_deg').value))
+        self._bias_max = math.radians(float(g('gyro_bias_max_dps').value))
+        self._ref_rate_max = math.radians(float(g('ref_rate_max_dps').value))
+        self._ref_bad_s = float(g('ref_bad_s').value)
+        self._ref_good_s = float(g('ref_good_s').value)
 
         self._R_compass = math.radians(float(g('R_compass_deg').value)) ** 2
         self._R_cog_base = float(g('R_cog_base').value)
@@ -370,7 +426,7 @@ class HeadingNode(Node):
         return SetParametersResult(successful=True)
 
     # ------------------------------------------------------------------
-    # Compass offset: venue load + atomic persist (sole writer)
+    # Compass offset: robot-level cal file (sole writer) + legacy venue read
     # ------------------------------------------------------------------
 
     def _load_compass_offset(self):
@@ -378,39 +434,165 @@ class HeadingNode(Node):
         if p == p:                              # explicit param (not NaN) wins
             self._compass_offset = float(p)
             self._compass_offset_known = True
+            self._cal_source = 'param'
             self.get_logger().info(
                 f'compass offset from param: {math.degrees(p):.1f} deg.')
             return
-        try:
+        try:                                    # robot-level cal file
+            with open(self._cal_file, 'r') as f:
+                c = json.load(f)
+            off = c.get('compass_offset_rad')
+            if off is not None:
+                self._compass_offset = float(off)
+                self._compass_offset_known = True
+                self._cal_source = 'cal_file'
+                self.get_logger().info(
+                    f'compass offset from {self._cal_file}: '
+                    f'{math.degrees(self._compass_offset):.1f} deg '
+                    f'(calibrated {c.get("calibrated_iso", "?")}).')
+                return
+        except FileNotFoundError:
+            pass
+        except Exception as exc:               # noqa: BLE001
+            self.get_logger().warn(f'cal file load failed ({exc}).')
+        try:                                    # legacy venue key (read-only)
             with open(self._venue_file, 'r') as f:
                 v = json.load(f)
             voff = v.get('compass_offset_rad')
             if voff is not None:
                 self._compass_offset = float(voff)
                 self._compass_offset_known = True
-                self.get_logger().info(
-                    f'compass offset from venue: '
-                    f'{math.degrees(self._compass_offset):.1f} deg.')
+                self._cal_source = 'venue-legacy'
+                self.get_logger().warn(
+                    f'compass offset from LEGACY venue key: '
+                    f'{math.degrees(self._compass_offset):.1f} deg — migrating '
+                    f'to {self._cal_file}.')
+                self._persist_compass_offset(self._compass_offset,
+                                             n_samples=None,
+                                             note='migrated from venue file')
+                return
         except Exception as exc:               # noqa: BLE001
-            self.get_logger().warn(
-                f'venue compass offset load failed ({exc}); auto-cal will run '
-                'on the first forward RTK drive.')
+            self.get_logger().warn(f'legacy venue offset load failed ({exc}).')
+        self.get_logger().warn(
+            'no compass offset anywhere (param/cal file/venue); bootstrap '
+            'auto-cal will run on the first forward RTK drive.')
 
-    def _persist_compass_offset(self, off):
-        path = self._venue_file
+    def _persist_compass_offset(self, off, n_samples=None, note=None):
+        """Atomic write of the robot-level cal file with provenance. The venue
+        file is intentionally NOT touched (re-saving a venue must never destroy
+        the calibration)."""
+        path = self._cal_file
         try:
-            with open(path, 'r') as f:
-                v = json.load(f)
-            v['compass_offset_rad'] = float(off)
+            os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
+            now = self._now()
+            c = {
+                'compass_offset_rad': float(off),
+                'compass_offset_deg': round(math.degrees(off), 2),
+                'calibrated_unix': round(now, 1),
+                'calibrated_iso': datetime.datetime.now(
+                    datetime.timezone.utc).isoformat(timespec='seconds'),
+                'cal_lat': self._fix_last[0] if self._fix_last else None,
+                'cal_lon': self._fix_last[1] if self._fix_last else None,
+                'rtk_quality': self._rtk_quality,
+                'n_samples': n_samples,
+            }
+            if note:
+                c['note'] = note
             tmp = path + '.tmp'
             with open(tmp, 'w') as f:
-                json.dump(v, f, indent=2)
+                json.dump(c, f, indent=2)
             os.replace(tmp, path)
             self.get_logger().info(
                 f'persisted compass_offset_rad={off:.4f} to {path}.')
         except Exception as exc:               # noqa: BLE001
             self.get_logger().warn(
                 f'could not persist compass offset: {exc} (in-memory cal holds).')
+
+    def _cmd_cb(self, msg: String):
+        """Operator commands: {"action": "recalibrate"} arms a one-shot compass
+        recalibration on the next forward RTK drive; {"action": "cancel_cal"}
+        disarms it. Recalibration is the ONLY way to overwrite a known offset."""
+        try:
+            d = json.loads(msg.data) if msg.data.strip() else {}
+            action = d.get('action')
+        except (ValueError, AttributeError):
+            self.get_logger().warn(f'/heading/cmd: unparseable: {msg.data!r}')
+            return
+        if action == 'recalibrate':
+            self._cal_armed = True
+            self._cal_acc = []
+            old = (f'{math.degrees(self._compass_offset):.1f} deg'
+                   if self._compass_offset_known else 'none')
+            self.get_logger().warn(
+                f'compass recalibration ARMED by operator (current offset: '
+                f'{old}). Drive the robot FORWARD >= '
+                f'{self._cal_min * self._cog_min_travel:.1f} m under RTK; the '
+                'new offset persists when enough COG samples accumulate.')
+        elif action == 'cancel_cal':
+            self._cal_armed = not self._compass_offset_known and self._autocal
+            self._cal_acc = []
+            self.get_logger().info('compass recalibration disarmed.')
+        else:
+            self.get_logger().warn(f'/heading/cmd: unknown action {action!r}.')
+
+    # ------------------------------------------------------------------
+    # Absolute-reference rate referee (trusted-gyro cross-check)
+    # ------------------------------------------------------------------
+
+    def _ref_rate_ok(self, key, z, t):
+        """True when reference ``key`` may be fused. Estimates the reference's
+        own rotation rate (EMA of the wrapped derivative) and compares it to
+        the bias-corrected LIMO gyro: a reference that is turning while the
+        robot demonstrably is not (or vice versa) is lying — suspend it until
+        its rate agrees with the gyro again. The fused output then coasts on
+        gyro (+COG when driving under RTK) instead of following the lie."""
+        st = self._ref_rate[key]
+        prev_z, prev_t = st['prev_z'], st['prev_t']
+        st['prev_z'], st['prev_t'] = z, t
+        if prev_z is None or prev_t is None or t <= prev_t or t - prev_t > 1.0:
+            st['rate'] = None                  # stream gap: no fresh estimate
+            return not st['suspended']
+        inst = _wrap(z - prev_z) / (t - prev_t)
+        st['rate'] = inst if st['rate'] is None else (
+            0.8 * st['rate'] + 0.2 * inst)
+        gyro_ok = (self._latest_limo_rate is not None
+                   and self._fresh(self._t_gyro_limo, self._gyro_timeout))
+        if not gyro_ok:
+            return not st['suspended']         # no referee available
+        diff = abs(st['rate'] - self._latest_limo_rate)
+        if diff > self._ref_rate_max:
+            st['good_since'] = None
+            if st['bad_since'] is None:
+                st['bad_since'] = t
+            if not st['suspended'] and t - st['bad_since'] >= self._ref_bad_s:
+                st['suspended'] = True
+                # The lying reference was fused at full weight until this
+                # moment — psi may already be dragged off truth (field
+                # 2026-06-10: leg-2 glue arrived 22 deg off, fused then HELD
+                # the wrong value on gyro alone). Admit the contamination:
+                # inflate the heading variance so the next ground truth (COG
+                # on the next forward drive) passes the std-scaled gate and
+                # snaps psi back, instead of being rejected as an outlier.
+                self.P[0, 0] = max(self.P[0, 0], math.radians(45.0) ** 2)
+                self.get_logger().error(
+                    f'{key} reference SUSPENDED: it rotates at '
+                    f'{math.degrees(st["rate"]):+.1f} deg/s while the gyro '
+                    f'says {math.degrees(self._latest_limo_rate):+.1f} deg/s '
+                    '— sensor is lying (bad FCU boot / interference); fusing '
+                    'gyro+COG until it behaves. Heading std inflated: drive '
+                    'forward under RTK to re-anchor.')
+        else:
+            st['bad_since'] = None
+            if st['suspended']:
+                if st['good_since'] is None:
+                    st['good_since'] = t
+                if t - st['good_since'] >= self._ref_good_s:
+                    st['suspended'] = False
+                    st['good_since'] = None
+                    self.get_logger().warn(
+                        f'{key} reference re-enabled: rate agrees with the '
+                        f'gyro again.')
+        return not st['suspended']
 
     # ------------------------------------------------------------------
     # EKF core
@@ -446,6 +628,10 @@ class HeadingNode(Node):
         K = self.P[:, h_idx] / S
         self.x = self.x + K * y
         self.x[0] = _wrap(self.x[0])
+        # Physical bound on the bias states: conflicting absolute sources must
+        # not be "explained" as a runaway gyro bias (which then spins psi).
+        self.x[1] = max(-self._bias_max, min(self._bias_max, self.x[1]))
+        self.x[2] = max(-self._bias_max, min(self._bias_max, self.x[2]))
         self.P = self.P - np.outer(K, self.P[h_idx, :])
         self.P = 0.5 * (self.P + self.P.T)      # keep symmetric
         self._n_updates += 1
@@ -491,7 +677,10 @@ class HeadingNode(Node):
         myh = (mx * math.sin(roll) * math.sin(pitch) + my * math.cos(roll)
                - mz * math.sin(roll) * math.cos(pitch))
         heading = math.atan2(-myh, mxh) + self._mag_frame_offset
-        self._update(_wrap(heading), self._R_mag, h_idx=0)
+        self._last_mag_z = _wrap(heading)
+        if not self._ref_rate_ok('mag', self._last_mag_z, self._t_mag):
+            return
+        self._update(self._last_mag_z, self._R_mag, h_idx=0)
 
     def _compass_cb(self, msg: Float64):
         if not self._en_compass:
@@ -501,7 +690,11 @@ class HeadingNode(Node):
         if not self._compass_offset_known:
             return
         z = math.radians(self._raw_compass_deg) - self._compass_offset
-        self._update(_wrap(z), self._R_compass, h_idx=0)
+        self._last_compass_z = _wrap(z)
+        if not self._ref_rate_ok('compass', self._last_compass_z,
+                                 self._t_compass):
+            return
+        self._update(self._last_compass_z, self._R_compass, h_idx=0)
 
     def _rtk_cb(self, msg: String):
         q = None
@@ -535,23 +728,35 @@ class HeadingNode(Node):
             return                              # accumulate; keep the same anchor
         cog = _geo_bearing(plat, plon, lat, lon)
         self._fix_prev = (lat, lon)
+        self._fix_last = (lat, lon)
         reverse = self._vx < -self._rev_vx
         if reverse:
             cog = _wrap(cog + math.pi)
         # Reject COG that strongly disagrees with the gyro-propagated heading
         # (un-flagged reverse, multipath, etc.). The gyro carries heading through.
-        if abs(_wrap(cog - self.x[0])) > self._cog_disagree:
-            return
-        R = (self._R_cog_base / max(travel, 1e-3)) ** 2 + self._R_cog_floor
-        if self._rtk_quality == 5:              # FLOAT ~dm: inflate vs FIXED
-            R *= 4.0
-        self._update(cog, R, h_idx=0)
-        self._t_cog = self._now()
-        # Compass offset auto-cal: forward motion, good fix, not yet known.
-        if (self._autocal and not reverse and not self._compass_offset_known
+        # The gate scales with the state's own uncertainty: when the filter is
+        # lost (huge std after a conflict or cold boot), ground truth must be
+        # allowed back in — a fixed 90 deg gate made a wrong anchor permanent
+        # (field regression 2026-06-10).
+        gate = max(self._cog_disagree,
+                   3.0 * math.sqrt(max(self.P[0, 0], 0.0)))
+        gated = abs(_wrap(cog - self.x[0])) > gate
+        if not gated:
+            R = (self._R_cog_base / max(travel, 1e-3)) ** 2 + self._R_cog_floor
+            if self._rtk_quality == 5:          # FLOAT ~dm: inflate vs FIXED
+                R *= 4.0
+            self._update(cog, R, h_idx=0)
+            self._t_cog = self._now()
+        # Compass offset cal: forward motion + good fix, and EITHER bootstrap
+        # (no offset known anywhere) OR an explicit operator recalibration.
+        # Accumulation deliberately ignores the gate above — an operator arms a
+        # recal precisely BECAUSE the current state may be wrong, so the gate
+        # must not filter the truth out of the calibration. A known offset is
+        # never silently overwritten.
+        if (self._autocal and not reverse and self._cal_armed
                 and self._raw_compass_deg is not None):
             self._accumulate_cal(cog)
-        elif (self._compass_offset_known and not reverse
+        elif (not gated and self._compass_offset_known and not reverse
                 and self._raw_compass_deg is not None):
             self._crosscheck_compass(cog)
 
@@ -560,16 +765,22 @@ class HeadingNode(Node):
         off = _wrap(math.radians(self._raw_compass_deg) - cog)
         self._cal_acc.append(off)
         if len(self._cal_acc) >= self._cal_min:
+            old = (math.degrees(self._compass_offset)
+                   if self._compass_offset_known else None)
             sx = sum(math.sin(o) for o in self._cal_acc)
             sy = sum(math.cos(o) for o in self._cal_acc)
+            n = len(self._cal_acc)
             self._compass_offset = math.atan2(sx, sy)
             self._compass_offset_known = True
+            self._cal_source = 'cal_file'
+            self._cal_armed = False
             self._cal_acc = []
             self.get_logger().warn(
-                'compass auto-calibrated: offset='
-                f'{math.degrees(self._compass_offset):.1f} deg '
-                f'(persist as compass_offset_rad:={self._compass_offset:.4f}).')
-            self._persist_compass_offset(self._compass_offset)
+                'compass calibrated: offset='
+                f'{math.degrees(self._compass_offset):.1f} deg'
+                + (f' (was {old:.1f} deg)' if old is not None else '')
+                + f', {n} forward-COG samples.')
+            self._persist_compass_offset(self._compass_offset, n_samples=n)
 
     def _crosscheck_compass(self, cog):
         true_b = math.radians(self._raw_compass_deg) - self._compass_offset
@@ -652,6 +863,30 @@ class HeadingNode(Node):
         if mag_fresh:
             active.append('mag')
 
+        # Absolute sources fighting each other (compass vs mag split): surface
+        # it loudly instead of letting the filter silently absorb the conflict.
+        src_conflict = False
+        if (compass_fresh and mag_fresh
+                and self._last_compass_z is not None
+                and self._last_mag_z is not None):
+            split = abs(_wrap(self._last_compass_z - self._last_mag_z))
+            if split > self._src_conflict:
+                src_conflict = True
+                self.get_logger().error(
+                    f'heading sources CONFLICT: compass vs mag split '
+                    f'{math.degrees(split):.0f} deg — calibration or magnetic '
+                    'environment is wrong; fused heading is NOT trustworthy. '
+                    'Re-run calibration (/heading/cmd {"action":"recalibrate"} '
+                    '+ forward drive).',
+                    throttle_duration_sec=5.0)
+
+        if self._cal_armed:
+            cal_state = f'collecting {len(self._cal_acc)}/{self._cal_min}'
+        elif self._compass_offset_known:
+            cal_state = 'calibrated'
+        else:
+            cal_state = 'uncalibrated'
+
         payload = {
             'fused_deg': round(bearing, 2),
             'heading_std_deg': round(math.degrees(math.sqrt(max(self.P[0, 0],
@@ -668,6 +903,11 @@ class HeadingNode(Node):
             'n_updates': self._n_updates,
             'compass_offset_deg': (round(math.degrees(self._compass_offset), 2)
                                    if self._compass_offset_known else None),
+            'cal_state': cal_state,
+            'cal_source': self._cal_source,
+            'src_conflict': src_conflict,
+            'suspended_sources': sorted(
+                k for k, st in self._ref_rate.items() if st['suspended']),
         }
         s = String()
         s.data = json.dumps(payload)

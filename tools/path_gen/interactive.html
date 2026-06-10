@@ -2181,9 +2181,12 @@ function onHeadingStatus(msg) {
   const conflict = d.src_conflict
     ? ' <br><span class="err">SOURCE CONFLICT: compass vs mag disagree — heading NOT trustworthy; recalibrate under RTK</span>'
     : '';
+  const susp = (d.suspended_sources && d.suspended_sources.length)
+    ? ` <br><span class="warn">suspended (lying vs gyro): ${d.suspended_sources.join(', ')}</span>`
+    : '';
   el.innerHTML =
     `heading ${Number(d.fused_deg).toFixed(1)}&deg; &plusmn;${Number(d.heading_std_deg).toFixed(1)} ` +
-    `(${d.mode}) — ${cal}${conflict}`;
+    `(${d.mode}) — ${cal}${conflict}${susp}`;
 }
 
 // Heading vector on the RTK marker. /heading/fused is already a compass

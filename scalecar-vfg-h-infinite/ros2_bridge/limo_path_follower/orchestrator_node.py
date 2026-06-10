@@ -85,15 +85,33 @@ PROCS = {
     # stays warm across the sequencer's per-leg kill/respawn of reposition — each
     # new leg gets an already-converged heading. Publishes only /heading/* — never
     # cmd_vel* (ADR-01). It also owns the venue compass_offset_rad calibration.
+    # venue_file points at the live active.json (same as 'reposition'/'geofence')
+    # rather than heading_node's rooftop.json default. heading_node uses it only
+    # for the per-venue compass_offset_rad (read at start, persisted after auto-
+    # cal); pointing it at active.json keeps the heading stack on the operator's
+    # current venue. heading is long-lived (NOT per-leg) so it reads active.json
+    # once at bring-up; if active.json is absent yet, heading_node degrades
+    # gracefully (warns, auto-cal runs on the first forward RTK drive).
     'heading': [
         'ros2', 'run', 'limo_path_follower', 'heading_node',
+        '--ros-args', '-p',
+        'venue_file:=/home/agilex/H-infinity/scenarios/venues/active.json',
     ],
     # T4 (R1-R4, P3): RTK go-to-pose between recorded runs. Publishes cmd_vel_raw
     # only while repositioning. MUST NOT run concurrently with 'follower' (C6) —
     # the sequencer enforces exactly one cmd_vel_raw publisher. Consumes
     # /heading/fused from 'heading' (bring 'heading' up first).
+    # venue_file MUST point at the live active.json (same file 'geofence',
+    # run_executor, and venue_loader use) — NOT reposition_node's rooftop.json
+    # default. This is what reposition's R3 working-area + EXCLUSION gate and its
+    # runtime geofence validate against; the standalone 'geofence' watchdog only
+    # checks the outer polygon, so reposition is the sole layer that avoids
+    # exclusion islands. reposition is respawned per leg (run_executor), always
+    # after the operator's 'Send to NUC' has written active.json.
     'reposition': [
         'ros2', 'run', 'limo_path_follower', 'reposition_node',
+        '--ros-args', '-p',
+        'venue_file:=/home/agilex/H-infinity/scenarios/venues/active.json',
     ],
     # T6: the experiment sequencer (the integrator). Drives the matrix unattended
     # by start/kill-ing the movers above through this orchestrator.
@@ -134,8 +152,9 @@ PROCS = {
     # run_executor runs the persisted leg batch on a single /run/go (Start),
     # resuming at the first incomplete leg. It drives reposition (drawn curve,
     # RTK) + follower (analytic recipe, odom) through the SAME C6 mover-exclusion
-    # as the sequencer; it never publishes cmd_vel* itself. Mutually exclusive in
-    # spirit with 'sequencer' (both drive the movers) — run only one.
+    # as the sequencer; it never publishes cmd_vel* itself. Mutually exclusive
+    # with 'sequencer'/'sequencer_smoke' (both drive the movers) — ENFORCED via
+    # EXCLUSIVE_GROUPS below.
     'run_executor': [
         'ros2', 'run', 'limo_path_follower', 'run_executor_node',
     ],
@@ -161,9 +180,17 @@ PROCS = {
     ],
 }
 
-# Only one chassis-driver PROC at a time (all open the chassis serial). 'gnss'
-# (mavros+RTK) is NOT here — it runs alongside 'base' in the split bring-up.
-EXCLUSIVE = {'base', 'base_vanilla', 'base_gnss'}
+# Mutually exclusive PROC groups: starting a member kills any other alive
+# member of the same group first.
+#  - chassis drivers: all open the chassis serial. 'gnss' (mavros+RTK) is NOT
+#    here — it runs alongside 'base' in the split bring-up.
+#  - run supervisors: sequencer / sequencer_smoke / run_executor all drive the
+#    movers (follower/reposition) through this orchestrator; two at once would
+#    fight over C6 mover exclusivity at the supervisor level.
+EXCLUSIVE_GROUPS = (
+    {'base', 'base_vanilla', 'base_gnss'},
+    {'sequencer', 'sequencer_smoke', 'run_executor'},
+)
 
 LOG_DIR = '/tmp/limo_orchestrator'
 
@@ -215,8 +242,10 @@ class OrchestratorNode(Node):
             self.get_logger().info(f"start: '{name}' already running, ignoring")
             return
 
-        if name in EXCLUSIVE:
-            for ex in EXCLUSIVE:
+        for group in EXCLUSIVE_GROUPS:
+            if name not in group:
+                continue
+            for ex in group:
                 if ex != name and self._alive(ex):
                     self.get_logger().info(
                         f"start: stopping exclusive '{ex}' before starting '{name}'")

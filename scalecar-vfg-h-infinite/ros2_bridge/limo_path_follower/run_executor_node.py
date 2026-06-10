@@ -107,6 +107,22 @@ DEFAULT_BAG_ROOT = os.path.join(_REPO_ROOT, "Experiment Data")
 # would start it driving at default params before SET_PARAMS/PUSH_RECIPE).
 NEUTRAL_RECIPE = json.dumps({"type": "none"})
 
+# Operator paging (Discord webhook via tools/notify/ntfy.py, discord.env).
+# Imported defensively like odom_watchdog: a missing module/webhook only
+# disables paging, it can never interrupt a batch. Field rule 2026-06-10:
+# every operator-actionable warning goes to BOTH channels — the browser card
+# (WebUI, from /run/status) and Discord (this).
+try:
+    sys.path.insert(0, os.path.join(_REPO_ROOT, "tools", "notify"))
+    from ntfy import notify_discord as _notify_discord  # type: ignore
+except Exception:  # noqa: BLE001
+    def _notify_discord(*_a, **_k):
+        return False
+
+# Battery warn threshold (volts) for the once-per-crossing Discord page;
+# matches preflight.sh / ntfy.py conventions (warn 10.8, halt 10.5).
+BATT_WARN_V = 10.8
+
 
 class Phase(Enum):
     IDLE = "idle"
@@ -156,6 +172,14 @@ class RunExecutor(Node):
         # world (odom is zeroed at the achieved heading), leaving the corridor
         # the containment check verified -> pause for the operator instead.
         self.declare_parameter("arrival_heading_tol_deg", 20.0)
+        # Operator breathing room between consecutive curves (exp<->rep): the
+        # robot sits still, heading/RTK settle, and the operator can eyeball
+        # alignment before the next maneuver starts (field request 2026-06-10).
+        self.declare_parameter("inter_curve_dwell_s", 5.0)
+        # Glue (reposition) cruise speed cap. 0.40 m/s oscillated on a tight
+        # hook while the heading EKF was being dragged by a relapsing FCU
+        # (field 2026-06-10); 0.2 gives pure pursuit and COG twice the time.
+        self.declare_parameter("reposition_speed_mps", 0.2)
 
         self._active_file = str(self.get_parameter("active_venue_file").value)
         self._bag_root = str(self.get_parameter("bag_root").value)
@@ -174,6 +198,10 @@ class RunExecutor(Node):
         self._track_margin = float(self.get_parameter("path_tracking_margin_m").value)
         self._arrival_head_tol = float(
             self.get_parameter("arrival_heading_tol_deg").value)
+        self._dwell_s = float(self.get_parameter("inter_curve_dwell_s").value)
+        self._repo_speed = float(self.get_parameter("reposition_speed_mps").value)
+        self._dwell_until = 0.0
+        self._batt_warned = False
 
         # -- Batch state -----------------------------------------------
         self._venue = {}
@@ -366,7 +394,17 @@ class RunExecutor(Node):
         try:
             self._battery_v = float(msg.battery_voltage)
         except Exception:
-            pass
+            return
+        # Once-per-crossing low-battery page (browser card comes from the
+        # WebUI's own battery watch; this is the Discord half of the rule).
+        if self._battery_v < BATT_WARN_V and not self._batt_warned:
+            self._batt_warned = True
+            _notify_discord(
+                f"LIMO battery LOW: {self._battery_v:.2f} V "
+                f"(warn {BATT_WARN_V}, halt {self._batt_halt}).",
+                title="H-inf run_executor")
+        elif self._battery_v > BATT_WARN_V + 0.2 and self._batt_warned:
+            self._batt_warned = False
 
     def _on_odom_zero_status(self, msg):
         try:
@@ -696,6 +734,9 @@ class RunExecutor(Node):
             self._pause(f"unknown curve kind '{kind}'")
 
     def _advance_curve(self):
+        # Dwell before every curve->curve transition (the very first curve
+        # after Start has no preceding curve and starts immediately).
+        self._dwell_until = time.monotonic() + self._dwell_s
         self._curve_idx += 1
         curves = self._legs[self._leg_idx].get("curves") or []
         if self._curve_idx >= len(curves):
@@ -730,6 +771,10 @@ class RunExecutor(Node):
     def _enter(self, phase):
         if phase != self.phase:
             self.get_logger().info(f"phase {self.phase.value} -> {phase.value}")
+            if phase == Phase.DONE:
+                _notify_discord(
+                    f"BATCH DONE: {self._runs_done()}/{self._runs_target()} "
+                    "scored runs complete.", title="H-inf run_executor")
             if phase == Phase.ODOM_RESET:
                 self._odom_reset_sent = False
                 self._odom_reset_command_t = None
@@ -760,6 +805,13 @@ class RunExecutor(Node):
         # WebUI auto-clears estop at Start; PREFLIGHT waits for it to clear).
         if self._estop and self.phase != Phase.PREFLIGHT:
             self._pause("E-stop during run/maneuver")
+            return
+
+        # Inter-curve dwell: hold (robot motionless, no mover spawned yet) at
+        # the entry phase of each new curve until the dwell window passes.
+        if (self.phase in (Phase.REPOSITION_START, Phase.KILL_REPOSITION)
+                and time.monotonic() < self._dwell_until):
+            self._publish_status(message="dwell before next curve")
             return
 
         handler = getattr(self, f"_tick_{self.phase.value}", None)
@@ -825,7 +877,11 @@ class RunExecutor(Node):
                     payload = {
                         "waypoints": [{"lat": float(w["lat"]),
                                        "lon": float(w["lon"])} for w in wps],
-                        "v_const": float(curve.get("v_const", 0.4)),
+                        # reposition_speed_mps is a CAP: an authored per-curve
+                        # v_const may go slower, never faster.
+                        "v_const": min(float(curve.get("v_const",
+                                                       self._repo_speed)),
+                                       self._repo_speed),
                         "pos_tol_m": float(curve.get("pos_tol_m", 0.15)),
                     }
                     if curve.get("end_heading_deg") is not None:
@@ -1175,6 +1231,7 @@ class RunExecutor(Node):
             return
         self._pause_reason = reason
         self.get_logger().warn(f"PAUSE: {reason}")
+        _notify_discord(f"RUN PAUSED: {reason}", title="H-inf run_executor")
         if self._recorder is not None:
             try:
                 self._recorder.stop(timeout_s=5.0)
@@ -1187,6 +1244,7 @@ class RunExecutor(Node):
 
     def _abort(self, reason):
         self.get_logger().warn(f"ABORT: {reason}")
+        _notify_discord(f"RUN ABORTED: {reason}", title="H-inf run_executor")
         if self._recorder is not None:
             try:
                 self._recorder.stop(timeout_s=5.0)

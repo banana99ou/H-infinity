@@ -3851,6 +3851,12 @@ function lbRenderPlanState(d) {
   const total = lbStages.reduce((s, st) => s + st.exps.length, 0);
   let html = `<span class="ok">plan: ${lbStages.length} stage(s), ${total} curve` +
     `${total === 1 ? '' : 's'}; the batch runs ALL stages unattended.</span>`;
+  // Resume credit is keyed by VENUE NAME (= run_id in the sidecars): renaming
+  // the venue between field days silently resets progress to 0. Surface it.
+  if (d.counts_runs_done != null)
+    html += `<br><span class="small">credits ${d.counts_runs_done} previously passed ` +
+      `run(s) under venue name '${d.venue_name || '?'}' — keep the SAME venue ` +
+      `name across days or progress restarts</span>`;
   html += lbUnfittableHtml(d);
   const notes = (lbPlanMeta && lbPlanMeta.notes) || [];
   if (notes.length) html += `<br><span class="small">${notes.length} planner note(s); first: ${notes[0]}</span>`;

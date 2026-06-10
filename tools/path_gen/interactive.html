@@ -442,6 +442,18 @@
         are fit-checked here with the SAME clearance the NUC enforces.
       </div>
 
+      <h4 style="margin:8px 0 4px;">0 &middot; Auto-plan (system lays out the remaining matrix)</h4>
+      <div class="small">One press: the NUC reads experiment.yaml + the bag manifest,
+        picks the remaining (family, R) cells, and fits as many curves + glue as the
+        venue holds — in stages. Inspect every stage below, tweak if needed, then
+        Send + Start. The batch runs ALL stages unattended.</div>
+      <div class="row" style="margin-top:4px;">
+        <button id="lb-plan" class="primary">Auto-plan</button>
+        <button id="lb-plan-apply" style="display:none;">Apply latched plan</button>
+        <label style="margin:0;">stage <select id="lb-stage-sel" style="min-width:90px;"></select></label>
+      </div>
+      <div class="stat" id="lb-plan-state">(no plan requested)</div>
+
       <h4 style="margin:8px 0 4px;">1 &middot; Experiment curves (scored, odom)</h4>
       <div class="row">
         <button id="lb-exp-add" class="primary">Place experiment (click map)</button>
@@ -449,7 +461,7 @@
       </div>
       <div class="row" style="margin-top:4px;">
         <label style="margin:0;">type
-          <select id="lb-rec-type"><option value="step">step</option><option value="uturn">uturn</option></select>
+          <select id="lb-rec-type"><option value="step">step</option><option value="slalom">slalom</option><option value="uturn">uturn</option></select>
         </label>
         <label style="margin:0;">R <input type="number" id="lb-rec-R" value="0.50" step="0.05" min="0.3" style="width:55px;"></label>
         <label style="margin:0;">dir <select id="lb-rec-dir"><option value="1">left (+1)</option><option value="-1">right (-1)</option></select></label>
@@ -1200,6 +1212,7 @@ let topicExpStatus = null, topicExpCmd = null;   // T10 — /experiment/{status,
 // T12 — operator leg-batch flow (venue_loader + run_executor)
 let topicVenueLoad = null, topicVenueLoadStatus = null, topicVenueLoaded = null;
 let topicRunGo = null, topicRunCmd = null, topicRunStatus = null;
+let topicPlanRequest = null, topicPlanResult = null;
 let setParamsService = null;
 let lastOdomTime = 0, lastStatusTime = 0, odomCount = 0, statusCount = 0;
 let lastExpTime = 0, expCount = 0;                // T10 — sequencer freshness
@@ -1608,6 +1621,11 @@ function subscribeAll() {
   topicRunStatus = new ROSLIB.Topic({
     ros, name: '/run/status', messageType: 'std_msgs/msg/String' });
   topicRunStatus.subscribe(onRunStatus);
+  topicPlanRequest = new ROSLIB.Topic({
+    ros, name: '/plan/request', messageType: 'std_msgs/msg/String' });
+  topicPlanResult = new ROSLIB.Topic({
+    ros, name: '/plan/result', messageType: 'std_msgs/msg/String' });
+  topicPlanResult.subscribe(onPlanResult);
 
   refreshManualPins();
 
@@ -3383,6 +3401,45 @@ function lbStepRecipeLocal(recipe) {
   for (let i = 0; i <= n; i++) out.push(pos(total * i / n));
   return out;
 }
+// ---- SlalomPath.position(s) reimplemented (mirror slalom.py) ----
+// Alternating arcs, FIRST ARC ALWAYS LEFT (the class has no direction param).
+function lbSlalomRecipeLocal(recipe) {
+  const p = recipe.params || {};
+  const R = Number(p.R) || 0.5;
+  const theta = p.theta_arc != null ? Number(p.theta_arc) : Math.PI/2;
+  const L1 = Number(p.L1) || 0, Lmid = Number(p.L_mid) || 0, Lend = Number(p.L_end) || 0;
+  const nArcs = Math.max(1, Math.round(Number(p.n_arcs) || 2));
+  const segs = [['line', L1, 0]];
+  for (let i = 0; i < nArcs; i++) {
+    segs.push(['arc', R * theta, (i % 2 === 0) ? 1 : -1]);
+    if (i < nArcs - 1) segs.push(['line', Lmid, 0]);
+  }
+  segs.push(['line', Lend, 0]);
+  const pts = [[0, 0]];
+  let x = 0, y = 0, h = 0;
+  for (const [kind, len, dir] of segs) {
+    if (len <= 0) continue;
+    const n = Math.max(1, Math.round(len / 0.10));
+    if (kind === 'line') {
+      for (let i = 1; i <= n; i++)
+        pts.push([x + len * i / n * Math.cos(h), y + len * i / n * Math.sin(h)]);
+    } else {
+      const cx = x - dir * R * Math.sin(h), cy = y + dir * R * Math.cos(h);
+      for (let i = 1; i <= n; i++) {
+        const hi = h + dir * (len * i / n) / R;
+        pts.push([cx + dir * R * Math.sin(hi), cy - dir * R * Math.cos(hi)]);
+      }
+      h += dir * len / R;
+    }
+    x = pts[pts.length - 1][0]; y = pts[pts.length - 1][1];
+  }
+  return pts;
+}
+function lbRecipeLocal(recipe) {
+  return recipe.type === 'slalom' ? lbSlalomRecipeLocal(recipe)
+                                  : lbStepRecipeLocal(recipe);
+}
+
 // Place local (px,py) [+x fwd, +y left] at start={lat,lon,heading_deg}.
 // Mirrors venue_geom.recipe_points_en: E=px·sinh − py·cosh; N=px·cosh + py·sinh.
 function lbPlaceAtStartPose(localPts, start) {
@@ -3398,8 +3455,19 @@ function lbPlaceAtStartPose(localPts, start) {
 // ---- leg-batch state (operator authors GEOMETRY; system sweeps treatments) ----
 let lbMode = null;             // null | 'placeExp' | 'repo'  (map-click target)
 let lbExps = [];               // [{id, recipe:{type,params}, start:{lat,lon,heading_deg}}]
-let lbRepos = [];              // lbRepos[g] = {mids:[{lat,lon}], v_const, pos_tol_m}
+let lbRepos = [];              // lbRepos[g] = {mids:[{lat,lon}], v_const, pos_tol_m,
+                               //   waypoints?: [{lat,lon}]}  (waypoints = planner Dubins
+                               //   glue, used verbatim instead of the Bezier; drawing a
+                               //   midpoint on such a gap converts it back to Bezier)
                                //   gap g connects exp[g].end -> exp[(g+1)%n].start (cyclic)
+// Auto-plan: lbStages[i] = {name, geometries, exps, repos} in the SAME editor
+// shapes; lbExps/lbRepos ALIAS the selected stage's arrays, so map edits flow
+// straight into what Send serializes. null = manual authoring (no plan).
+let lbStages = null;
+let lbStageIdx = 0;
+let lbPlanMeta = null;         // {unfittable:[], notes:[]} from the last applied plan
+let lbPlanPending = false;     // true between Auto-plan press and /plan/result
+let lbLastPlanMsg = null;      // last latched /plan/result (apply needs a press)
 let lbSelExp = -1;             // selected experiment index
 let lbRepoGap = 0;             // gap selected for glue drawing
 let lbLayers = [];             // map layers to clear each redraw
@@ -3418,6 +3486,21 @@ function lbBindDrag(marker, onMove) {
 // ---- experiment recipe inputs <-> the selected experiment ----
 function lbReadRecipeInputs() {
   const type = $('lb-rec-type').value;
+  if (type === 'slalom') {
+    // The L2 input doubles as L_end; L_mid/n_arcs ride along from the
+    // selected experiment (the auto-planner sets them) or planner defaults.
+    const cur = (lbSelExp >= 0 && lbExps[lbSelExp]
+                 && lbExps[lbSelExp].recipe.type === 'slalom')
+                ? lbExps[lbSelExp].recipe.params : {};
+    return { type, params: {
+      R: parseFloat($('lb-rec-R').value) || 0.5,
+      theta_arc: (parseFloat($('lb-rec-theta').value) || 90) * Math.PI/180,
+      L1: parseFloat($('lb-rec-L1').value) || 0,
+      L_end: parseFloat($('lb-rec-L2').value) || 0,
+      L_mid: cur.L_mid != null ? cur.L_mid : 0.5,
+      n_arcs: cur.n_arcs != null ? cur.n_arcs : 2,
+    } };
+  }
   const params = { L1: parseFloat($('lb-rec-L1').value) || 0, R: parseFloat($('lb-rec-R').value) || 0.5,
                    L2: parseFloat($('lb-rec-L2').value) || 0, direction: parseInt($('lb-rec-dir').value, 10) };
   if (type === 'step') params.theta_arc = (parseFloat($('lb-rec-theta').value) || 90) * Math.PI/180;
@@ -3428,8 +3511,9 @@ function lbWriteRecipeInputs(e) {
   $('lb-rec-type').value = e.recipe.type;
   $('lb-rec-R').value = e.recipe.params.R;
   $('lb-rec-L1').value = e.recipe.params.L1;
-  $('lb-rec-L2').value = e.recipe.params.L2;
-  $('lb-rec-dir').value = String(e.recipe.params.direction >= 0 ? 1 : -1);
+  $('lb-rec-L2').value = e.recipe.type === 'slalom'
+    ? e.recipe.params.L_end : e.recipe.params.L2;
+  $('lb-rec-dir').value = String((e.recipe.params.direction || 1) >= 0 ? 1 : -1);
   if (e.recipe.params.theta_arc != null) $('lb-rec-theta').value = Math.round(e.recipe.params.theta_arc * 180/Math.PI);
   $('lb-rec-heading').value = Math.round(e.start.heading_deg);
 }
@@ -3443,7 +3527,7 @@ function lbApplyInputsToSel() {
 }
 
 // ---- experiment geometry (mirror NUC placement) ----
-function lbExpLatLon(e) { return lbPlaceAtStartPose(lbStepRecipeLocal(e.recipe), e.start); }
+function lbExpLatLon(e) { return lbPlaceAtStartPose(lbRecipeLocal(e.recipe), e.start); }
 function lbExpEnd(e) { const p = lbExpLatLon(e); return p[p.length - 1]; }  // [lat,lon]
 
 // ---- place / select / delete experiments ----
@@ -3465,7 +3549,8 @@ function lbPlaceExpAt(latlng) {
 function lbDelExp() {
   if (lbSelExp < 0) { alert('select an experiment first (click its cyan anchor)'); return; }
   lbExps.splice(lbSelExp, 1);
-  lbRepos = [];   // gaps renumbered — drawn glue is invalidated
+  lbRepos.length = 0;   // gaps renumbered — drawn glue is invalidated
+                        // (in place: lbRepos may ALIAS the active plan stage)
   lbSelExp = lbExps.length ? Math.min(lbSelExp, lbExps.length - 1) : -1;
   if (lbSelExp >= 0) lbWriteRecipeInputs(lbExps[lbSelExp]);
   lbRebuildGapSelect();
@@ -3486,10 +3571,16 @@ function lbRepo(g) {
                                   pos_tol_m: parseFloat($('lb-repo-postol').value) || 0.15 };
   return lbRepos[g];
 }
-function lbRepoClickAt(latlng) { lbRepo(lbRepoGap).mids.push({ lat: latlng.lat, lon: latlng.lng }); lbRedrawAll(); }
+function lbRepoClickAt(latlng) {
+  const r = lbRepo(lbRepoGap);
+  if (r.waypoints) r.waypoints = null;   // hand-drawing converts a planner
+                                         // Dubins glue back to a Bezier
+  r.mids.push({ lat: latlng.lat, lon: latlng.lng });
+  lbRedrawAll();
+}
 function lbRepoClearMids() {
   const g = parseInt($('lb-repo-gap').value, 10) || 0;
-  if (lbRepos[g]) lbRepos[g].mids = [];
+  if (lbRepos[g]) { lbRepos[g].mids = []; lbRepos[g].waypoints = null; }
   lbRedrawAll();
 }
 function lbRepoCtrl(g) {            // full Bézier control polygon (endpoints snapped)
@@ -3500,6 +3591,9 @@ function lbRepoCtrl(g) {            // full Bézier control polygon (endpoints s
   return [{ lat: a[0], lon: a[1] }, ...mids, { lat: b.lat, lon: b.lon }];
 }
 function lbRepoSamples(g) {
+  const r = lbRepos[g];
+  if (r && r.waypoints && r.waypoints.length)
+    return r.waypoints.map(w => [w.lat, w.lon]);   // planner Dubins glue: verbatim
   const ctrl = lbRepoCtrl(g);
   const len = lbPolylineLenM(ctrl.map(c => [c.lat, c.lon]));
   const n = Math.max(12, Math.min(300, Math.round(len / 0.3)));
@@ -3574,6 +3668,7 @@ function lbPersist() {
   try {
     localStorage.setItem(LS_LB_KEY, JSON.stringify({
       exps: lbExps, repos: lbRepos, repoGap: lbRepoGap,
+      stages: lbStages, stageIdx: lbStageIdx, planMeta: lbPlanMeta,
     }));
   } catch (e) {}
 }
@@ -3585,12 +3680,31 @@ function lbRestore() {
     const finite = (v) => typeof v === 'number' && isFinite(v);
     // Same corrupt-save guard idea as restoreVenue: drop entries that would
     // draw at null island or crash lbExpLatLon.
-    lbExps = (Array.isArray(d.exps) ? d.exps : []).filter(e =>
+    const okExp = (e) =>
       e && e.start && finite(e.start.lat) && finite(e.start.lon) &&
-      Math.abs(e.start.lat) >= 1 && e.recipe && e.recipe.params);
-    lbRepos = Array.isArray(d.repos)
-      ? d.repos.map(r => (r && Array.isArray(r.mids)) ? r : undefined)
-      : [];
+      Math.abs(e.start.lat) >= 1 && e.recipe && e.recipe.params;
+    const okRepos = (rs) => Array.isArray(rs)
+      ? rs.map(r => (r && Array.isArray(r.mids)) ? r : undefined) : [];
+    if (Array.isArray(d.stages) && d.stages.length) {
+      lbStages = d.stages
+        .map(st => ({ name: st.name, geometries: st.geometries || [],
+                      exps: (Array.isArray(st.exps) ? st.exps : []).filter(okExp),
+                      repos: okRepos(st.repos) }))
+        .filter(st => st.exps.length);
+      lbPlanMeta = d.planMeta || null;
+      lbStageIdx = (finite(d.stageIdx) && d.stageIdx >= 0
+                    && d.stageIdx < lbStages.length) ? d.stageIdx : 0;
+      if (lbStages.length) {
+        // ALIAS the selected stage back into the editor (JSON broke the refs).
+        lbExps = lbStages[lbStageIdx].exps;
+        lbRepos = lbStages[lbStageIdx].repos;
+      } else {
+        lbStages = null;
+      }
+    } else {
+      lbExps = (Array.isArray(d.exps) ? d.exps : []).filter(okExp);
+      lbRepos = okRepos(d.repos);
+    }
     lbRepoGap = (finite(d.repoGap) && d.repoGap >= 0 && d.repoGap < lbExps.length)
       ? d.repoGap : 0;
     lbSelExp = -1;   // selection is session state, not worth restoring
@@ -3652,11 +3766,119 @@ function lbRenderLegs() {
   $('lb-legs').innerHTML = html;
 }
 function lbClearAll() {
-  if (!confirm('Clear all experiments + glue?')) return;
+  if (!confirm('Clear all experiments + glue' +
+               (lbStages ? ' AND the applied auto-plan (all stages)' : '') + '?')) return;
   lbExps = []; lbRepos = []; lbSelExp = -1; lbRepoGap = 0;
+  lbStages = null; lbStageIdx = 0; lbPlanMeta = null;
+  $('lb-plan-state').textContent = '(no plan requested)';
+  if ($('lb-stage-sel')) $('lb-stage-sel').innerHTML = '';
+  if (lbLastPlanMsg && lbLastPlanMsg.stages && lbLastPlanMsg.stages.length)
+    $('lb-plan-apply').style.display = '';
   if (lbMode) { lbMode = null; map.getContainer().style.cursor = '';
     $('lb-exp-add').style.outline = ''; $('lb-repo-draw').style.outline = ''; }
   lbRebuildGapSelect(); lbRedrawAll();
+}
+
+// ---- auto-plan (T13: system lays out the remaining matrix in stages) ----
+function lbBuiltLegsForStage(st) {
+  // lbBuiltLegs and friends read the module-level editor state; swap it in,
+  // build, restore. (The current stage's arrays are ALIASED into lbStages,
+  // so this also serializes any operator tweaks.)
+  const se = lbExps, sr = lbRepos;
+  lbExps = st.exps; lbRepos = st.repos;
+  try { return lbBuiltLegs(); }
+  finally { lbExps = se; lbRepos = sr; }
+}
+function lbPlanRequest() {
+  if (!ros || !topicPlanRequest) { alert('not connected'); return; }
+  if (normalizedVenueCorners().length < 3) {
+    alert('author the venue polygon first (>= 3 corners)'); return;
+  }
+  const v = venueToJSON();
+  const a = venueAnchor();
+  v.anchor = { lat0: a.lat0, lon0: a.lon0, bearing_deg: a.bearing };
+  lbPlanPending = true;
+  topicPlanRequest.publish(new ROSLIB.Message({ data: JSON.stringify({ venue: v }) }));
+  $('lb-plan-state').innerHTML =
+    '<span class="pill">planning… (NUC searches placements, ~5–10 s)</span>';
+}
+function onPlanResult(msg) {
+  let d; try { d = JSON.parse(msg.data); } catch (e) { return; }
+  lbLastPlanMsg = d;
+  // /plan/result is LATCHED: a reconnect replays the last plan. Never let a
+  // stale replay clobber the operator's editor — applying takes a press.
+  if (!lbPlanPending) {
+    if (d.stages && d.stages.length) {
+      $('lb-plan-apply').style.display = '';
+      $('lb-plan-state').innerHTML =
+        `<span class="pill">latched plan available: ${d.stages.length} stage(s)` +
+        ` for '${d.venue_name || '?'}' — Apply to load</span>`;
+    }
+    return;
+  }
+  lbPlanPending = false;
+  lbApplyPlan(d);
+}
+function lbApplyPlan(d) {
+  if (!d || !d.stages || !d.stages.length) {
+    $('lb-plan-state').innerHTML =
+      `<span class="err">plan failed: ${((d && d.notes) || []).join('; ') || 'see NUC log'}</span>`
+      + lbUnfittableHtml(d);
+    return;
+  }
+  lbStages = d.stages.map(st => ({
+    name: st.name,
+    geometries: st.geometries || [],
+    exps: (st.experiments || []).map(e => ({
+      id: e.id, recipe: e.recipe,
+      start: { lat: e.start.lat, lon: e.start.lon, heading_deg: e.start.heading_deg } })),
+    repos: (st.glues || []).map(g => ({
+      mids: g.mids || [], waypoints: g.waypoints || null,
+      v_const: g.v_const, pos_tol_m: g.pos_tol_m })),
+  }));
+  lbPlanMeta = { unfittable: d.unfittable || [], notes: d.notes || [] };
+  $('lb-plan-apply').style.display = 'none';
+  lbLoadStage(0);
+  lbRenderPlanState(d);
+}
+function lbUnfittableHtml(d) {
+  const u = (d && d.unfittable) || [];
+  if (!u.length) return '';
+  return '<br><span class="err">does not fit: ' +
+    u.map(x => `${x.family} R${x.R} (${x.reason})`).join('; ') + '</span>';
+}
+function lbRenderPlanState(d) {
+  const total = lbStages.reduce((s, st) => s + st.exps.length, 0);
+  let html = `<span class="ok">plan: ${lbStages.length} stage(s), ${total} curve` +
+    `${total === 1 ? '' : 's'}; the batch runs ALL stages unattended.</span>`;
+  html += lbUnfittableHtml(d);
+  const notes = (lbPlanMeta && lbPlanMeta.notes) || [];
+  if (notes.length) html += `<br><span class="small">${notes.length} planner note(s); first: ${notes[0]}</span>`;
+  $('lb-plan-state').innerHTML = html;
+}
+function lbRebuildStageSelect() {
+  const sel = $('lb-stage-sel'); if (!sel) return;
+  sel.innerHTML = '';
+  (lbStages || []).forEach((st, i) => {
+    const o = document.createElement('option');
+    o.value = i;
+    o.textContent = `${i + 1}/${lbStages.length}: ` +
+      st.geometries.map(g => `${g.family} R${g.R}`).join(', ');
+    sel.appendChild(o);
+  });
+  sel.value = String(lbStageIdx);
+}
+function lbLoadStage(i) {
+  if (!lbStages || !lbStages[i]) return;
+  lbStageIdx = i;
+  // ALIAS (not copy): edits in the editor mutate the stage in place.
+  lbExps = lbStages[i].exps;
+  lbRepos = lbStages[i].repos;
+  lbSelExp = -1; lbRepoGap = 0;
+  if (lbExps.length) { lbSelExp = 0; lbWriteRecipeInputs(lbExps[0]); }
+  lbRebuildGapSelect();
+  lbRebuildStageSelect();
+  lbRedrawAll();
 }
 
 // ---- send ----
@@ -3665,15 +3887,24 @@ function lbBuildPayload() {
   const a = venueAnchor();
   v.schema_version = 2;
   v.anchor = { lat0: a.lat0, lon0: a.lon0, bearing_deg: a.bearing };
-  v.legs = lbBuiltLegs();
+  if (lbStages && lbStages.length) {
+    v.plan_stages = lbStages.map(st => ({
+      name: st.name, legs: lbBuiltLegsForStage(st) }));
+    v.legs = v.plan_stages[0].legs;   // stage-unaware consumers see stage 1
+  } else {
+    v.legs = lbBuiltLegs();
+  }
   return v;
 }
 function lbSend() {
   if (!ros || !topicVenueLoad) { alert('not connected'); return; }
-  if (!lbExps.length) { alert('place at least one experiment first'); return; }
-  const legs = lbBuiltLegs();
-  topicVenueLoad.publish(new ROSLIB.Message({ data: JSON.stringify(lbBuildPayload()) }));
-  $('lb-send-state').innerHTML = `<span class="pill">sent ${legs.length} legs @ ${new Date().toLocaleTimeString()} — awaiting /venue/load_status</span>`;
+  if (!lbExps.length) { alert('place at least one experiment first (or Auto-plan)'); return; }
+  const payload = lbBuildPayload();
+  const nLegs = (payload.plan_stages || []).reduce((s, st) => s + st.legs.length, 0)
+    || payload.legs.length;
+  topicVenueLoad.publish(new ROSLIB.Message({ data: JSON.stringify(payload) }));
+  const staged = payload.plan_stages ? ` in ${payload.plan_stages.length} stages` : '';
+  $('lb-send-state').innerHTML = `<span class="pill">sent ${nLegs} legs${staged} @ ${new Date().toLocaleTimeString()} — awaiting /venue/load_status</span>`;
 }
 function lbStart() {
   if (!ros || !topicRunGo) { alert('not connected'); return; }
@@ -3705,15 +3936,18 @@ function onVenueLoaded(msg) {
   if (d && d.name) $('lb-send-state').title =
     `active: ${d.name} — ${d.n_legs} legs, ${d.total_scored} scored (live progress: /run/status)`;
 }
+let _lastRunPhase = null;
 function onRunStatus(msg) {
   let d; try { d = JSON.parse(msg.data); } catch (e) {
     $('lb-run-status').innerHTML = '<span class="err">bad /run/status JSON</span>'; return; }
   const phase = d.phase || '--';
+  const stg = d.n_stages ? `stage ${(d.stage_index||0)+1}/${d.n_stages}` +
+    (d.stage ? ` (${d.stage})` : '') + ' &nbsp; ' : '';
   const leg = (d.n_legs) ? `leg ${Math.min((d.leg_index||0)+1, d.n_legs)}/${d.n_legs}` : 'leg --';
   const sweep = (d.runs_target) ? `sweep ${d.runs_done||0}/${d.runs_target}` : `done ${d.n_complete||0}`;
   const t = d.treatment ? ` &nbsp; <span class="pill">${d.treatment.controller} v${d.treatment.v_const} rep${d.treatment.rep}</span>` : '';
   $('lb-run-status').innerHTML =
-    `<span class="pill">${phase}</span> &nbsp; ${leg} &nbsp; ${sweep}${t}<br>` +
+    `<span class="pill">${phase}</span> &nbsp; ${stg}${leg} &nbsp; ${sweep}${t}<br>` +
     `curve: ${d.curve_name || '--'} (${d.curve_kind || '--'}) &nbsp; rtk q=${d.rtk_q != null ? d.rtk_q : '--'}` +
     (d.battery_v != null ? ` &nbsp; batt ${Number(d.battery_v).toFixed(2)}V` : '') +
     (d.message ? `<br><span class="small">${d.message}</span>` : '');
@@ -3722,9 +3956,20 @@ function onRunStatus(msg) {
   else if (phase === 'aborted')
     raiseAlert('run_paused', 'critical', 'Run ABORTED', d.message || 'aborted');
   else clearAlert('run_paused');
+  // Walk-away operator: a browser ping when the whole batch lands (Discord
+  // pings come from the run_executor itself). Transition-edged so the
+  // latched status replay on reconnect does not re-fire it.
+  if (phase === 'done' && _lastRunPhase && _lastRunPhase !== 'done')
+    raiseAlert('run_done', 'warn', 'Batch DONE',
+      `${d.runs_done || 0}/${d.runs_target || 0} scored runs complete`);
+  if (phase !== 'done') clearAlert('run_done');
+  _lastRunPhase = phase;
 }
 
 // ---- wire-up ----
+$('lb-plan').onclick       = lbPlanRequest;
+$('lb-plan-apply').onclick = () => lbApplyPlan(lbLastPlanMsg);
+$('lb-stage-sel').onchange = () => lbLoadStage(parseInt($('lb-stage-sel').value, 10) || 0);
 $('lb-exp-add').onclick    = lbPlaceExpToggle;
 $('lb-exp-del').onclick    = lbDelExp;
 ['lb-rec-type','lb-rec-R','lb-rec-L1','lb-rec-theta','lb-rec-L2','lb-rec-dir','lb-rec-heading']
@@ -3739,6 +3984,7 @@ $('lb-pause').onclick      = () => lbRunCmd('pause');
 $('lb-abort').onclick      = lbAbort;
 lbRestore();             // bring back authored experiments + glue (like restoreVenue)
 lbRebuildGapSelect();
+if (lbStages) lbRebuildStageSelect();
 if ($('lb-repo-gap') && lbRepoGap < lbExps.length) $('lb-repo-gap').value = String(lbRepoGap);
 lbRedrawAll();           // draws restored paths; no-op when nothing was saved
 </script>

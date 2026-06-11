@@ -3844,7 +3844,7 @@ function lbPlanRequest() {
   lbPlanPending = true;
   topicPlanRequest.publish(new ROSLIB.Message({ data: JSON.stringify({ venue: v }) }));
   $('lb-plan-state').innerHTML =
-    '<span class="pill">planning… (NUC searches placements, ~5–10 s)</span>';
+    '<span class="pill">planning… (NUC searches placements + A/B pairs, ~10–60 s)</span>';
 }
 function onPlanResult(msg) {
   let d; try { d = JSON.parse(msg.data); } catch (e) { return; }

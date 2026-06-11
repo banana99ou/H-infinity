@@ -35,7 +35,10 @@ except Exception:  # pragma: no cover - in-source / odd layout fallback
 # yaml so they are version-controlled and operator-editable, but the cell key
 # only sweeps (family, R).
 PLAN_DEFAULTS = {
-    "max_geometries_per_stage": 3,
+    # >= 2: each stage is ONE geometry placed as an A/B opposed pair
+    # (directional-bias removal, field decision 2026-06-11); <= 1: legacy
+    # single-curve stages (the stage-advance shakedown forces this).
+    "max_geometries_per_stage": 2,
     "geometry_order": "matrix",      # matrix | finish-nearest
     "grid_m": 1.0,                   # coarse placement grid pitch
     "heading_step_deg": 30.0,        # coarse heading pitch
@@ -536,9 +539,11 @@ def _plan_glue(end, exit_b, start, start_b, poly, excl, req, cfg):
 # Placement search
 # ----------------------------------------------------------------------
 
-def _candidates(pts_local, poly, excl, req, cfg, prefer_near=None):
+def _candidates(pts_local, poly, excl, req, cfg, prefer_near=None,
+                prefer_heading=None):
     """Coarse-to-fine search. Returns scored [(score, x, y, h_deg), ...]
-    best-first (at most ~20)."""
+    best-first (at most ~20). prefer_heading (compass deg) biases toward a
+    target heading — the A/B opposed-pair placement wants ~+180 deg."""
     xs = [p[0] for p in poly]
     ys = [p[1] for p in poly]
     grid = float(cfg["grid_m"])
@@ -563,6 +568,10 @@ def _candidates(pts_local, poly, excl, req, cfg, prefer_near=None):
                                                 y - prefer_near[1]) - 4.0)
                                  if prefer_near else 0.0)
                             score = min(mn, req + 0.5) - 0.08 * d
+                            if prefer_heading is not None:
+                                # 1.8 at 180 deg off — dominates the band, so
+                                # opposed placements sort first.
+                                score -= 0.01 * _ang_diff_deg(h, prefer_heading)
                             found.append((score, x, y, h))
                 x += gx
             y += gx
@@ -652,137 +661,144 @@ def plan_stages(venue, doc, counts, footprint_r=0.30, track_margin=0.30,
     spacing = 0.25      # search-time sampling; final check is the loader's 0.10
     stage_geo = []      # per assembled stage: exit/entry poses (EN) for transit
     queue = list(remaining)
-    max_per = int(cfg["max_geometries_per_stage"])
-    cap = max_per       # shrinks on a glue failure, resets per finished stage
+    # Stage shape (field decision 2026-06-11): one GEOMETRY per stage, placed
+    # as an A/B OPPOSED PAIR — the same recipe twice, headings ~180 deg apart,
+    # glued into a racetrack (two ~180 turnarounds, far easier to keep above
+    # the trackable radius than one 360 self-loop). The executor's least-done
+    # treatment cycling then alternates runs between the two directions, so
+    # slope/wind/mount bias averages out of every cell. Stages never mix
+    # geometries any more. max_geometries_per_stage <= 1 keeps the legacy
+    # single-curve (self-loop) stages — the stage-advance shakedown uses it.
+    ab_pair = int(cfg["max_geometries_per_stage"]) >= 2
     guard = 0
-    while queue and guard < 32:
+    while queue and guard < 64:
         guard += 1
-        placed = []      # [{id, recipe, start_en, h, exit_b, end_en, fam, R, rem}]
-        deferred = []
-        for (fam, R, rem) in queue:
-            if len(placed) >= cap:
-                deferred.append((fam, R, rem))
-                continue
-            variants = []
-            for direction in ((1, -1) if fam == "step" else (1,)):
-                recipe = _recipe_for(fam, R, cfg, direction)
-                if recipe is None:
-                    break
-                pts, end_yaw = _local_samples(recipe, spacing)
-                if pts is None:
-                    break
-                variants.append((recipe, pts, end_yaw))
-            if not variants:
-                unfittable.append({"family": fam, "R": R,
-                                   "reason": "recipe not buildable "
-                                             "(unknown family or vfg import)"})
-                continue
-            prefer = placed[-1]["end_en"] if placed else None
-            # Gather candidates for every direction variant, best-first.
-            scored = []
-            for (recipe, pts, end_yaw) in variants:
-                for c in _candidates(pts, poly, excl, req, cfg,
-                                     prefer_near=prefer):
-                    scored.append((c, recipe, pts, end_yaw))
-            scored.sort(key=lambda t: -t[0][0])
-            best = None
-            if placed:
-                # Glue-aware pick: first candidate whose INCOMING glue from
-                # the previous curve is clear AND chassis-trackable. (The
-                # stage-closing glue is checked after assembly.)
-                for cand in scored[:12]:
-                    (s, x, y, h) = cand[0]
-                    mids, _n = _plan_glue(
-                        placed[-1]["end_en"], placed[-1]["exit_b"],
-                        (x, y), h, poly, excl, req, cfg)
-                    if mids is not None:
-                        best = cand
-                        break
-            if best is None and scored:
-                best = scored[0]
-            if best is None:
-                if placed:
-                    deferred.append((fam, R, rem))   # may fit alone next stage
-                else:
-                    unfittable.append({
-                        "family": fam, "R": R,
-                        "reason": f"no placement clears {req:.2f}m "
-                                  "even in an empty venue"})
-                continue
-            (score, x, y, h), recipe, pts, end_yaw = best
-            placed.append({
-                "id": f"exp{len(placed) + 1}", "recipe": recipe,
-                "fam": fam, "R": R, "rem": rem,
-                "start_en": (x, y), "h": h,
-                "exit_b": _exit_bearing(h, end_yaw),
-                "end_en": _place(pts, x, y, h)[-1],
-                "cands": scored[:12],   # kept for the self-loop fix below
-            })
-        if not placed:
-            for (fam, R, rem) in deferred:
-                unfittable.append({"family": fam, "R": R,
-                                   "reason": "stage assembly failed"})
-            break
-
-        glues, glue_fail = [], None
-        for g in range(len(placed)):
-            nxt = placed[(g + 1) % len(placed)]
-            glue_en, note = _plan_glue(
-                placed[g]["end_en"], placed[g]["exit_b"],
-                nxt["start_en"], nxt["h"], poly, excl, req, cfg)
-            if glue_en is None:
-                glue_fail = (g, note)
+        fam, R, rem = queue.pop(0)
+        variants = []
+        for direction in ((1, -1) if fam == "step" else (1,)):
+            recipe = _recipe_for(fam, R, cfg, direction)
+            if recipe is None:
                 break
-            if note:
-                notes.append(f"stage {len(stages) + 1} glue {g}: {note}")
-            glues.append(_glue_out(glue_en, cfg, lat0, lon0))
-        if glue_fail is not None and len(placed) > 1:
-            # Retry this stage with a smaller cap: the last-placed geometry is
-            # demoted behind the deferred ones so the retried (and every later)
-            # stage actually differs. Bounded by cap >= 1 + the outer guard.
-            cap = len(placed) - 1
-            notes.append(
-                f"glue gap {glue_fail[0]} infeasible with "
-                f"{len(placed)} curves ({glue_fail[1]}); retrying with {cap}")
-            requeue = [(p["fam"], p["R"], p["rem"]) for p in placed[:-1]]
-            dropped = placed[-1]
-            queue = (requeue + deferred
-                     + [(dropped["fam"], dropped["R"], dropped["rem"])])
+            pts, end_yaw = _local_samples(recipe, spacing)
+            if pts is None:
+                break
+            variants.append((recipe, pts, end_yaw))
+        if not variants:
+            unfittable.append({"family": fam, "R": R,
+                               "reason": "recipe not buildable "
+                                         "(unknown family or vfg import)"})
             continue
-        if glue_fail is not None:
-            # Single-curve stage whose end->start loop is infeasible at the
-            # clearance-best placement: retry the loop over the OTHER stored
-            # candidates (placement was chosen blind to the self-loop).
-            p = placed[0]
-            fixed = False
-            for (cand, recipe, pts, end_yaw) in p["cands"]:
-                (_s, x, y, h) = cand
-                exit_b = _exit_bearing(h, end_yaw)
-                end_en = _place(pts, x, y, h)[-1]
-                glue_en, note = _plan_glue(end_en, exit_b, (x, y), h,
-                                           poly, excl, req, cfg)
-                if glue_en is None:
-                    continue
-                p.update({"recipe": recipe, "start_en": (x, y), "h": h,
-                          "exit_b": exit_b, "end_en": end_en})
-                if note:
-                    notes.append(f"stage {len(stages) + 1} glue 0: {note}")
-                glues = [_glue_out(glue_en, cfg, lat0, lon0)]
-                fixed = True
-                break
-            if not fixed:
-                unfittable.append({
-                    "family": p["fam"], "R": p["R"],
-                    "reason": f"single-curve glue loop infeasible at every "
-                              f"stored placement ({glue_fail[1]})"})
-                queue = deferred
-                cap = max_per
-                continue
+
+        def _entry(recipe, pts, end_yaw, x, y, h, idx):
+            return {"id": f"exp{idx}", "recipe": recipe, "fam": fam, "R": R,
+                    "rem": rem, "start_en": (x, y), "h": h,
+                    "exit_b": _exit_bearing(h, end_yaw),
+                    "end_en": _place(pts, x, y, h)[-1]}
+
+        placed, glues_en = None, None
+
+        if ab_pair:
+            target = req + float(cfg["fit_buffer_m"])
+
+            def _try_B(A, recipe, pts, end_yaw, xB, yB, hB):
+                if _min_clear_placed(pts, xB, yB, hB, poly, excl,
+                                     target) < target:
+                    return None
+                B = _entry(recipe, pts, end_yaw, xB, yB, hB, 2)
+                g1, n1 = _plan_glue(A["end_en"], A["exit_b"],
+                                    B["start_en"], B["h"],
+                                    poly, excl, req, cfg)
+                if g1 is None:
+                    return None
+                g2, n2 = _plan_glue(B["end_en"], B["exit_b"],
+                                    A["start_en"], A["h"],
+                                    poly, excl, req, cfg)
+                if g2 is None:
+                    return None
+                return B, [(g1, n1), (g2, n2)]
+
+            for (recipe, pts, end_yaw) in variants:
+                for (_sA, xA, yA, hA) in _candidates(
+                        pts, poly, excl, req, cfg)[:6]:
+                    A = _entry(recipe, pts, end_yaw, xA, yA, hA, 1)
+                    opp = (hA + 180.0) % 360.0
+                    # Closed-form racetrack slots first: B.start = A.end +
+                    # lateral offset w (+ optional slide s along the exit),
+                    # heading exactly opposed. The same recipe rotated 180
+                    # then ENDS at A.start + the same offset, so BOTH glues
+                    # are clean ~w/2-radius turnarounds by construction —
+                    # the grid search rarely lands in this slot on its own.
+                    ex_, ey_ = _bearing_vec(A["exit_b"])
+                    cand_B = []
+                    for sgn in (1.0, -1.0):
+                        nx_, ny_ = ey_ * sgn, -ex_ * sgn
+                        for w in (1.8, 2.4, 3.0, 3.6):
+                            for s_ in (0.0, 1.0, 2.0):
+                                cand_B.append(
+                                    (A["end_en"][0] + nx_ * w + ex_ * s_,
+                                     A["end_en"][1] + ny_ * w + ey_ * s_,
+                                     opp))
+                    for (xB, yB, hB) in cand_B:
+                        got = _try_B(A, recipe, pts, end_yaw, xB, yB, hB)
+                        if got is not None:
+                            placed, glues_en = [A, got[0]], got[1]
+                            break
+                    if placed is None:
+                        # Grid fallback: anywhere opposed-ish that glues.
+                        for (_sB, xB, yB, hB) in _candidates(
+                                pts, poly, excl, req, cfg,
+                                prefer_near=A["end_en"],
+                                prefer_heading=opp)[:6]:
+                            if _ang_diff_deg(hB, opp) > 60.0:
+                                continue   # not opposed enough to de-bias
+                            got = _try_B(A, recipe, pts, end_yaw, xB, yB, hB)
+                            if got is not None:
+                                placed, glues_en = [A, got[0]], got[1]
+                                break
+                    if placed:
+                        break
+                if placed:
+                    break
+            if placed is None:
+                notes.append(f"{fam} R{R}: no trackable A/B pair fits — "
+                             "falling back to a single curve (directional "
+                             "bias NOT cancelled for this geometry)")
+
+        if placed is None:
+            # Single curve with a self-loop glue (legacy shape; also the
+            # fallback when the venue cannot host an opposed pair).
+            for (recipe, pts, end_yaw) in variants:
+                for (_s, x, y, h) in _candidates(pts, poly, excl,
+                                                 req, cfg)[:20]:
+                    P = _entry(recipe, pts, end_yaw, x, y, h, 1)
+                    g, note = _plan_glue(P["end_en"], P["exit_b"],
+                                         P["start_en"], P["h"],
+                                         poly, excl, req, cfg)
+                    if g is None:
+                        continue
+                    placed, glues_en = [P], [(g, note)]
+                    break
+                if placed:
+                    break
+        if placed is None:
+            unfittable.append({
+                "family": fam, "R": R,
+                "reason": ("no placement supports a trackable A/B pair or "
+                           f"self-loop clearing {req:.2f}m")})
+            continue
+
+        glues = []
+        for gi, (g, note) in enumerate(glues_en):
+            if note:
+                notes.append(f"stage {len(stages) + 1} glue {gi}: {note}")
+            glues.append(_glue_out(g, cfg, lat0, lon0))
 
         stages.append({
             "name": f"stage_{len(stages) + 1}",
-            "geometries": [{"family": p["fam"], "R": p["R"],
-                            "remaining_runs": p["rem"]} for p in placed],
+            # One geometry per stage (the A/B pair shares it): listed ONCE so
+            # downstream accounting (fuzz invariant, executor scoring) sees
+            # each (family, R) in exactly one place.
+            "geometries": [{"family": fam, "R": R, "remaining_runs": rem}],
             "experiments": [{
                 "id": p["id"], "recipe": p["recipe"],
                 "start": dict(zip(("lat", "lon"),
@@ -795,9 +811,7 @@ def plan_stages(venue, doc, counts, footprint_r=0.30, track_margin=0.30,
                           "exit_b": placed[-1]["exit_b"],
                           "entry_en": placed[0]["start_en"],
                           "entry_b": placed[0]["h"]})
-        queue = deferred
-        cap = max_per
-    if guard >= 32 and queue:
+    if queue:
         for (fam, R, rem) in queue:
             unfittable.append({"family": fam, "R": R,
                                "reason": "planner retry budget exhausted"})

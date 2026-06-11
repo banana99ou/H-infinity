@@ -133,6 +133,30 @@ def test_entry_glue_lands_on_next_stage_start_pin():
         assert abs(eg["end_heading_deg"] - pin["heading_deg"]) < 0.6
 
 
+def test_stages_are_opposed_ab_pairs():
+    """A: each stage = ONE geometry placed twice, headings ~180 deg apart
+    (directional-bias removal), glued as a racetrack. Single-curve stages are
+    allowed only with an explicit fallback note."""
+    venue, p = _plan_rooftop()
+    assert p["ok"]
+    for st in p["stages"]:
+        assert len(st["geometries"]) == 1, "stage mixes geometries"
+        exps = st["experiments"]
+        assert len(exps) <= 2
+        if len(exps) == 1:
+            geom = st["geometries"][0]
+            assert any("single curve" in n and f"R{geom['R']}" in n
+                       for n in p["notes"]), \
+                f"{st['name']}: silent single-curve stage"
+            continue
+        assert exps[0]["recipe"] == exps[1]["recipe"], \
+            "A/B legs must be the SAME treatment geometry"
+        d = abs((exps[0]["start"]["heading_deg"]
+                 - exps[1]["start"]["heading_deg"] + 180.0) % 360.0 - 180.0)
+        assert d > 120.0, f"{st['name']}: pair only {d:.0f} deg apart"
+        assert len(st["glues"]) == 2
+
+
 def test_entry_glue_passes_loader_containment():
     venue, p = _plan_rooftop()
     assert p["ok"]

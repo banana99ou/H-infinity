@@ -41,7 +41,7 @@ def _extract(names):
     return ns
 
 
-NS = _extract({'_wrap', 'point_seg_dist'})
+NS = _extract({'_wrap', 'point_seg_dist', 'polyline_dist'})
 
 
 class _Log:
@@ -51,11 +51,13 @@ class _Log:
 class Robot:
     """Minimal stand-in for the node: only what _select_join_segment touches."""
 
-    def __init__(self, waypoints, xy, heading_deg, infeasible_deg=100.0):
+    def __init__(self, waypoints, xy, heading_deg, infeasible_deg=100.0,
+                 acquire_radius=1.0):
         self._waypoints = waypoints
         self._fix_xy = xy
         self._heading_est = math.radians(heading_deg)
         self._infeasible = math.radians(infeasible_deg)
+        self._acquire_radius = acquire_radius
         self._seg_i = 0
 
     def get_logger(self):
@@ -106,6 +108,48 @@ def test_prefix_behind_join():
     r = Robot(pts, (0.0, 0.1), 0.0)                          # facing east
     assert r.select() is True, 'must find a forward-feasible join'
     assert r._seg_i >= 5, f'expected an east-arm segment, got {r._seg_i}'
+
+
+def test_offpath_before_start_joins_seg0():
+    """2026-06-11 field regression: robot OFF the path, parked before the
+    start and facing it, must join at segment 0 and drive the WHOLE curve —
+    the tail is the heading convergence."""
+    pts = jhook()
+    # 1.5 m short of wp0, roughly along the start tangent (-40 deg).
+    rx = pts[0][0] - 1.5 * math.cos(math.radians(-40.0))
+    ry = pts[0][1] - 1.5 * math.sin(math.radians(-40.0))
+    r = Robot(pts, (rx, ry), -40.0)
+    assert r.select() is True
+    assert r._seg_i == 0, f'off-path before start must join seg 0, got {r._seg_i}'
+
+
+def test_offpath_near_end_still_joins_earliest():
+    """The exact 2026-06-11 failure shape: robot off-path, CLOSER to the
+    curve's end than to its start, start still in-front feasible. The old
+    closest-wins rule joined the LAST segment; earliest must win."""
+    pts = jhook()
+    ex, ey = pts[-1]
+    sx, sy = pts[0]
+    # Off-path point ~2 m from the end, farther from the start, facing the
+    # start (so seg 0 is feasible).
+    rx, ry = ex + 0.5, ey - 2.0
+    th = math.degrees(math.atan2(sy - ry, sx - rx))
+    r = Robot(pts, (rx, ry), th)
+    assert NS['polyline_dist']((rx, ry), pts) > 1.0, 'setup must be off-path'
+    assert r.select() is True
+    assert r._seg_i == 0, f'expected earliest feasible (seg 0), got {r._seg_i}'
+
+
+def test_offpath_start_behind_falls_forward():
+    """Off-path with the start area behind the nose: the earliest FEASIBLE
+    segment wins (not seg 0, not the closest)."""
+    pts = ([(-3.0 + 0.5 * k, 0.0) for k in range(6)]        # west arm (behind)
+           + [(0.5 + 0.5 * k, 0.2) for k in range(6)])      # east arm (ahead)
+    r = Robot(pts, (0.0, 1.5), 0.0)                          # 1.3+ m off, facing east
+    assert NS['polyline_dist']((0.0, 1.5), pts) > 1.0, 'setup must be off-path'
+    assert r.select() is True
+    assert 5 <= r._seg_i, f'expected first east-arm feasible seg, got {r._seg_i}'
+    assert r._seg_i <= 6, f'must be the EARLIEST feasible, got {r._seg_i}'
 
 
 def test_truly_infeasible():

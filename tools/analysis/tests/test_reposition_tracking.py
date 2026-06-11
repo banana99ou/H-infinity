@@ -26,7 +26,8 @@ SRC = os.path.join(
 
 _FUNCS = {'_wrap', 'point_seg_dist', 'point_seg_nearest', 'polyline_dist',
           'seg_circle_far_t'}
-_METHODS = {'_lookahead_target', '_control_cb', '_active_tol'}
+_METHODS = {'_lookahead_target', '_control_cb', '_active_tol',
+            '_select_join_segment'}
 _CONSTS = {'_RTK_FIXED', '_ALLOWED_RTK'}
 
 
@@ -147,21 +148,41 @@ def arc_path(n=30, step=0.4, th0=-40.0, dth=100.0):
 # _lookahead_target
 # ---------------------------------------------------------------------------
 
-def test_offpath_targets_nearest_point_not_end():
+def test_offpath_targets_current_segment_not_end():
     """2026-06-11 regression core: 1.2 m off-path near the START must aim at
-    the nearby path point, never the final waypoint."""
+    the current (joined) segment, never the final waypoint."""
     pts = arc_path()
     # 1.2 m perpendicular-ish off the second waypoint.
     rx, ry = pts[1][0] - 0.85, pts[1][1] + 0.85
     r = Robot(pts, (rx, ry), 0.0)
     tx, ty = r._lookahead_target()
     assert (tx, ty) != pts[-1], 'aimed at the curve end from off-path (old bug)'
-    d_tgt = math.hypot(tx - rx, ty - ry)
-    xtrack = NS['polyline_dist']((rx, ry), pts)
-    assert abs(d_tgt - xtrack) < 1e-6, (
-        f'target is not the nearest path point: {d_tgt:.2f} vs xtrack '
-        f'{xtrack:.2f}')
-    assert r._seg_i <= 3, f'nearest segment should be early, got {r._seg_i}'
+    want = NS['point_seg_nearest']((rx, ry), pts[0], pts[1])
+    assert (abs(tx - want[0]) < 1e-9 and abs(ty - want[1]) < 1e-9), (
+        f'target must be the nearest point on the CURRENT segment: got '
+        f'({tx:.2f},{ty:.2f}), want ({want[0]:.2f},{want[1]:.2f})')
+    assert r._seg_i == 0, f'_seg_i must not jump ahead, got {r._seg_i}'
+
+
+def test_field_2026_06_11_join_plus_reacquire_targets_start():
+    """Integration replay of the field failure: robot off-path, CLOSER to the
+    curve end than to its start, start in-front feasible. Join must pick seg 0
+    AND re-acquire must then walk it to the START area — with the old code the
+    pair degenerated to a beeline at the last segment."""
+    pts = arc_path()
+    ex, ey = pts[-1]
+    sx, sy = pts[0]
+    rx, ry = ex + 0.5, ey - 2.0          # ~2 m from the end, ~6+ m from start
+    th = math.degrees(math.atan2(sy - ry, sx - rx))   # facing the start
+    r = Robot(pts, (rx, ry), th)
+    assert math.hypot(rx - ex, ry - ey) < math.hypot(rx - sx, ry - sy), \
+        'setup: must be closer to the end than to the start'
+    assert NS['_select_join_segment'](r) is True
+    assert r._seg_i == 0, f'join must pick seg 0, got {r._seg_i}'
+    tx, ty = r._lookahead_target()
+    assert math.hypot(tx - sx, ty - sy) < 0.5, (
+        f'must walk to the curve START, not the tail: target ({tx:.2f},{ty:.2f})')
+    assert r._seg_i == 0
 
 
 def test_near_end_still_drives_straight_in():

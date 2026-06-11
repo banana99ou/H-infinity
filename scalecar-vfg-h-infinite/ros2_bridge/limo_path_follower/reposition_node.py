@@ -935,6 +935,16 @@ class RepositionNode(Node):
                           - self._heading_est)
             d0 = math.hypot(wps[0][0] - rx, wps[0][1] - ry)
             return d0 <= min_target_dist or abs(alpha) <= self._infeasible
+        # ON the path (within acquire_radius): join where it stands — the
+        # CLOSEST in-front feasible segment (field regression 2026-06-10;
+        # driving back to the start would mean driving the path backward).
+        # OFF the path: join the EARLIEST in-front feasible segment — the
+        # authored curve delivers position AND heading (the tail is the
+        # heading convergence), so a far robot drives TO the curve's start
+        # and tracks all of it instead of cutting to whatever segment is
+        # nearest (field failure 2026-06-11: parked before the start, the
+        # node joined seg 30/30 5.5 m away and arrived heading-off).
+        on_path = polyline_dist((rx, ry), wps) <= self._acquire_radius
         best = None                      # (cross-track dist, segment index)
         for i in range(n - 1):
             # Join target: first waypoint beyond i that is usefully ahead.
@@ -949,8 +959,12 @@ class RepositionNode(Node):
             if abs(alpha) > self._infeasible:
                 continue
             d = point_seg_dist((rx, ry), wps[i], wps[i + 1])
-            if best is None or d < best[0]:
-                best = (d, i)
+            if on_path:
+                if best is None or d < best[0]:
+                    best = (d, i)
+            else:
+                best = (d, i)            # earliest feasible wins
+                break
         if best is None:
             return False
         self._seg_i = best[1]
@@ -990,20 +1004,16 @@ class RepositionNode(Node):
                 bx, by = wps[i + 1]
                 return (ax + (bx - ax) * t, ay + (by - ay) * t)
         # No crossing and not near the end: the robot is off-path. Re-acquire
-        # by aiming at the NEAREST remaining path point — the old fallback
-        # aimed at the curve END, so a robot 1.2 m off-path beelined past the
-        # whole authored curve (field failure 2026-06-11). Normal pursuit
-        # resumes as soon as the look-ahead circle crosses the path again.
-        best = None                      # (dist, seg index, nearest point)
-        for i in range(self._seg_i, last):
-            px, py = point_seg_nearest((rx, ry), wps[i], wps[i + 1])
-            d = math.hypot(px - rx, py - ry)
-            if best is None or d < best[0]:
-                best = (d, i, (px, py))
-        if best is None:
-            return wps[last]
-        self._seg_i = best[1]            # still monotone: loop starts at _seg_i
-        return best[2]
+        # by aiming at the nearest point on the CURRENT segment only — the
+        # old fallback aimed at the curve END, so a robot 1.2 m off-path
+        # beelined past the whole authored curve (field failure 2026-06-11).
+        # Restricting to _seg_i (not the globally nearest remaining point)
+        # preserves the join decision: a robot joined at seg 0 walks to the
+        # curve START even when the tail happens to be nearer. Normal pursuit
+        # resumes as soon as the look-ahead circle crosses the path again; a
+        # target that ends up behind the nose trips the forward-cone guard.
+        return point_seg_nearest((rx, ry), wps[self._seg_i],
+                                 wps[min(self._seg_i + 1, last)])
 
     # ------------------------------------------------------------------
     # Actuation

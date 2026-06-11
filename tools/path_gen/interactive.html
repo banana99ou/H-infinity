@@ -394,6 +394,11 @@
     <div class="small" id="venue-corner-state">corners: 0 / 4</div>
     <div class="small" style="color:#6cf;">Click 2 corners to set one side, then a 3rd for depth — corner 4 auto-snaps to a rectangle. Click a corner/pin to select it, then arrow keys nudge; drag to move freely.</div>
     <div class="small" id="venue-place-hint" style="color:#6cf;"></div>
+    <label style="margin-top:6px;">venue name (= run resume key — keep it the SAME
+      across field days; a fresh name restarts progress from 0)
+      <input type="text" id="venue-name" value="rooftop" maxlength="48"
+             pattern="[A-Za-z0-9_\-]+">
+    </label>
     <label style="margin-top:6px;">safety margin (m)
       <span class="pill" id="venue-margin-val">0.50</span>
       <input type="range" id="venue-margin" min="0.0" max="2.0" step="0.05" value="0.50">
@@ -2607,6 +2612,7 @@ function loadVenueObject(v) {
   venue.exclusions = (v.exclusions || []).map(e => ({ kind: 'circle', lat: e.lat, lon: e.lon, radius_m: e.radius_m }));
   venue.start_pins = (v.start_pins || []).map(p => ({ id: p.id, lat: p.lat, lon: p.lon, heading_deg: p.heading_deg }));
   venue.end_pins   = (v.end_pins   || []).map(p => ({ id: p.id, lat: p.lat, lon: p.lon, heading_deg: p.heading_deg }));
+  $('venue-name').value = venue.name;
   $('venue-margin').value = venue.safety_margin_m;
   $('venue-margin-val').textContent = venue.safety_margin_m.toFixed(2);
   drawVenue();
@@ -2697,6 +2703,14 @@ $('btn-venue-clear-corners').onclick = () => {
   selectedVenueHandle = null;
   if (venuePlaceMode === 'corner') $('venue-place-hint').textContent = venueHintText();
   drawVenue(); persistVenue();
+};
+$('venue-name').oninput = (e) => {
+  // Resume credit is keyed by this name (run_id == venue name in the
+  // manifest): sanitize to the charset the run/bag naming uses.
+  const clean = e.target.value.replace(/[^A-Za-z0-9_\-]/g, '_');
+  if (clean !== e.target.value) e.target.value = clean;
+  venue.name = clean || 'rooftop';
+  persistVenue();
 };
 $('venue-margin').oninput = (e) => {
   venue.safety_margin_m = parseFloat(e.target.value);

@@ -44,6 +44,23 @@ import run_eval  # noqa: E402
 import manifest as mf  # noqa: E402
 
 
+# Required-topic set for a paper-grade leg (system_spec §5 pass criteria).
+# OptiTrack joins this list once the indoor venue comes online.
+REQUIRED_TOPICS = (
+    "/wheel/odom",
+    "/cmd_vel_raw",
+    "/cmd_vel",
+    "/estop",
+    "/reference_path",
+    "/path_follower/status",
+    "/gps_rtk_f9p_helical/gps/fix",
+    "/gps_rtk_f9p_helical/gps/rtk_status",
+)
+
+# Speed threshold separating "robot moving" from encoder noise / standstill.
+MOTION_V_THRESH = 0.05
+
+
 def _window(bag):
     """Run window [t0, t1] from odom stamps (fallback: status, then any)."""
     for topic in (run_eval.TOPIC_ODOM, run_eval.TOPIC_STATUS):
@@ -52,6 +69,25 @@ def _window(bag):
             s = d["stamp"]
             return float(s[0]), float(s[-1])
     return None, None
+
+
+def _motion_window(bag):
+    """[t_first, t_last] where |odom v| > MOTION_V_THRESH, else (None, None).
+
+    The bag records several seconds of pre-motion idle (bag start -> follower
+    spawn -> recipe push), so the length gate must compare the *moving* span
+    against arc-length/v — gating on whole-bag duration fails every leg whose
+    idle head is long relative to the path.
+    """
+    d = bag.get(run_eval.TOPIC_ODOM)
+    if d is None or len(d["stamp"]) < 2:
+        return None, None
+    s = np.asarray(d["stamp"], dtype=float)
+    v = np.abs(np.asarray(d["v"], dtype=float))
+    m = v > MOTION_V_THRESH
+    if not np.any(m):
+        return None, None
+    return float(s[m][0]), float(s[m][-1])
 
 
 def rtk_fixed_pct(bag, t0, t1):
@@ -122,6 +158,8 @@ def qc_leg(leg, target_len_v, rtk_pct_min, length_tol, gap_tol,
 
     t0, t1 = _window(bag)
     duration = (t1 - t0) if t0 is not None else None
+    m0, m1 = _motion_window(bag)
+    motion_s = (m1 - m0) if m0 is not None else None
 
     # 0) Run window. If neither odom nor status carries >=2 samples the window
     # can't be inferred: the length check is skipped and RTK%/estop fall back to
@@ -129,6 +167,21 @@ def qc_leg(leg, target_len_v, rtk_pct_min, length_tol, gap_tol,
     # let it slip through on partial checks.
     if t0 is None:
         reasons.append("no_run_window")
+
+    # 0b) Required topics (system_spec §5): every one must be present with at
+    # least one message. Catches recorder-side losses (e.g. a QoS-poisoned
+    # /cmd_vel_raw subscription) that leave the run looking healthy elsewhere.
+    bag_counts = bag.get("_counts") or {}
+    absent = [t for t in REQUIRED_TOPICS if bag_counts.get(t, 0) == 0]
+    if absent:
+        reasons.append("missing_topics:" + "+".join(absent))
+    # estop_cli relays cmd_vel_raw -> cmd_vel 1:1, so a large count gap means
+    # the recorder captured only a fraction of the raw stream (e.g. one latched
+    # sample from a QoS-mismatched subscription) even though the topic exists.
+    n_raw = bag_counts.get("/cmd_vel_raw", 0)
+    n_cmd = bag_counts.get("/cmd_vel", 0)
+    if n_cmd > 0 and not absent and n_raw < 0.5 * n_cmd:
+        reasons.append(f"cmd_vel_raw_undercount_{n_raw}/{n_cmd}")
 
     # 1) RTK FIXED % (skipped at GPS-denied venues via --no-rtk-gate)
     pct, n_rtk = rtk_fixed_pct(bag, t0, t1)
@@ -144,11 +197,14 @@ def qc_leg(leg, target_len_v, rtk_pct_min, length_tol, gap_tol,
     elif estop_fired(bag, t0, t1):
         reasons.append("estop_fired")
 
-    # 3) Length vs analytic
-    if target_len_v is not None and duration is not None and target_len_v > 0:
-        ratio = duration / target_len_v
-        if not (1.0 - length_tol <= ratio <= 1.0 + length_tol):
-            reasons.append(f"length_ratio_{ratio:.2f}")
+    # 3) Length vs analytic — gate on the motion window, not whole-bag time.
+    if target_len_v is not None and target_len_v > 0:
+        if motion_s is None:
+            reasons.append("no_motion")
+        else:
+            ratio = motion_s / target_len_v
+            if not (1.0 - length_tol <= ratio <= 1.0 + length_tol):
+                reasons.append(f"length_ratio_{ratio:.2f}")
 
     # 4) Continuity
     if bag.get(run_eval.TOPIC_ODOM) is None:
@@ -164,6 +220,7 @@ def qc_leg(leg, target_len_v, rtk_pct_min, length_tol, gap_tol,
     return {**row, "usable": usable, "reasons": ";".join(reasons),
             "rtk_fixed_pct": (round(pct, 1) if pct is not None else None),
             "duration_s": (round(duration, 2) if duration is not None else None),
+            "motion_s": (round(motion_s, 2) if motion_s is not None else None),
             "sidecar_pass": sidecar_pass, "verdict_mismatch": mismatch}
 
 
@@ -241,7 +298,7 @@ def main(argv=None):
     qc_csv = os.path.join(out_dir, "qc.csv")
     cols = ["run_id", "cell_id", "leg", "controller", "v_const", "radius_m",
             "path_family", "usable", "reasons", "rtk_fixed_pct", "duration_s",
-            "sidecar_pass", "verdict_mismatch", "bag_dir"]
+            "motion_s", "sidecar_pass", "verdict_mismatch", "bag_dir"]
     with open(qc_csv, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=cols, extrasaction="ignore")
         w.writeheader()

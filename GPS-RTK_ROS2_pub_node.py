@@ -248,36 +248,18 @@ class HelicalGpsNode(Node):
             self.get_logger().info(f"F9P NMEA: {line[:80]}")
         
 
-    def _status_timer_cb(self):
-        """Publish NavSatFix and human-readable RTK status string."""
+    def publish_fix(self):
+        """Publish one NavSatFix from the current GNSS state.
+
+        Called by the NMEA reader thread on every parsed GGA sentence, so the
+        fix topic runs at the receiver's epoch rate instead of being sampled
+        by the 1 Hz status timer (which silently threw away all but one
+        position per second — fatal for RTK-as-ground-truth on short runs).
+        rclpy publish is thread-safe.
+        """
         now = self.get_clock().now().to_msg()
         gs = self.gnss_status
-        rs = self.rtcm_status
-        t_now = time.time()
 
-        # RTCM status (forwarded-to-F9P time vs. network-received time)
-        if rs.last_rx_time > 0:
-            rtcm_age = t_now - rs.last_rx_time
-            rtcm_active = rtcm_age < RTCM_STALE_SECONDS
-        else:
-            rtcm_age = float("inf")
-            rtcm_active = False
-
-        if getattr(rs, "last_net_rx_time", 0.0) > 0:
-            rtcm_net_age = t_now - rs.last_net_rx_time
-        else:
-            rtcm_net_age = float("inf")
-
-        # GNSS frequency calculation
-        dt = t_now - self.last_status_time
-        if dt > 0:
-            hz = (gs.msg_count - self.last_msg_count) / dt
-        else:
-            hz = 0.0
-        self.last_msg_count = gs.msg_count
-        self.last_status_time = t_now
-
-        # NavSatFix
         fix_msg = NavSatFix()
         fix_msg.header.stamp = now
         fix_msg.header.frame_id = "f9p_helical"
@@ -306,6 +288,34 @@ class HelicalGpsNode(Node):
         fix_msg.position_covariance_type = NavSatFix.COVARIANCE_TYPE_UNKNOWN
 
         self.fix_pub.publish(fix_msg)
+
+    def _status_timer_cb(self):
+        """Publish the human-readable RTK status string (1 Hz)."""
+        gs = self.gnss_status
+        rs = self.rtcm_status
+        t_now = time.time()
+
+        # RTCM status (forwarded-to-F9P time vs. network-received time)
+        if rs.last_rx_time > 0:
+            rtcm_age = t_now - rs.last_rx_time
+            rtcm_active = rtcm_age < RTCM_STALE_SECONDS
+        else:
+            rtcm_age = float("inf")
+            rtcm_active = False
+
+        if getattr(rs, "last_net_rx_time", 0.0) > 0:
+            rtcm_net_age = t_now - rs.last_net_rx_time
+        else:
+            rtcm_net_age = float("inf")
+
+        # GNSS frequency calculation
+        dt = t_now - self.last_status_time
+        if dt > 0:
+            hz = (gs.msg_count - self.last_msg_count) / dt
+        else:
+            hz = 0.0
+        self.last_msg_count = gs.msg_count
+        self.last_status_time = t_now
 
         # Human-readable status
         lat_str = f"{gs.lat:.8f}" if gs.lat is not None else "N/A"
@@ -491,6 +501,13 @@ def nmea_reader(ser_mgr: SerialManager, gnss_status: GNSSStatus, node: HelicalGp
                     gnss_status.hdop = float(msg.horizontal_dil) if msg.horizontal_dil else None
                 except (ValueError, TypeError):
                     gnss_status.hdop = None
+
+                # Publish a fix per GGA epoch (receiver rate, not timer rate).
+                if node is not None:
+                    try:
+                        node.publish_fix()
+                    except Exception as e:
+                        node.get_logger().warn(f"Failed to publish fix: {e}")
 
         except Exception as e:
             # Catch-all to avoid killing the thread on unexpected errors

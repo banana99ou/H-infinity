@@ -78,6 +78,35 @@ TOPICS = [
     "/pixhawk/global_position/compass_hdg",    # std_msgs/Float64, raw FCU compass
 ]
 
+# Recorder QoS pins. `ros2 bag record` adapts its subscription QoS to whatever
+# publishers are alive at subscribe time; the web-UI teleop (rosbridge
+# advertises every publisher as TRANSIENT_LOCAL) is often the only
+# /cmd_vel_raw publisher at bag start (the follower respawns per leg), and a
+# TRANSIENT_LOCAL-requesting subscription can never match the follower's
+# VOLATILE publisher — the topic records empty (rooftop legs 2026-06-11).
+# Pinning the actuation chain to its canonical profile makes the recording
+# independent of graph state at record start.
+QOS_OVERRIDES = {
+    "/cmd_vel_raw": {"reliability": "reliable", "durability": "volatile",
+                     "history": "keep_last", "depth": 100},
+    "/cmd_vel": {"reliability": "reliable", "durability": "volatile",
+                 "history": "keep_last", "depth": 100},
+}
+
+QOS_OVERRIDES_PATH = "/tmp/data_logger_qos_overrides.yaml"
+
+
+def write_qos_overrides(path: str = QOS_OVERRIDES_PATH) -> str:
+    """Write the recorder QoS override YAML; returns the path."""
+    lines = []
+    for topic, qos in QOS_OVERRIDES.items():
+        lines.append(f"{topic}:")
+        for key, val in qos.items():
+            lines.append(f"  {key}: {val}")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+    return path
+
 
 def build_bag_name(scenario: str, duration_label: str) -> str:
     """
@@ -246,7 +275,9 @@ class BagRecorder:
             raise RuntimeError("BagRecorder.start() called twice")
 
         os.makedirs(os.path.dirname(self.bag_path) or ".", exist_ok=True)
-        cmd = [self._ros2_bin, "bag", "record", "-o", self.bag_path, *self.topics]
+        cmd = [self._ros2_bin, "bag", "record",
+               "--qos-profile-overrides-path", write_qos_overrides(),
+               "-o", self.bag_path, *self.topics]
 
         self._start_monotonic = time.monotonic()
         self._start_wallclock_utc = datetime.now(timezone.utc).isoformat()
@@ -457,6 +488,8 @@ def main(argv=None) -> int:
         "ros2",
         "bag",
         "record",
+        "--qos-profile-overrides-path",
+        write_qos_overrides(),
         "-o",
         bag_path,
         *TOPICS,

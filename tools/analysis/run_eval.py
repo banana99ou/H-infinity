@@ -185,7 +185,17 @@ def build_path_from_recipe(recipe, r_min_default=0.5):
 def _require_rosbags():
     try:
         from rosbags.highlevel import AnyReader  # noqa: F401
-        return AnyReader
+        try:
+            # rosbag2 Humble bags carry no embedded type definitions; newer
+            # rosbags releases refuse to open them without an explicit
+            # typestore.
+            import functools
+
+            from rosbags.typesys import Stores, get_typestore
+            return functools.partial(
+                AnyReader, default_typestore=get_typestore(Stores.ROS2_HUMBLE))
+        except ImportError:
+            return AnyReader
     except Exception as exc:
         raise SystemExit(
             "[run_eval] the 'rosbags' pip library is required to read rosbag2 "
@@ -239,6 +249,12 @@ def read_bag(bag_dir):
     want = set(out.keys())
 
     with AnyReader([bag]) as reader:
+        # Raw per-topic message counts for ALL recorded topics (not just the
+        # decoded set) so the QC gate can verify required-topic presence.
+        counts = {}
+        for c in reader.connections:
+            counts[c.topic] = counts.get(c.topic, 0) + (c.msgcount or 0)
+        out["_counts"] = counts
         conns = [c for c in reader.connections if c.topic in want]
         for conn, t_ns, raw in reader.messages(connections=conns):
             msg = reader.deserialize(raw, conn.msgtype)

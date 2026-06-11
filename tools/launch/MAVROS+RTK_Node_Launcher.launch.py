@@ -29,6 +29,10 @@ def generate_launch_description():
     compass (separate USB: CP2102 chassis vs ttyACM* Pixhawk/F9P)."""
     fcu_url = LaunchConfiguration("fcu_url")
     gps_rtk_script = _find_repo_file_upwards(Path(__file__).parent, "GPS-RTK_ROS2_pub_node.py")
+    # resolve() because the deployed NUC copy of the GPS script is a symlink
+    # into ~/H-infinity (the rsync'd repo); the session recorder lives there.
+    repo_root = gps_rtk_script.resolve().parent
+    gnss_session_script = repo_root / "tools" / "gnss" / "gnss_session_recorder.py"
 
     return LaunchDescription(
         [
@@ -60,6 +64,12 @@ def generate_launch_description():
                 output="screen",
                 respawn=True,
                 respawn_delay=2.0,
+            ),
+            # --- GNSS session bag (sensor-comparison dataset, one bag per
+            # session; lives and dies with this launch) ---
+            ExecuteProcess(
+                cmd=[sys.executable, str(gnss_session_script)],
+                output="screen",
             ),
         ]
     )

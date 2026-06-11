@@ -1762,6 +1762,21 @@ function onOdom(msg) {
   const y = msg.pose.pose.position.y;
   const q = msg.pose.pose.orientation;
   const yaw = Math.atan2(2*(q.w*q.z + q.x*q.y), 1 - 2*(q.y*q.y + q.z*q.z));
+  // Executor odom-reset detector (field 2026-06-11): odom_zero re-latches the
+  // origin before every scored curve, so /wheel/odom_zeroed collapses to
+  // (0,0,0) mid-batch. The belief projection anchor is manual state and went
+  // stale — the blue dot never snapped onto the RTK dot during autonomous
+  // runs even though the reset was real (verified in the bags). Re-anchor
+  // automatically: display-only, same as Belief->RTK minus the reset publish.
+  const prev = lastRobotOdom;
+  if (Math.hypot(prev.x, prev.y) > 0.5 && Math.hypot(x, y) < 0.05 && rtkFresh()) {
+    $('lat').value = lastRtkFix.lat.toFixed(8);
+    $('lon').value = lastRtkFix.lon.toFixed(8);
+    if (fusedHeadingFresh()) $('bearing').value = lastFusedHeading.deg.toFixed(1);
+    redraw();
+    const rs = $('reanchor-state');
+    if (rs) rs.innerHTML = '<span class="ok">auto re-anchored to RTK (executor odom reset detected)</span>';
+  }
   lastRobotOdom = { x, y, theta: yaw, t: lastOdomTime };
   drawRobot(x, y, yaw);
 }

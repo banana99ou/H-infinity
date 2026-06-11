@@ -231,6 +231,8 @@ class RunExecutor(Node):
         self._leg_idx = 0
         self._curve_idx = 0
         self._cur_curve = None
+        self._last_completed_leg_idx = None  # park position for stage transit
+        self._transit_curve = None           # one-shot synthetic repo curve
         self._cur_recipe = {}
         self._matrix_doc = {}    # raw experiment.yaml (planner input)
 
@@ -575,7 +577,11 @@ class RunExecutor(Node):
         # a stage-unaware consumer still sees a valid single-stage batch.
         self._stages = [
             {"name": str(st.get("name") or f"stage_{i + 1}"),
-             "legs": st.get("legs") or []}
+             "legs": st.get("legs") or [],
+             # Planner-emitted inter-stage transit glue (C, 2026-06-11): the
+             # curve from the PREVIOUS stage's exit pose into this stage's
+             # first start pin. Optional — absent means path-join fallback.
+             "entry_glue": st.get("entry_glue")}
             for i, st in enumerate(v.get("plan_stages") or [])
             if st.get("legs")]
         self._stage_idx = 0
@@ -741,12 +747,65 @@ class RunExecutor(Node):
         self._legs = self._stages[self._stage_idx]["legs"]
         return False
 
+    def _build_transit(self, old_legs, last_leg_idx, entry_glue):
+        """Concatenate the transit polyline for an unattended stage advance
+        (C, field design 2026-06-11): from the robot's park position (the end
+        of old_legs[last_leg_idx]'s experiment) FOLLOW THE OLD STAGE'S OWN
+        ALREADY-VALIDATED LOOP — each remaining leg's glue then its recipe
+        path, as plain unscored waypoints — to the stage exit pose (the last
+        leg's experiment end), then the planner's inter-stage entry glue to
+        the next stage's first start pin. Headings match at every junction by
+        construction, so the whole thing is ONE reposition goto.
+
+        Returns a synthetic reposition-curve dict, or None (caller falls back
+        to the plain path-join)."""
+        try:
+            wps = []
+            n = len(old_legs)
+            if last_leg_idx is None:
+                return None         # never completed a leg here (resume case)
+            corners = (self._venue or {}).get("corners_wgs84") or []
+            if not corners:
+                return None
+            lat0, lon0 = corners[0]["lat"], corners[0]["lon"]
+            for idx in range(last_leg_idx + 1, n):
+                for curve in old_legs[idx].get("curves") or []:
+                    kind = str(curve.get("kind", "")).lower()
+                    if kind == "reposition":
+                        wps += [{"lat": float(w["lat"]), "lon": float(w["lon"])}
+                                for w in curve.get("waypoints_wgs84") or []]
+                    elif kind == "recipe":
+                        pts = venue_geom.recipe_points_en(
+                            curve.get("recipe") or {}, curve.get("start_pose"),
+                            lat0, lon0, spacing_m=0.25)
+                        if not pts:
+                            return None   # unverifiable geometry — fall back
+                        for (e, nn, _s) in pts:
+                            la, lo = venue_geom.en_to_latlon(e, nn, lat0, lon0)
+                            wps.append({"lat": la, "lon": lo})
+            wps += [{"lat": float(w["lat"]), "lon": float(w["lon"])}
+                    for w in entry_glue.get("waypoints_wgs84") or []]
+            if len(wps) < 2:
+                return None
+            out = {"name": "stage_transit", "kind": "reposition",
+                   "waypoints_wgs84": wps,
+                   "v_const": float(entry_glue.get("v_const", 0.2)),
+                   "pos_tol_m": float(entry_glue.get("pos_tol_m", 0.15))}
+            if entry_glue.get("end_heading_deg") is not None:
+                out["end_heading_deg"] = float(entry_glue["end_heading_deg"])
+            return out
+        except (KeyError, TypeError, ValueError) as exc:
+            self.get_logger().warn(f"transit build failed ({exc!r}) — "
+                                   "falling back to plain path-join")
+            return None
+
     def _advance_stage(self):
         """After the current stage's geometries fill: move to the next stage
         with work, containment-gate it, and continue the batch unattended.
         Returns 'advanced' | 'paused' | 'none'."""
         if not self._stages:
             return "none"
+        old = self._stages[self._stage_idx]
         for i in range(self._stage_idx + 1, len(self._stages)):
             st = self._stages[i]
             self._legs = st["legs"]
@@ -760,6 +819,19 @@ class RunExecutor(Node):
                 self._pause(f"next stage '{st['name']}' violates containment "
                             "— re-plan, Send, then Start")
                 return "paused"
+            # Planned transit (C): only valid when advancing from exactly the
+            # stage the glue was planned FROM — a skipped stage (resume
+            # credit) leaves the robot somewhere the glue does not start.
+            self._transit_curve = None
+            eg = st.get("entry_glue")
+            if eg and eg.get("from_stage") == old["name"]:
+                self._transit_curve = self._build_transit(
+                    old["legs"], self._last_completed_leg_idx, eg)
+                if self._transit_curve is not None:
+                    self.get_logger().info(
+                        "stage transit planned: walk the old stage loop to "
+                        "its exit + inter-stage glue "
+                        f"({len(self._transit_curve['waypoints_wgs84'])} wps).")
             self._stage_idx = i
             self._leg_idx = 0
             self._curve_idx = 0
@@ -852,6 +924,11 @@ class RunExecutor(Node):
         self._done_notified = False
         self._leg_idx = 0
         self._curve_idx = 0
+        # Fresh Start: the robot may be parked anywhere (operator moved it,
+        # resume after pause) — a transit planned for a previous advance no
+        # longer starts where the robot stands. Path-join handles it instead.
+        self._transit_curve = None
+        self._last_completed_leg_idx = None
         if not self._select_stage_with_work():
             self._enter(Phase.DONE)
             return
@@ -888,6 +965,18 @@ class RunExecutor(Node):
             return
         self._cur_curve = curves[self._curve_idx]
         kind = str(self._cur_curve.get("kind", "")).lower()
+        # One-shot stage transit (C): the first reposition after an advance
+        # drives the planned old-loop + inter-stage glue polyline instead of
+        # the leg's own glue (the transit ENDS at that glue's endpoint — the
+        # first start pin). An abort pauses; on resume the transit is gone
+        # and the plain path-join takes over.
+        if kind == "reposition" and self._transit_curve is not None:
+            self._cur_curve = self._transit_curve
+            self._transit_curve = None
+            self.get_logger().info(
+                "stage transit: driving the old stage's loop to its exit + "
+                "inter-stage glue "
+                f"({len(self._cur_curve['waypoints_wgs84'])} wps, unscored).")
         if kind == "reposition":
             self._cur_treatment = None   # glue move — no scored treatment
             self._cur_scored = False
@@ -931,6 +1020,9 @@ class RunExecutor(Node):
         self.get_logger().info(
             f"leg '{lid}' done — sweep {self._runs_done()}/{self._runs_target()}.")
         self._publish_status(message=f"leg '{lid}' done")
+        # The robot is physically parked at THIS leg's experiment end — the
+        # anchor for a stage-advance transit (C, 2026-06-11).
+        self._last_completed_leg_idx = self._leg_idx
         # Cycle the authored legs ("fill gaps"); when no geometry in THIS
         # stage has a remaining treatment, auto-advance to the next planned
         # stage (the unattended multi-stage batch) or finish.

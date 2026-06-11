@@ -30,6 +30,13 @@ def latlon_to_en(lat, lon, lat0, lon0):
     return ((lon - lon0) * mlon, (lat - lat0) * mlat)
 
 
+def en_to_latlon(e, n, lat0, lon0):
+    """Inverse of latlon_to_en (same equirectangular small-area model)."""
+    mlat = 111320.0
+    mlon = 111320.0 * math.cos(math.radians(lat0))
+    return (lat0 + n / mlat, lon0 + e / mlon)
+
+
 def pt_in_poly(pt, poly):
     """Ray-cast point-in-polygon. poly is a list of (x, y)."""
     x, y = pt

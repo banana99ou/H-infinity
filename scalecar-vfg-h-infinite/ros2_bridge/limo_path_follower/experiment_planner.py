@@ -52,7 +52,19 @@ PLAN_DEFAULTS = {
              # HARD floor: the chassis cannot steer tighter than ~0.37 m, so a
              # drawn glue below this would not be tracked (pure pursuit clamps
              # and leaves the checked corridor). Reject, don't warn.
-             "hard_radius_m": 0.37},
+             "hard_radius_m": 0.37,
+             # TRACKABLE floor (B+ smoothness gate, field 2026-06-11): glue is
+             # driven by reposition's pure pursuit with a 0.6 m look-ahead — a
+             # legal-but-tight Dubins loop (R 0.45) breaks the steering cone
+             # mid-arc and aborts. Glue must be drivable WITH MARGIN, not
+             # merely chassis-possible.
+             "track_radius_m": 0.7,
+             # Straight-tail arrival condition: the final tail_check_m of every
+             # glue must lie within tail_align_deg of the start-pin heading —
+             # reposition converges heading through the tail, so this is what
+             # turns "arrived (position + heading)" into a planned property.
+             "tail_align_deg": 10.0,
+             "tail_check_m": 0.8},
 }
 
 
@@ -250,6 +262,51 @@ def _max_curvature(pts):
     return k
 
 
+def _ang_diff_deg(a, b):
+    return abs((a - b + 180.0) % 360.0 - 180.0)
+
+
+def check_glue_tracking(pts, start_b, g):
+    """B+ smoothness gate over one sampled glue polyline (endpoints included).
+
+    Treats the glue as the robot will drive it: (1) every point must be
+    reachable at the TRACKABLE radius floor (track_radius_m — pure pursuit
+    with margin, not the bare chassis limit), and (2) the final tail_check_m
+    must be straight along the start-pin heading (start_b, compass deg E-of-N)
+    within tail_align_deg, because reposition achieves arrival heading by
+    tracking that tail. Exp curves are exempt (driven by the follower, the
+    tight radii ARE the experiment); junction continuity to them holds because
+    both generators start the glue along the previous curve's exit heading.
+
+    Returns (ok, reason). Exposed for tests and for ad-hoc plan audits.
+    """
+    track_r = max(float(g.get("track_radius_m", 0.7)),
+                  float(g.get("hard_radius_m", 0.37)))
+    kmax = _max_curvature(pts)
+    if kmax > 1.0 / track_r + 1e-6:
+        return False, (f"min turn radius {1.0 / max(kmax, 1e-9):.2f}m is "
+                       f"tighter than the trackable floor {track_r:.2f}m")
+    tail_deg = float(g.get("tail_align_deg", 10.0))
+    tail_m = float(g.get("tail_check_m", 0.8))
+    acc = 0.0
+    for a, b in zip(reversed(pts[:-1]), reversed(pts[1:])):
+        de, dn = b[0] - a[0], b[1] - a[1]
+        seg = math.hypot(de, dn)
+        if seg < 1e-9:
+            continue
+        brg = math.degrees(math.atan2(de, dn)) % 360.0
+        off = _ang_diff_deg(brg, start_b)
+        if off > tail_deg:
+            return False, (f"approach tail bends {off:.0f} deg off the "
+                           f"start heading {acc:.1f}m before arrival "
+                           f"(needs <= {tail_deg:.0f} deg for the last "
+                           f"{tail_m:.1f}m)")
+        acc += seg
+        if acc >= tail_m:
+            break
+    return True, None
+
+
 def _dubins_paths(a_pose, b_pose, R):
     """All valid Dubins words from pose A to pose B at turn radius R.
 
@@ -366,7 +423,9 @@ def _plan_glue(end, exit_b, start, start_b, poly, excl, req, cfg):
     {"kind": "mids"|"waypoints", "pts": [(E, N), ...]} — mids exclude the
     snapped endpoints (WebUI lbRepos schema); waypoints include them."""
     g = cfg["glue"]
-    hard_k = 1.0 / float(g["hard_radius_m"])
+    track_r = max(float(g.get("track_radius_m", 0.7)),
+                  float(g["hard_radius_m"]))
+    track_k = 1.0 / track_r            # B+ gate: trackable, not just possible
     soft_k = 1.0 / float(g["min_radius_m"])
     chord_mid = ((end[0] + start[0]) / 2.0, (end[1] + start[1]) / 2.0)
     dx, dy = start[0] - end[0], start[1] - end[1]
@@ -421,8 +480,11 @@ def _plan_glue(end, exit_b, start, start_b, poly, excl, req, cfg):
                 if mn < req:
                     continue
                 kmax = _max_curvature(pts)
-                if kmax > hard_k:
-                    continue        # not trackable by the chassis — reject
+                if kmax > track_k:
+                    continue        # not trackable with margin — reject (B+)
+                ok_track, _why = check_glue_tracking(pts, start_b, g)
+                if not ok_track:
+                    continue        # bent tail / gate failure — reject (B+)
                 spread = sum(math.hypot(d[0] - chord_mid[0],
                                         d[1] - chord_mid[1]) for d in dodges)
                 penalty = 0.3 * spread \
@@ -441,24 +503,33 @@ def _plan_glue(end, exit_b, start, start_b, poly, excl, req, cfg):
     # Target a pose one straight tail-length BEFORE the start pin so the
     # tracker arrives on a straight, heading-aligned segment (reposition
     # achieves heading by geometry).
-    tail = 1.0
+    tail = max(1.0, float(g.get("tail_check_m", 0.8)) + 0.2)
     a_yaw = math.radians(90.0 - exit_b)
     b_yaw = math.radians(90.0 - start_b)
     bx = start[0] - sx * tail
     by = start[1] - sy * tail
-    for R in (1.2, 1.0, 0.8, 0.6, 0.45):
+    # B+ gate: never sweep below the TRACKABLE radius — a chassis-legal 0.45 m
+    # Dubins loop breaks reposition's pure-pursuit cone mid-arc (field
+    # 2026-06-11: "do a 180 at the E1 start").
+    radii = sorted({r for r in (1.2, 1.0, 0.8, track_r) if r >= track_r},
+                   reverse=True)
+    for R in radii:
         for (_length, pts) in _dubins_paths((end[0], end[1], a_yaw),
                                             (bx, by, b_yaw), R)[:3]:
             full = pts + [(bx + sx * tail * i / 4.0,
                            by + sy * tail * i / 4.0) for i in range(1, 5)]
-            if min(_clear(p, poly, excl) for p in full) >= req:
-                note = (f"glue is a Dubins path (R={R:.2f}m, "
-                        f"{_length + tail:.1f}m) — regenerate the plan "
-                        "rather than hand-editing it")
-                return {"kind": "waypoints", "pts": full}, note
+            if min(_clear(p, poly, excl) for p in full) < req:
+                continue
+            ok_track, _why = check_glue_tracking(full, start_b, g)
+            if not ok_track:
+                continue
+            note = (f"glue is a Dubins path (R={R:.2f}m, "
+                    f"{_length + tail:.1f}m) — regenerate the plan "
+                    "rather than hand-editing it")
+            return {"kind": "waypoints", "pts": full}, note
     return None, (f"no trackable glue ({tried} Bezier variants + Dubins "
-                  f"R 1.2..0.45 all violate clearance of {req:.2f}m or the "
-                  f"{g['hard_radius_m']:.2f}m chassis radius)")
+                  f"R {radii[0]:.1f}..{radii[-1]:.2f} all violate clearance "
+                  f"of {req:.2f}m or the {track_r:.2f}m trackable radius)")
 
 
 # ----------------------------------------------------------------------
@@ -579,6 +650,7 @@ def plan_stages(venue, doc, counts, footprint_r=0.30, track_margin=0.30,
                 "notes": ["matrix complete — no remaining (family, R) cells"]}
 
     spacing = 0.25      # search-time sampling; final check is the loader's 0.10
+    stage_geo = []      # per assembled stage: exit/entry poses (EN) for transit
     queue = list(remaining)
     max_per = int(cfg["max_geometries_per_stage"])
     cap = max_per       # shrinks on a glue failure, resets per finished stage
@@ -719,12 +791,50 @@ def plan_stages(venue, doc, counts, footprint_r=0.30, track_margin=0.30,
             } for p in placed],
             "glues": glues,
         })
+        stage_geo.append({"exit_en": placed[-1]["end_en"],
+                          "exit_b": placed[-1]["exit_b"],
+                          "entry_en": placed[0]["start_en"],
+                          "entry_b": placed[0]["h"]})
         queue = deferred
         cap = max_per
     if guard >= 32 and queue:
         for (fam, R, rem) in queue:
             unfittable.append({"family": fam, "R": R,
                                "reason": "planner retry budget exhausted"})
+
+    # One inter-stage transit glue per boundary (C, field design 2026-06-11):
+    # the robot finishes stage i at SOME exp end (not statically known), walks
+    # the stage's own already-validated loop to the stage EXIT pose (the last
+    # experiment's end), then drives this glue to stage i+1's first start pin.
+    # Emitted as explicit waypoints (planner-sampled, not hand-editable) on
+    # the DESTINATION stage. Failure degrades to the executor's path-join
+    # fallback — noted, never fatal.
+    for i in range(len(stages) - 1):
+        a, b = stage_geo[i], stage_geo[i + 1]
+        glue_en, note = _plan_glue(a["exit_en"], a["exit_b"],
+                                   b["entry_en"], b["entry_b"],
+                                   poly, excl, req, cfg)
+        pair = f"{stages[i]['name']} -> {stages[i + 1]['name']}"
+        if glue_en is None:
+            notes.append(f"no inter-stage glue {pair} ({note}); the executor "
+                         "falls back to a reposition path-join at the advance")
+            continue
+        if note:
+            notes.append(f"inter-stage glue {pair}: {note}")
+        if glue_en["kind"] == "mids":
+            pts_en = _bezier_samples([a["exit_en"]] + list(glue_en["pts"])
+                                     + [b["entry_en"]])
+        else:
+            pts_en = list(glue_en["pts"])
+        stages[i + 1]["entry_glue"] = {
+            "from_stage": stages[i]["name"],
+            "waypoints_wgs84": [
+                dict(zip(("lat", "lon"), _en_to_latlon(e, n, lat0, lon0)))
+                for (e, n) in pts_en],
+            "v_const": float(cfg["glue"]["v_const"]),
+            "pos_tol_m": float(cfg["glue"]["pos_tol_m"]),
+            "end_heading_deg": round(b["entry_b"], 1),
+        }
 
     return {"ok": bool(stages) and not unfittable,
             "req_clearance_m": req,

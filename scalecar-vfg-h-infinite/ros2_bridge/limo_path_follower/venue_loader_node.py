@@ -246,6 +246,22 @@ class VenueLoaderNode(Node):
                 label=f"stage {st.get('name', si + 1)}: ")
             if not ok:
                 return False, why
+            # Inter-stage transit glue (C, 2026-06-11): driven unattended at
+            # a stage advance — must clear the venue like any reposition
+            # curve. Checked as a pseudo-leg through the same gate.
+            eg = st.get("entry_glue")
+            if eg is not None:
+                wps = eg.get("waypoints_wgs84") or []
+                if len(wps) < 2:
+                    return False, (f"stage {st.get('name', si + 1)}: "
+                                   "entry_glue has < 2 waypoints")
+                ok, why = self._validate_legs(
+                    [{"id": f"{st.get('name', si + 1)}_entry",
+                      "curves": [{"kind": "reposition", "name": "entry_glue",
+                                  "waypoints_wgs84": wps}]}], v,
+                    label=f"stage {st.get('name', si + 1)} entry glue: ")
+                if not ok:
+                    return False, why
         return True, "ok"
 
     # ------------------------------------------------------------------

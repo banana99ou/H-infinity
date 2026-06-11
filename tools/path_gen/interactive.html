@@ -3692,6 +3692,14 @@ function lbRedrawAll() {
       lbAdd(mm);
     });
   }
+  // Inter-stage transit glue INTO the current stage (planner waypoints, not
+  // editable — dashed violet so it reads as "arrival route", not a leg).
+  const stEg = (lbStages && lbStages[lbStageIdx]) ? lbStages[lbStageIdx].entry_glue : null;
+  if (stEg && (stEg.waypoints_wgs84 || []).length >= 2) {
+    lbAdd(L.polyline(stEg.waypoints_wgs84.map(w => [w.lat, w.lon]),
+      { color: '#c6f', weight: 3, dashArray: '8 6', opacity: 0.9 }).addTo(map)
+      .bindTooltip(`entry from ${stEg.from_stage} (inter-stage transit)`));
+  }
   lbUpdateReadouts();
   lbRenderLegs();
   lbPersist();   // every mutation path ends here — keep the restore snapshot current
@@ -3871,6 +3879,9 @@ function lbApplyPlan(d) {
     repos: (st.glues || []).map(g => ({
       mids: g.mids || [], waypoints: g.waypoints || null,
       v_const: g.v_const, pos_tol_m: g.pos_tol_m })),
+    // Inter-stage transit glue (planner-sampled waypoints, not editable):
+    // carried verbatim into the Send payload; drawn dashed on the map.
+    entry_glue: st.entry_glue || null,
   }));
   lbPlanMeta = { unfittable: d.unfittable || [], notes: d.notes || [] };
   $('lb-plan-apply').style.display = 'none';
@@ -3930,8 +3941,11 @@ function lbBuildPayload() {
   v.schema_version = 2;
   v.anchor = { lat0: a.lat0, lon0: a.lon0, bearing_deg: a.bearing };
   if (lbStages && lbStages.length) {
-    v.plan_stages = lbStages.map(st => ({
-      name: st.name, legs: lbBuiltLegsForStage(st) }));
+    v.plan_stages = lbStages.map(st => {
+      const out = { name: st.name, legs: lbBuiltLegsForStage(st) };
+      if (st.entry_glue) out.entry_glue = st.entry_glue;
+      return out;
+    });
     v.legs = v.plan_stages[0].legs;   // stage-unaware consumers see stage 1
   } else {
     v.legs = lbBuiltLegs();

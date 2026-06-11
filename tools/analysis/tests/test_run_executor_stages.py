@@ -33,7 +33,7 @@ _METHODS = {
     "_select_stage_with_work", "_advance_stage", "_all_geometries_done",
     "_all_leg_lists", "_stage_name", "_next_treatment_for", "_geometry_of",
     "_recipe_curve", "_cell_key_for", "_scored_geometries", "_runs_done",
-    "_runs_target",
+    "_runs_target", "_build_transit",
 }
 
 
@@ -102,6 +102,8 @@ class Exec:
         self._track_margin = 0.30
         self._leg_idx = 0
         self._curve_idx = 0
+        self._transit_curve = None
+        self._last_completed_leg_idx = None
         self.paused = None
         self.status_msgs = []
 
@@ -202,6 +204,90 @@ def test_global_progress_spans_stages():
     # 3 geometries x 2 controllers x 1 speed x N=2 = 12; done = 2.
     assert ex._runs_target() == 12
     assert ex._runs_done() == 2
+
+
+# ---------------------------------------------------------------------------
+# Inter-stage transit (C, 2026-06-11)
+# ---------------------------------------------------------------------------
+
+def _repo_curve(name, pts):
+    return {"name": name, "kind": "reposition",
+            "waypoints_wgs84": [_ll(e, n) for (e, n) in pts]}
+
+
+def _leg_with_repo(fam, R, repo_pts, e=15, n=15):
+    lg = _leg(fam, R, e, n)
+    lg["curves"].insert(0, _repo_curve(f"repo_{fam}_{R}", repo_pts))
+    return lg
+
+
+def _entry_glue(from_stage, pts, end_heading=90.0):
+    return {"from_stage": from_stage,
+            "waypoints_wgs84": [_ll(e, n) for (e, n) in pts],
+            "v_const": 0.2, "pos_tol_m": 0.15,
+            "end_heading_deg": end_heading}
+
+
+def _stage1_filled_counts():
+    counts = {}
+    for c in ("lpv-hinf", "pid"):
+        counts[_key("step", 1.0, c)] = 2
+        counts[_key("step", 0.7, c)] = 2
+    return counts
+
+
+def _transit_stages():
+    s1 = {"name": "stage_1", "legs": [
+        _leg_with_repo("step", 1.0, [(10, 10), (12, 12)], e=14, n=14),
+        _leg_with_repo("step", 0.7, [(16, 16), (18, 18)], e=18, n=14)]}
+    s2 = {"name": "stage_2", "legs": [_leg("slalom", 0.5)],
+          "entry_glue": _entry_glue("stage_1", [(20, 14), (22, 15), (24, 15)])}
+    return [s1, s2]
+
+
+def test_transit_built_on_advance_walks_loop_then_entry_glue():
+    """Parked at leg 1's exp end: the transit must traverse leg 2 (its glue +
+    its recipe path, unscored) to the stage exit, then the entry glue."""
+    ex = Exec(_transit_stages(), _stage1_filled_counts())
+    ex._last_completed_leg_idx = 0
+    assert ex._advance_stage() == "advanced"
+    t = ex._transit_curve
+    assert t is not None, "expected a planned transit"
+    wps = t["waypoints_wgs84"]
+    # starts at leg 2's repo curve start, ends at the entry glue's end
+    assert abs(wps[0]["lat"] - _ll(16, 16)["lat"]) < 1e-9
+    assert abs(wps[-1]["lat"] - _ll(24, 15)["lat"]) < 1e-9
+    # contains the recipe path (sampled, > the 5 repo+glue waypoints)
+    assert len(wps) > 5, f"recipe path missing from transit ({len(wps)} wps)"
+    assert t["kind"] == "reposition" and t["name"] == "stage_transit"
+    assert t["end_heading_deg"] == 90.0
+
+
+def test_transit_entry_glue_only_when_parked_at_exit():
+    ex = Exec(_transit_stages(), _stage1_filled_counts())
+    ex._last_completed_leg_idx = 1          # parked at the LAST leg's end
+    assert ex._advance_stage() == "advanced"
+    t = ex._transit_curve
+    assert t is not None
+    assert len(t["waypoints_wgs84"]) == 3   # exactly the entry glue
+
+
+def test_transit_skipped_on_from_stage_mismatch():
+    """Entry glue planned from a SKIPPED stage must not be driven: the robot
+    is not parked where it starts."""
+    stages = _transit_stages()
+    stages[1]["entry_glue"]["from_stage"] = "stage_0"
+    ex = Exec(stages, _stage1_filled_counts())
+    ex._last_completed_leg_idx = 1
+    assert ex._advance_stage() == "advanced"
+    assert ex._transit_curve is None
+
+
+def test_transit_none_without_a_completed_leg():
+    ex = Exec(_transit_stages(), _stage1_filled_counts())
+    ex._last_completed_leg_idx = None       # resume case: park unknown
+    assert ex._advance_stage() == "advanced"
+    assert ex._transit_curve is None
 
 
 if __name__ == "__main__":

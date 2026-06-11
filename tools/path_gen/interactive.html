@@ -1655,6 +1655,13 @@ const STACK_LABELS = {
   sequencer:    'experiment_sequencer_node',
   ops:          'ops_node',
   bag:          'bag_node (manual rec)',
+  // Leg-batch backends + safety layer: the Send/Start buttons and the pre-run
+  // safety check are blind without these rows (field 2026-06-10: venue_loader
+  // and run_executor were dead and Send/Start silently went nowhere).
+  venue_loader:  'venue_loader_node (Send backend)',
+  run_executor:  'run_executor_node (Start backend)',
+  geofence:      'geofence_watchdog (safety)',
+  odom_watchdog: 'odom_watchdog (base-serial recovery)',
 };
 function onOrchStatus(msg) {
   let state;

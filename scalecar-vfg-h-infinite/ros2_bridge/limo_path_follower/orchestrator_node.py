@@ -96,6 +96,10 @@ PROCS = {
         'ros2', 'run', 'limo_path_follower', 'heading_node',
         '--ros-args', '-p',
         'venue_file:=/home/agilex/H-infinity/scenarios/venues/active.json',
+        # Pixhawk is mounted ~90 deg rotated: the raw-mag EKF source needs its
+        # own frame offset (the compass_offset cal does NOT apply to it).
+        # Measured against the COG-calibrated compass on 2026-06-11: -91.8 deg.
+        '-p', 'mag_frame_offset_rad:=-1.602',
     ],
     # T4 (R1-R4, P3): RTK go-to-pose between recorded runs. Publishes cmd_vel_raw
     # only while repositioning. MUST NOT run concurrently with 'follower' (C6) —

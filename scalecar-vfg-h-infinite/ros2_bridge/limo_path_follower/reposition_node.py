@@ -248,6 +248,21 @@ def point_seg_dist(p, a, b):
     return math.hypot(px - (ax + t * dx), py - (ay + t * dy))
 
 
+def point_seg_nearest(p, a, b):
+    """Nearest point to p on the segment a->b."""
+    ax, ay = a
+    bx, by = b
+    px, py = p
+    dx = bx - ax
+    dy = by - ay
+    L2 = dx * dx + dy * dy
+    if L2 < 1e-12:
+        return (ax, ay)
+    t = ((px - ax) * dx + (py - ay) * dy) / L2
+    t = max(0.0, min(1.0, t))
+    return (ax + t * dx, ay + t * dy)
+
+
 def polyline_dist(p, pts):
     """Cross-track distance from p to the nearest point on the polyline pts."""
     if len(pts) == 1:
@@ -862,6 +877,18 @@ class RepositionNode(Node):
         bearing = math.atan2(ty - self._fix_xy[1], tx - self._fix_xy[0])
         alpha = _wrap(bearing - self._heading_est)
 
+        # Forward-cone guard while driving: pure pursuit is singular at
+        # |alpha| -> 180 deg (kappa = 2 sin(a)/L -> 0): a target behind the
+        # nose commands STRAIGHT and the robot wanders off blind (field
+        # failure 2026-06-11). Forward-only cannot recover from outside the
+        # same cone the join logic enforces: stop and surface it.
+        if abs(alpha) > self._infeasible:
+            self._abort(f'look-ahead target {math.degrees(alpha):.0f} deg off '
+                        'the nose while tracking (forward-only cannot reach '
+                        'it) — overshot the path end or joined a backward '
+                        'segment')
+            return
+
         # Curvature to the look-ahead point, clamped to the physical R_min.
         kappa_raw = 2.0 * math.sin(alpha) / self._lookahead
         kappa = max(-self._kappa_max, min(self._kappa_max, kappa_raw))
@@ -947,6 +974,14 @@ class RepositionNode(Node):
         if n == 1:
             return wps[0]
         last = n - 1
+        rx, ry = self._fix_xy
+        # Endgame first: within a look-ahead of the final point, aim straight
+        # at it. This must PRECEDE the crossing loop — near the end the far
+        # crossing leaves the path and the loop degenerates to the crossing
+        # BEHIND the robot, which only ever "worked" via the alpha~180
+        # steering singularity the forward-cone guard now forbids.
+        if math.hypot(wps[last][0] - rx, wps[last][1] - ry) <= self._lookahead:
+            return wps[last]
         for i in range(self._seg_i, last):
             t = seg_circle_far_t(self._fix_xy, self._lookahead, wps[i], wps[i + 1])
             if t is not None:
@@ -954,7 +989,21 @@ class RepositionNode(Node):
                 ax, ay = wps[i]
                 bx, by = wps[i + 1]
                 return (ax + (bx - ax) * t, ay + (by - ay) * t)
-        return wps[last]
+        # No crossing and not near the end: the robot is off-path. Re-acquire
+        # by aiming at the NEAREST remaining path point — the old fallback
+        # aimed at the curve END, so a robot 1.2 m off-path beelined past the
+        # whole authored curve (field failure 2026-06-11). Normal pursuit
+        # resumes as soon as the look-ahead circle crosses the path again.
+        best = None                      # (dist, seg index, nearest point)
+        for i in range(self._seg_i, last):
+            px, py = point_seg_nearest((rx, ry), wps[i], wps[i + 1])
+            d = math.hypot(px - rx, py - ry)
+            if best is None or d < best[0]:
+                best = (d, i, (px, py))
+        if best is None:
+            return wps[last]
+        self._seg_i = best[1]            # still monotone: loop starts at _seg_i
+        return best[2]
 
     # ------------------------------------------------------------------
     # Actuation

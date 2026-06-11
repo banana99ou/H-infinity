@@ -101,6 +101,8 @@ class Robot:
         self._speed = 0.2
         self._min_speed = 0.05
         self._slowdown = 0.5
+        self._pos_tol_slack = 0.15
+        self._min_dfinal = None
         self._reason = ''
         self.drives = []                 # (v, omega) actually commanded
         self.aborted = None              # abort reason, if any
@@ -246,6 +248,38 @@ def test_front_target_still_drives():
     assert len(r.drives) == 1
     v, _w = r.drives[0]
     assert v > 0.0
+
+
+def test_near_miss_arrives_undershoot_policy():
+    """2026-06-11 field regression: passed 0.2 m beside the endpoint (tol
+    0.15) — within tol+slack the closest pass must count as ARRIVAL with the
+    true error reported, not pause the batch."""
+    pts = [(0.0, 0.0), (2.0, 0.0)]
+    r = Robot(pts, (2.1, 0.18), 0.0)     # just past, 0.21 m off the end
+    r.control()
+    assert r._state == 'arrived', f'expected arrival, got abort: {r.aborted}'
+    assert 'closest pass' in r._reason
+    assert not r.drives
+
+
+def test_wide_miss_still_aborts():
+    """Beyond tol+slack the pass-by is a genuine failure: abort, never accept."""
+    pts = [(0.0, 0.0), (2.0, 0.0)]
+    r = Robot(pts, (2.2, 0.35), 0.0)     # 0.40 m off the end (> 0.15+0.15)
+    r.control()
+    assert r.aborted is not None, 'accepted a 0.40 m miss'
+    assert r._state == 'aborted'
+
+
+def test_slack_only_applies_in_endgame():
+    """A backward target far from the end must still abort even when some
+    earlier closest approach was small (mid-path cone break is not a miss)."""
+    pts = [(0.0, 0.0), (1.0, 0.0)]
+    r = Robot(pts, (2.5, 0.0), 0.0)      # 1.5 m past the end, facing away
+    r._min_dfinal = 0.05                  # pretend it once skimmed the end
+    r.control()
+    assert r.aborted is not None
+    assert r._state == 'aborted'
 
 
 def test_arrival_still_wins_over_guard():

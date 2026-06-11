@@ -322,6 +322,12 @@ class RepositionNode(Node):
         # pos_tol_m (or pos_tol_m param); on FLOAT it is widened to at least the
         # float floor so we never chase precision FLOAT can't deliver.
         self.declare_parameter('pos_tol_m', 0.15)            # FIXED arrival radius
+        # Closest-pass acceptance slack ("undershoot" policy, field
+        # 2026-06-11): an Ackermann robot (R_min) cannot capture a point a
+        # few cm outside its turn envelope — when it passes BESIDE the final
+        # point, the closest approach within pos_tol + this slack counts as
+        # arrival (true miss distance is reported); beyond it, abort.
+        self.declare_parameter('pos_tol_slack_m', 0.15)
         self.declare_parameter('pos_tol_float_m', 0.40)      # FLOAT arrival floor
         self.declare_parameter('heading_tol_deg', 5.0)       # FIXED heading band
         self.declare_parameter('heading_tol_float_deg', 10.0)  # FLOAT heading band
@@ -359,6 +365,7 @@ class RepositionNode(Node):
 
         g = self.get_parameter
         self._pos_tol_default = float(g('pos_tol_m').value)
+        self._pos_tol_slack = float(g('pos_tol_slack_m').value)
         self._pos_tol_float = float(g('pos_tol_float_m').value)
         self._head_tol_fixed = math.radians(float(g('heading_tol_deg').value))
         self._head_tol_float = math.radians(float(g('heading_tol_float_deg').value))
@@ -418,6 +425,7 @@ class RepositionNode(Node):
         self._pos_tol = self._pos_tol_default  # FIXED arrival radius for this mission
         self._acquired = False       # has the robot reached the path corridor yet
         self._feasible_checked = False  # one-shot forward-drivable check done
+        self._min_dfinal = None      # closest approach to the final point (mission)
         self._goto_start_dist = None    # distance to final at commit (info/logging)
         # Goto latched because it arrived before the first usable RTK fix
         # (spawn race); replanned from _fix_cb once a fix lands.
@@ -703,6 +711,7 @@ class RepositionNode(Node):
         self._acquired = False
         self._feasible_checked = False
         self._goto_start_dist = d_final
+        self._min_dfinal = None      # closest approach to the final point
         self._state = 'driving'
         self._reason = ''
         _eh = ('position-only' if end_yaw is None
@@ -811,6 +820,8 @@ class RepositionNode(Node):
 
         last = self._waypoints[-1]
         d_final = math.hypot(self._fix_xy[0] - last[0], self._fix_xy[1] - last[1])
+        if self._min_dfinal is None or d_final < self._min_dfinal:
+            self._min_dfinal = d_final
         pos_tol, head_tol = self._active_tol()
         head_err = (None if self._heading_est is None or self._end_yaw is None
                     else _wrap(self._heading_est - self._end_yaw))
@@ -883,6 +894,29 @@ class RepositionNode(Node):
         # failure 2026-06-11). Forward-only cannot recover from outside the
         # same cone the join logic enforces: stop and surface it.
         if abs(alpha) > self._infeasible:
+            # Endgame near-miss = the "undershoot" policy (field 2026-06-11):
+            # the cone breaking within a look-ahead of the END means the robot
+            # just passed BESIDE the final point. An Ackermann robot (R_min)
+            # physically cannot capture a point a few cm outside its turn
+            # envelope, and re-chasing it circles forever (a 0.16 m pass vs
+            # 0.15 m tol paused the batch). Accept the closest pass within
+            # pos_tol + slack as arrival; report the TRUE miss distance.
+            closest = d_final if self._min_dfinal is None else self._min_dfinal
+            if (d_final <= self._lookahead
+                    and closest <= pos_tol + self._pos_tol_slack):
+                self._state = 'arrived'
+                self._zero_cmd()
+                self._reason = (
+                    f'arrived (closest pass {closest:.2f} m; within tol '
+                    f'{pos_tol:.2f} + slack {self._pos_tol_slack:.2f} — '
+                    'undershoot policy, R_min cannot capture tighter)')
+                self.get_logger().info(
+                    f'arrived: err {d_final:.3f} m. {self._reason}')
+                self._publish_status(
+                    err_m=d_final,
+                    err_deg=(float('nan') if head_err is None
+                             else math.degrees(head_err)))
+                return
             self._abort(f'look-ahead target {math.degrees(alpha):.0f} deg off '
                         'the nose while tracking (forward-only cannot reach '
                         'it) — overshot the path end or joined a backward '

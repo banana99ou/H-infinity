@@ -1,0 +1,51 @@
+# PHASE-3 SHAKEDOWN — force an unattended STAGE ADVANCE quickly (NOT the campaign).
+#
+# Two geometries with max_geometries_per_stage: 1 => the planner MUST produce
+# two one-curve stages; one controller x one speed x N=1 => exactly one scored
+# run per stage, so the never-yet-driven stage transition fires within minutes.
+# WATCH THE TRANSITION IN PERSON: robot parks at stage 1's curve end, the
+# executor containment-gates stage 2, and reposition forward-joins stage 2's
+# glue. Failure pauses + pages Discord (safe), but eyes on it the first time.
+#
+# Use a FRESH venue name in the WebUI (e.g. 'rooftop_shakedown_adv') — if you
+# reuse phase 2's name, its passed step-R0.7 cells are already credited and
+# that stage is skipped (no advance to observe).
+#
+# Field swap (NUC):   cp scenarios/experiment_shakedown_stageadv.yaml scenarios/experiment.yaml
+# Restore afterwards: tools/sync/sync.sh push   (laptop is canonical)
+
+run_id: rooftop_shakedown_adv
+
+venue: scenarios/venues/rooftop.json
+
+matrix:
+  radius_m: [0.7, 0.5]
+  controller: [lpv-hinf]
+  v_const: [0.5]
+  path_family: [step]
+
+repetitions: 1
+
+plan:
+  max_geometries_per_stage: 1   # the whole point: force >= 2 stages
+
+gating:
+  battery_volts_warn: 10.8
+  battery_volts_halt: 10.5
+  rtk_run_window_pct: 95
+
+retry:
+  max_retries: 2
+  circuit_breaker_k: 3
+
+ntfy:
+  server: https://ntfy.sh
+  topic: ""
+
+artifact_sync:
+  enabled: true
+  granularity: per-run
+  bwlimit_kbps: 4000
+  mac_target: "hyeon-yongjeong@macbook-air-2:/Users/hyeon-yongjeong/code/H-infinity/Experiment Data/"
+  nas_target: "me@nanasrv:/mnt/raid0/main/code/H-infinity/Experiment Data/"
+  local_repo: "/home/agilex/H-infinity/Experiment Data"

@@ -1,0 +1,48 @@
+# PHASE-2 SHAKEDOWN — smallest possible auto-plan validation (NOT the campaign).
+#
+# One geometry (step R0.7), both controllers, one speed, N=1 => 2 scored runs,
+# then a second Start must go straight to DONE (manifest resume credit).
+# Use with a THROWAWAY venue name in the WebUI (e.g. 'rooftop_shakedown') so
+# these runs never credit the real dataset (resume keys on venue name).
+#
+# Field swap (NUC):   cp scenarios/experiment_shakedown.yaml scenarios/experiment.yaml
+# Restore afterwards: tools/sync/sync.sh push   (laptop is canonical)
+
+run_id: rooftop_shakedown
+
+venue: scenarios/venues/rooftop.json
+
+matrix:
+  radius_m: [0.7]
+  controller: [lpv-hinf, pid]
+  v_const: [0.5]
+  path_family: [step]
+
+repetitions: 1
+
+# Auto-planner shape/glue knobs (experiment_planner.PLAN_DEFAULTS otherwise).
+plan:
+  max_geometries_per_stage: 3
+
+# Gating/retry identical to the campaign yaml — the shakedown must exercise
+# the same gates it will run under.
+gating:
+  battery_volts_warn: 10.8
+  battery_volts_halt: 10.5
+  rtk_run_window_pct: 95
+
+retry:
+  max_retries: 2
+  circuit_breaker_k: 3
+
+ntfy:
+  server: https://ntfy.sh
+  topic: ""
+
+artifact_sync:
+  enabled: true
+  granularity: per-run
+  bwlimit_kbps: 4000
+  mac_target: "hyeon-yongjeong@macbook-air-2:/Users/hyeon-yongjeong/code/H-infinity/Experiment Data/"
+  nas_target: "me@nanasrv:/mnt/raid0/main/code/H-infinity/Experiment Data/"
+  local_repo: "/home/agilex/H-infinity/Experiment Data"

@@ -66,6 +66,7 @@ from rclpy.qos import (
 )
 from std_msgs.msg import String, Bool
 from nav_msgs.msg import Odometry
+from sensor_msgs.msg import NavSatFix
 
 # Recorder (T7) lives at the repo root, outside the colcon package. Import
 # defensively (a path slip degrades to "cannot record" -> the scored leg pauses
@@ -283,6 +284,13 @@ class RunExecutor(Node):
         self._repo_status = {}
         self._odom_zero_status = None
         self._last_odom_t = None
+        # Achieved-anchor inputs: fused heading health (heading_node JSON) and
+        # last RTK fix, each with a monotonic receive time for staleness checks.
+        self._heading_status = None
+        self._heading_status_t = None
+        self._last_fix = None           # (lat, lon)
+        self._last_fix_t = None
+        self._achieved_anchor = None    # snapshot taken at odom-zero confirm
 
         # -- ROS interfaces --------------------------------------------
         latched = QoSProfile(
@@ -313,6 +321,10 @@ class RunExecutor(Node):
         self.create_subscription(Odometry, "/wheel/odom", self._on_odom, 10)
         self.create_subscription(
             String, "/odom_zero/status", self._on_odom_zero_status, latched)
+        self.create_subscription(
+            String, "/heading/fused_status", self._on_heading_status, latched)
+        self.create_subscription(
+            NavSatFix, "/gps_rtk_f9p_helical/gps/fix", self._on_fix, 10)
         try:
             from limo_msgs.msg import LimoStatus  # type: ignore
             self.create_subscription(LimoStatus, "/limo_status", self._on_limo, 10)
@@ -482,6 +494,20 @@ class RunExecutor(Node):
             self._odom_zero_status = json.loads(msg.data) or {}
         except (ValueError, TypeError):
             pass
+
+    def _on_heading_status(self, msg):
+        try:
+            self._heading_status = json.loads(msg.data) or {}
+            self._heading_status_t = time.monotonic()
+        except (ValueError, TypeError):
+            pass
+
+    def _on_fix(self, msg):
+        # NavSatFix status -1 = no fix; lat/lon would be garbage.
+        if msg.status.status < 0:
+            return
+        self._last_fix = (float(msg.latitude), float(msg.longitude))
+        self._last_fix_t = time.monotonic()
 
     def _ros_now_s(self):
         return float(self.get_clock().now().nanoseconds) * 1e-9
@@ -940,6 +966,7 @@ class RunExecutor(Node):
                 self._odom_reset_sent = False
                 self._odom_reset_command_t = None
                 self._odom_reset_first_sent_t = None
+                self._achieved_anchor = None
             if phase == Phase.FOLLOWER_START:
                 # Neutralize the latched recipe BEFORE the follower spawns: a
                 # fresh follower replays the last latched message, and the
@@ -1130,12 +1157,78 @@ class RunExecutor(Node):
             self.get_logger().info(
                 f"odom_zero latch confirmed at (x={origin.get('x')}, "
                 f"y={origin.get('y')}, yaw={origin.get('yaw')}).")
+            self._capture_achieved_anchor()
             self._enter(Phase.BAG_START)
             return
         if time.monotonic() - self._odom_reset_first_sent_t > self._odom_settle_s:
             self._pause(
                 f"odom_zero reset not confirmed within {self._odom_settle_s:.1f}s "
                 "of first send")
+
+    def _capture_achieved_anchor(self):
+        """Snapshot the MEASURED world pose at the odom-zero instant.
+
+        The ref path is generated in the just-zeroed odom frame, so its world
+        placement is exactly the robot's true pose right now. The pin pose
+        (path_frame_anchor) is only the COMMANDED target — reposition arrives
+        up to pos_tol/heading_tol away from it — so run_eval must score
+        RTK-truth metrics against this snapshot, not the pin.
+
+        Never blocks the run: a stale/conflicted heading or missing fix is
+        recorded as valid=false and paged to the operator (the leg stays
+        analyzable via the post-hoc odom->RTK track fit).
+        """
+        now = time.monotonic()
+        problems = []
+
+        hs = self._heading_status or {}
+        heading_fresh = (self._heading_status_t is not None
+                         and now - self._heading_status_t <= 2.0)
+        mode = hs.get("mode")
+        if not heading_fresh:
+            problems.append("fused heading stale/absent")
+        elif mode not in ("GNSS_AIDED", "GYRO_MAG"):
+            problems.append(f"no absolute heading reference (mode={mode})")
+        if hs.get("src_conflict"):
+            problems.append("heading sources in conflict")
+
+        fix_fresh = (self._last_fix_t is not None
+                     and now - self._last_fix_t <= 3.0)
+        if not fix_fresh:
+            problems.append("RTK fix stale/absent")
+
+        err_deg = (self._repo_status or {}).get("err_deg")
+        self._achieved_anchor = {
+            "valid": not problems,
+            "problems": problems,
+            "lat": self._last_fix[0] if fix_fresh else None,
+            "lon": self._last_fix[1] if fix_fresh else None,
+            "fix_age_s": (round(now - self._last_fix_t, 2)
+                          if self._last_fix_t is not None else None),
+            "heading_deg": hs.get("fused_deg") if heading_fresh else None,
+            "heading_convention": "compass_deg_east_of_north",
+            "heading_std_deg": hs.get("heading_std_deg") if heading_fresh else None,
+            "heading_mode": mode,
+            "heading_sources": hs.get("active_sources") if heading_fresh else None,
+            "reposition_err_deg": (float(err_deg)
+                                   if isinstance(err_deg, (int, float)) else None),
+            "stamp_utc": datetime.now(timezone.utc).isoformat(),
+        }
+        if problems:
+            msg = ("achieved anchor INVALID at odom reset: "
+                   + "; ".join(problems)
+                   + " — RTK-truth scoring for this leg falls back to the "
+                     "post-hoc odom->RTK track fit.")
+            self.get_logger().error(msg)
+            _notify_discord(f"ANCHOR WARNING ({self._leg_cell_id}): {msg}",
+                            title="H-inf run_executor")
+        else:
+            self.get_logger().info(
+                f"achieved anchor: lat={self._achieved_anchor['lat']:.7f} "
+                f"lon={self._achieved_anchor['lon']:.7f} "
+                f"hdg={self._achieved_anchor['heading_deg']:.1f} deg "
+                f"(std {self._achieved_anchor['heading_std_deg']} deg, "
+                f"mode {mode}, repo err {err_deg} deg).")
 
     def _tick_bag_start(self):
         curve = self._cur_curve
@@ -1372,6 +1465,7 @@ class RunExecutor(Node):
                 bag_path=self._leg_bag_path,
                 topics=Data_Logger.TOPICS,
                 path_frame_anchor=path_frame_anchor,
+                achieved_anchor=self._achieved_anchor,
             )
             Data_Logger.write_sidecar(self._leg_bag_path, sidecar)
             return bool(classification["pass"])

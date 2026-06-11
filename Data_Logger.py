@@ -68,6 +68,14 @@ TOPICS = [
     "/path_follower/status",    # std_msgs/Float32MultiArray (telemetry + timing)
     "/path_follower/done",      # std_msgs/Bool, latched (completion edge)
     "/path_follower/timing",    # std_msgs/Float32 (per-cycle controller ms, A3)
+    # --- Heading (world-frame anchor audit) ---
+    # The ref path's world placement hinges on the robot's heading at the
+    # odom-zero instant; these let run_eval verify the sidecar's
+    # achieved_anchor snapshot against a full time series (and against the
+    # odom->RTK track fit) instead of trusting a single number.
+    "/heading/fused",                          # std_msgs/Float64, compass deg E-of-N
+    "/heading/fused_status",                   # std_msgs/String, JSON diagnostics
+    "/pixhawk/global_position/compass_hdg",    # std_msgs/Float64, raw FCU compass
 ]
 
 
@@ -305,6 +313,7 @@ def build_sidecar(
     topics: Optional[Sequence[str]] = None,
     git_commit: Optional[str] = None,
     path_frame_anchor: Optional[Dict[str, Any]] = None,
+    achieved_anchor: Optional[Dict[str, Any]] = None,
     extra: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Assemble the D3 sidecar dict. Pure (no I/O) so it is easy to unit-test.
@@ -317,6 +326,14 @@ def build_sidecar(
     ``{lat, lon, heading_deg, pin_id}`` so run_eval can re-anchor RTK-truth
     into the same frame as the analytic reference path. None for turnarounds
     and manual bags.
+
+    ``achieved_anchor`` (optional) is the MEASURED robot pose at the
+    odom-zero instant (RTK lat/lon + fused heading + health flags), as
+    opposed to the COMMANDED pin pose in ``path_frame_anchor``. Reposition
+    arrives within tolerance, not exactly on the pin (heading especially:
+    up to arrival_heading_tol_deg off), so RTK-truth metrics must be scored
+    against this pose — scoring against the pin charges the controller for
+    reposition's arrival error. None when the capture was impossible.
     """
     sidecar: Dict[str, Any] = {
         "schema_version": SIDECAR_SCHEMA_VERSION,
@@ -336,6 +353,9 @@ def build_sidecar(
             # reference, the same way /wheel/odom_zeroed does on the wheel side.
             # None for turnarounds / manual bags without a known pin pose.
             "path_frame_anchor": path_frame_anchor,
+            # Measured pose at the odom-zero instant (vs the commanded pin
+            # above). This is the frame RTK-truth metrics are scored in.
+            "achieved_anchor": achieved_anchor,
         },
         "rtk_summary": rtk_summary,
         "classification": classification,

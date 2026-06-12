@@ -751,7 +751,7 @@ class RunExecutor(Node):
         if geom is None:
             return None
         fam, R = geom
-        best = None   # (done, order, c, v)
+        best = None   # (attempts, done, order, c, v)
         order = 0
         for c in self._controllers:
             for v in self._speeds:
@@ -761,14 +761,24 @@ class RunExecutor(Node):
                     continue
                 if self._completed_counts.get(key, 0) >= self._target_n:
                     continue
-                if self._attempts.get((fam, R, c, v), 0) >= self._max_retries:
+                att = self._attempts.get((fam, R, c, v), 0)
+                if att >= self._max_retries:
                     continue   # retry-exhausted — skip so the cycle can finish
-                cand = (self._completed_counts.get(key, 0), order, c, v)
-                if best is None or cand[:2] < best[:2]:
+                # Deferred redo (2026-06-13): attempts is the PRIMARY sort key,
+                # so a cell that just failed sorts to the BACK — every other
+                # still-incomplete cell of this geometry runs before we retry
+                # it. A bad bag is usually a transient (RTK blip, recorder
+                # hiccup); a cooldown of other runs beats an immediate
+                # back-to-back retry under the same conditions. attempts resets
+                # to 0 on a pass (see _record_treatment_result), so a cell only
+                # carries the penalty while it is actively failing; once every
+                # fresh cell is full it is retried (and parked at max_retries).
+                cand = (att, self._completed_counts.get(key, 0), order, c, v)
+                if best is None or cand[:3] < best[:3]:
                     best = cand
         if best is None:
             return None
-        done, _order, c, v = best
+        _att, done, _order, c, v = best
         return {"controller": c, "v_const": float(v), "rep": int(done)}
 
     def _all_geometries_done(self):

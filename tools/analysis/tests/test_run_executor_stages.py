@@ -290,6 +290,37 @@ def test_transit_none_without_a_completed_leg():
     assert ex._transit_curve is None
 
 
+def test_failed_cell_deferred_to_back_of_queue():
+    """B (2026-06-13): a cell that just failed is retried only AFTER every
+    other still-incomplete cell of the geometry has run — not immediately."""
+    leg = _leg("step", 1.0)
+    ex = Exec([{"name": "stage_1", "legs": [leg]}], counts={}, n=2)
+    # two cells (default _speeds=[1.0]): (lpv-hinf, 1.0) and (pid, 1.0).
+    # lpv-hinf just failed once (attempts=1, still 0 passes); pid is fresh.
+    ex._attempts[("step", 1.0, "lpv-hinf", 1.0)] = 1
+    t = ex._next_treatment_for(leg)
+    assert t["controller"] == "pid", \
+        f"failed cell retried immediately instead of deferring: {t}"
+    # fill pid to N -> the only incomplete cell left is the failed lpv-hinf
+    ex._completed_counts[_key("step", 1.0, "pid")] = 2
+    t = ex._next_treatment_for(leg)
+    assert t["controller"] == "lpv-hinf", f"deferred cell never came back: {t}"
+    # at max_retries it is parked so the geometry/stage can finish
+    ex._attempts[("step", 1.0, "lpv-hinf", 1.0)] = 2
+    assert ex._next_treatment_for(leg) is None
+
+
+def test_fresh_cells_still_round_robin_least_done():
+    """Deferral must not disturb the normal fill order: among cells that have
+    NOT failed, the least-done one is still chosen (round-robin)."""
+    leg = _leg("step", 1.0)
+    ex = Exec([{"name": "stage_1", "legs": [leg]}], counts={}, n=5)
+    ex._completed_counts[_key("step", 1.0, "lpv-hinf")] = 3
+    ex._completed_counts[_key("step", 1.0, "pid")] = 1
+    t = ex._next_treatment_for(leg)
+    assert t["controller"] == "pid" and t["rep"] == 1, t
+
+
 if __name__ == "__main__":
     fails = 0
     for name, fn in sorted(globals().items()):

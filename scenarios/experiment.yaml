@@ -33,6 +33,19 @@ matrix:
 
 repetitions: 10
 
+# Auto-layout planner overrides (deep-merged over experiment_planner.PLAN_DEFAULTS).
+plan:
+  glue:
+    # Trackable min radius for reposition/glue curves. Set to 0.8 m in the
+    # field 2026-06-12: at the 0.7 default the A/B turnaround glues
+    # self-intersected and pure pursuit demanded sub-R_min (0.37 m) turns near
+    # the loop crossing, aborting the run mid-sweep. Wider glues track cleaner;
+    # 1.0 and 0.85 were tried first but left slalom unfittable, so 0.8 is the
+    # widest floor that still fits the venue. The hard chassis floor
+    # (hard_radius_m 0.37) is unchanged — this only widens what the gate accepts
+    # and what the Dubins fallback snaps up to.
+    track_radius_m: 0.8
+
 gating:
   # Battery is VOLTS on /limo_status.battery_voltage (hw-confirmed ~12.0 V).
   # M2 wants alert@30% / halt@20% SoC. Mapped linearly over the 3S Li-ion range

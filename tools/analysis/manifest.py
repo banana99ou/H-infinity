@@ -47,6 +47,7 @@ REQUIRED_TOPICS = [
     "/gps_rtk_f9p_helical/gps/rtk_status",
     "/path_follower/status",
     "/path_follower/done",
+    "/reference_path",
 ]
 
 
@@ -109,6 +110,65 @@ def topics_in_bag(bag_dir):
         return topics
     except Exception:
         return set()
+
+
+def topic_counts_in_bag(bag_dir):
+    """{topic: message_count} from metadata.yaml (no message decode).
+
+    Distinct from topics_in_bag(): a QoS-poisoned recorder subscription leaves
+    the topic PRESENT in metadata with count 0, so presence checks pass while
+    the data is gone. Counts are what the quick gate needs.
+    """
+    meta = os.path.join(bag_dir, "metadata.yaml")
+    try:
+        with open(meta, "r", encoding="utf-8") as f:
+            m = yaml.safe_load(f)
+        info = m.get("rosbag2_bagfile_information", {})
+        counts = {}
+        for t in info.get("topics_with_message_count", []):
+            name = (t.get("topic_metadata", {}) or {}).get("name")
+            if name:
+                counts[name] = counts.get(name, 0) + int(t.get("message_count", 0))
+        return counts
+    except Exception:
+        return {}
+
+
+def quick_gate(bag_dir):
+    """Bag-level quick gate — cheap enough to run ON-ROBOT right after each
+    bag closes (stdlib + yaml only; no rosbags/numpy, no message decode).
+
+    Catches the recorder-side failure class the live classifier cannot see
+    from its own topic subscriptions (e.g. a QoS-poisoned /cmd_vel_raw
+    subscription recording 0 msgs while the run itself looked healthy,
+    rooftop 2026-06-11). The full laptop gate (qc.py) stays authoritative;
+    this is the subset of it derivable from metadata.yaml alone.
+
+    Returns {"pass": bool, "reasons": [str], "duration_s": float|None}.
+    """
+    meta = os.path.join(bag_dir, "metadata.yaml")
+    reasons = []
+    try:
+        with open(meta, "r", encoding="utf-8") as f:
+            m = yaml.safe_load(f)
+        info = m.get("rosbag2_bagfile_information", {})
+        duration_s = float((info.get("duration", {}) or {}).get("nanoseconds", 0)) * 1e-9
+    except Exception:
+        return {"pass": False, "reasons": ["metadata_unreadable"], "duration_s": None}
+    counts = topic_counts_in_bag(bag_dir)
+    absent = [t for t in REQUIRED_TOPICS if counts.get(t, 0) == 0]
+    if absent:
+        reasons.append("missing_topics:" + "+".join(absent))
+    # estop_cli relays cmd_vel_raw -> cmd_vel 1:1; a large count gap means the
+    # recorder captured only a fraction of the raw stream.
+    n_raw = counts.get("/cmd_vel_raw", 0)
+    n_cmd = counts.get("/cmd_vel", 0)
+    if n_cmd > 0 and not absent and n_raw < 0.5 * n_cmd:
+        reasons.append(f"cmd_vel_raw_undercount_{n_raw}/{n_cmd}")
+    if duration_s < 0.5:
+        reasons.append(f"bag_too_short_{duration_s:.2f}s")
+    return {"pass": not reasons, "reasons": reasons,
+            "duration_s": round(duration_s, 3)}
 
 
 def cell_key(cell_params):

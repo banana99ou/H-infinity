@@ -246,6 +246,7 @@ class RunExecutor(Node):
         self._max_retries = 2           # retry.max_retries (per-cell classification)
         self._breaker_k = 3             # retry.circuit_breaker_k (consecutive)
         self._completed_counts = {}     # cell_key -> #passing runs (this venue)
+        self._progress = None           # whole-matrix X/320 dashboard summary
         self._attempts = {}             # (fam,R,c,v) -> consecutive failed attempts
         self._consec_fail = 0           # consecutive scored-run classification fails
         self._cur_treatment = None      # {controller, v_const, rep} or None (glue)
@@ -632,6 +633,11 @@ class RunExecutor(Node):
                 continue
             if str(r.get("run_id")) != str(run_id):
                 continue          # other venue/batch — must not mark us done
+            # Bag-level re-gate: pre-2026-06-12 sidecars say pass on
+            # recorder-broken bags; those cells must be refilled, not skipped.
+            if hasattr(manifest, "quick_gate") and not manifest.quick_gate(
+                    r["bag_dir"])["pass"]:
+                continue
             k = manifest.cell_key({
                 "controller": r.get("controller"), "v_const": r.get("v_const"),
                 "path_family": r.get("path_family"), "radius_m": r.get("radius_m")})
@@ -642,6 +648,54 @@ class RunExecutor(Node):
     def _rebuild_counts(self):
         """Count passing scored runs for THIS venue (the resume mechanism)."""
         self._completed_counts = self._counts_for(self._run_id)
+        self._progress = self._global_progress()
+
+    def _global_progress(self):
+        """Whole-matrix dataset progress (the X/320 dashboard number).
+
+        Cross-venue by design: the paper dataset accumulates over sessions, so
+        usable legs are counted over the WHOLE bag-root manifest against the
+        experiment.yaml expected-cell set, capped at N per cell. `sidecar_pass`
+        embeds the bag-level quick gate for every leg recorded from 2026-06-12
+        on, so this number only counts legs whose recording survived.
+        """
+        if manifest is None:
+            return None
+        try:
+            expected, reps, _doc = manifest.load_experiment(self._experiment_yaml)
+            rows = manifest.build_rows(manifest.discover_legs(self._bag_root))
+        except Exception as exc:
+            self.get_logger().warn(f"progress scan failed: {exc}")
+            return None
+        n = int(reps or self._target_n or 0)
+        if not expected or n <= 0:
+            return None
+        per_cell = {k: 0 for k in expected}
+        failed = 0
+        for r in rows:
+            k = manifest.cell_key({
+                "controller": r.get("controller"), "v_const": r.get("v_const"),
+                "path_family": r.get("path_family"),
+                "radius_m": r.get("radius_m")})
+            if k not in per_cell:
+                continue        # glue/turnaround/off-matrix legs don't count
+            # Re-run the bag quick gate even for legs whose sidecar predates
+            # it (pre-2026-06-12 sidecars say pass on recorder-broken bags).
+            if (r.get("sidecar_pass") is True
+                    and manifest.quick_gate(r["bag_dir"])["pass"]):
+                per_cell[k] += 1
+            else:
+                failed += 1
+        usable = sum(min(c, n) for c in per_cell.values())
+        target = n * len(per_cell)
+        return {
+            "usable": usable,
+            "target": target,
+            "failed_attempts": failed,
+            "redo_pending": target - usable,
+            "cells_short": sum(1 for c in per_cell.values() if c < n),
+            "cells_total": len(per_cell),
+        }
 
     def _leg_id(self, idx):
         if 0 <= idx < len(self._legs):
@@ -904,6 +958,7 @@ class RunExecutor(Node):
                 self._pause(
                     f"circuit breaker: {self._consec_fail} consecutive scored-run "
                     "classification failures — check RTK/venue, then Start to resume")
+        self._progress = self._global_progress()
 
     def _start_or_resume(self):
         """Shared Start/resume entry: reload venue + matrix + manifest counts,
@@ -1462,6 +1517,14 @@ class RunExecutor(Node):
             self._record_treatment_result(passed)
             if self.phase == Phase.PAUSED:   # circuit breaker tripped
                 return
+            if not passed:
+                # Notify-and-continue (operator decision 2026-06-12): a failed
+                # leg is bookkeeping, not control flow. The cell's count stays
+                # short, so the gap-filling planner re-runs it on a later
+                # pass; the operator decides about exhausted cells at the end.
+                self._publish_status(
+                    message=f"leg FAILED validation — cell stays queued for "
+                            f"redo (curve '{curve.get('name')}')")
         self.get_logger().info(
             f"curve '{curve.get('name')}' done (end_reason={self._run_end_reason}).")
         self._publish_status(message=f"curve '{curve.get('name')}' done")
@@ -1512,6 +1575,21 @@ class RunExecutor(Node):
                 "rtk_window_pct_required": self._rtk_window_pct,
                 "end_reason": self._run_end_reason,
             }
+            # Bag-level quick gate: the bag is closed here, so its metadata is
+            # final. A leg whose RECORDING is broken must not count toward the
+            # cell's N even when the run itself was clean (the live checks
+            # above can't see inside the bag) — folding the verdict into
+            # `pass` makes the gap-filling treatment planner redo the cell on
+            # a later pass, with no extra retry machinery.
+            if manifest is not None and hasattr(manifest, "quick_gate"):
+                qg = manifest.quick_gate(self._leg_bag_path)
+                classification["quick_gate"] = qg
+                if not qg["pass"]:
+                    classification["pass"] = False
+                    self.get_logger().warn(
+                        "quick-gate FAIL on "
+                        f"{os.path.basename(self._leg_bag_path)}: "
+                        f"{';'.join(qg['reasons'])}")
             sp = curve.get("start_pose") or {}
             path_frame_anchor = None
             if sp:
@@ -1651,6 +1729,7 @@ class RunExecutor(Node):
             "battery_v": self._battery_v,
             "rtk_q": self._rtk_quality,
             "pause_reason": self._pause_reason,
+            "progress": self._progress,
             "message": message,
         })))
 

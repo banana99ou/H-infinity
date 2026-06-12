@@ -80,7 +80,7 @@ def _motion_window(bag):
     idle head is long relative to the path.
     """
     d = bag.get(run_eval.TOPIC_ODOM)
-    if d is None or len(d["stamp"]) < 2:
+    if d is None or len(d["stamp"]) < 2 or "v" not in d:
         return None, None
     s = np.asarray(d["stamp"], dtype=float)
     v = np.abs(np.asarray(d["v"], dtype=float))
@@ -171,17 +171,21 @@ def qc_leg(leg, target_len_v, rtk_pct_min, length_tol, gap_tol,
     # 0b) Required topics (system_spec §5): every one must be present with at
     # least one message. Catches recorder-side losses (e.g. a QoS-poisoned
     # /cmd_vel_raw subscription) that leave the run looking healthy elsewhere.
-    bag_counts = bag.get("_counts") or {}
-    absent = [t for t in REQUIRED_TOPICS if bag_counts.get(t, 0) == 0]
-    if absent:
-        reasons.append("missing_topics:" + "+".join(absent))
-    # estop_cli relays cmd_vel_raw -> cmd_vel 1:1, so a large count gap means
-    # the recorder captured only a fraction of the raw stream (e.g. one latched
-    # sample from a QoS-mismatched subscription) even though the topic exists.
-    n_raw = bag_counts.get("/cmd_vel_raw", 0)
-    n_cmd = bag_counts.get("/cmd_vel", 0)
-    if n_cmd > 0 and not absent and n_raw < 0.5 * n_cmd:
-        reasons.append(f"cmd_vel_raw_undercount_{n_raw}/{n_cmd}")
+    # "_counts" is absent only for synthetic bags (test fixtures); real
+    # read_bag output always carries it.
+    bag_counts = bag.get("_counts")
+    if bag_counts is not None:
+        absent = [t for t in REQUIRED_TOPICS if bag_counts.get(t, 0) == 0]
+        if absent:
+            reasons.append("missing_topics:" + "+".join(absent))
+        # estop_cli relays cmd_vel_raw -> cmd_vel 1:1, so a large count gap
+        # means the recorder captured only a fraction of the raw stream (e.g.
+        # one latched sample from a QoS-mismatched subscription) even though
+        # the topic exists.
+        n_raw = bag_counts.get("/cmd_vel_raw", 0)
+        n_cmd = bag_counts.get("/cmd_vel", 0)
+        if n_cmd > 0 and not absent and n_raw < 0.5 * n_cmd:
+            reasons.append(f"cmd_vel_raw_undercount_{n_raw}/{n_cmd}")
 
     # 1) RTK FIXED % (skipped at GPS-denied venues via --no-rtk-gate)
     pct, n_rtk = rtk_fixed_pct(bag, t0, t1)

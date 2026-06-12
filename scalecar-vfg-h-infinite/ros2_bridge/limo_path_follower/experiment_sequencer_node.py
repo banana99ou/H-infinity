@@ -1,6 +1,16 @@
 # -*- coding: utf-8 -*-
 """Experiment sequencer (T6) — the integrator that drives the full matrix unattended.
 
+.. deprecated:: 2026-06-12
+    DEPRECATED — DO NOT EXTEND. run_executor_node is the experiment pathway
+    (operator decision 2026-06-12): it carries the webui leg-batch workflow,
+    the manifest-driven gap-filling treatment planner, the bag-level quick
+    gate, and the dataset progress dashboard. This node is kept only because
+    the ops smoke-e2e ('sequencer_smoke'), the orchestrator PROCS table, and
+    the tools/qc/ros sim harness still reference it; it is scheduled for
+    deletion once those are repointed/retired. Fix bugs in run_executor_node,
+    not here.
+
 This node owns the per-cell state machine described in DOC/experiment.md
 (operational model) and DOC/system_spec.md §3.6/§3.10. It coordinates the
 already-built primitives via their documented topic contracts only — it does

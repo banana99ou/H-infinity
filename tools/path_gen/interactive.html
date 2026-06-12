@@ -511,6 +511,15 @@
         <button id="lb-abort" class="estop" style="font-size:14px;padding:8px;">ABORT</button>
       </div>
       <div class="stat" id="lb-run-status" style="margin-top:6px;">(waiting for /run/status)</div>
+      <!-- Experiment dataset dashboard: whole-matrix progress (X/320 usable
+           legs across all sessions, from the bag-root manifest) + failed /
+           redo-pending counters. Fed by /run/status `progress`. -->
+      <div class="stat" id="lb-progress" style="margin-top:4px; display:none;">
+        <div style="background:#223; border-radius:4px; height:12px; overflow:hidden;">
+          <div id="lb-progress-fill" style="height:100%; width:0%; background:#4caf50; transition:width .3s;"></div>
+        </div>
+        <div class="small" id="lb-progress-text" style="margin-top:2px;"></div>
+      </div>
     </details>
 
     <h3>Manual control</h3>
@@ -3844,7 +3853,7 @@ function lbPlanRequest() {
   lbPlanPending = true;
   topicPlanRequest.publish(new ROSLIB.Message({ data: JSON.stringify({ venue: v }) }));
   $('lb-plan-state').innerHTML =
-    '<span class="pill">planning… (NUC searches placements + A/B pairs, ~10–60 s)</span>';
+    '<span class="pill">planning… (NUC searches placements + A/B pairs, ~1–2 min)</span>';
 }
 function onPlanResult(msg) {
   let d; try { d = JSON.parse(msg.data); } catch (e) { return; }
@@ -4007,6 +4016,24 @@ function onRunStatus(msg) {
     `curve: ${d.curve_name || '--'} (${d.curve_kind || '--'}) &nbsp; rtk q=${d.rtk_q != null ? d.rtk_q : '--'}` +
     (d.battery_v != null ? ` &nbsp; batt ${Number(d.battery_v).toFixed(2)}V` : '') +
     (d.message ? `<br><span class="small">${d.message}</span>` : '');
+  // Experiment dataset dashboard (progress bar + X/target + failed/redo).
+  const p = d.progress, pbox = $('lb-progress');
+  if (pbox) {
+    if (p && p.target) {
+      pbox.style.display = '';
+      const pct = Math.round(100 * (p.usable || 0) / p.target);
+      $('lb-progress-fill').style.width = pct + '%';
+      $('lb-progress-text').innerHTML =
+        `dataset <b>${p.usable || 0}/${p.target}</b> usable legs (${pct}%)` +
+        ` &nbsp; failed attempts: <b>${p.failed_attempts || 0}</b>` +
+        ` &nbsp; redo pending: <b>${p.redo_pending || 0}</b>` +
+        (p.cells_short != null ? ` &nbsp; cells short: ${p.cells_short}/${p.cells_total}` : '');
+    } else {
+      pbox.style.display = 'none';
+    }
+  }
+  if (d.message && /leg FAILED validation/.test(d.message))
+    raiseAlert('leg_failed', 'warn', 'Leg failed validation', d.message);
   if (phase === 'paused')
     raiseAlert('run_paused', 'critical', 'Run PAUSED', d.pause_reason || d.message || 'operator action needed');
   else if (phase === 'aborted')

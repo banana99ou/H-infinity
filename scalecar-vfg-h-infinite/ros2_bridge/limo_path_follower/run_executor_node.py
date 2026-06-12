@@ -272,6 +272,10 @@ class RunExecutor(Node):
         self._goto_last_send_t = 0.0  # monotonic time of last goto (re-)send
         self._params_sent = False
         self._params_future = None
+        self._params_sent_t = 0.0       # when the live set_parameters call went out
+        self._params_retries = 0        # re-sends after a dropped service response
+        self._set_params_timeout = 5.0  # re-send a stalled set_parameters call
+        self._set_params_max_retries = 3
         self._odom_reset_sent = False
         self._odom_reset_command_t = None       # ROS time of first send (confirm gate)
         self._odom_reset_first_sent_t = None    # monotonic time of first send (timeout)
@@ -1442,21 +1446,42 @@ class RunExecutor(Node):
                 return
             self._params_future = fut
             self._params_sent = True
+            self._params_sent_t = self._ros_now_s()
             return
-        if self._params_future.done():
-            self._params_sent = False
-            # future.done() != success: a rejected parameter (e.g. bad
-            # controller_type) returns successful=False per result.
-            try:
-                results = list(self._params_future.result().results)
-            except Exception as exc:
-                self._pause(f"follower set_parameters call failed: {exc}")
-                return
-            bad = [r.reason for r in results if not r.successful]
-            if bad:
-                self._pause("follower rejected params: " + "; ".join(bad))
-                return
-            self._enter(Phase.PUSH_RECIPE)
+        if not self._params_future.done():
+            # call_async has no timeout: if the follower's response is dropped
+            # (rmw "failed to send response (timeout)", seen right after a
+            # follower respawn), the future never resolves and the leg hangs
+            # here forever. Re-send on a stall — setting params is idempotent.
+            if self._ros_now_s() - self._params_sent_t > self._set_params_timeout:
+                self._params_retries += 1
+                if self._params_retries > self._set_params_max_retries:
+                    self._params_sent = False
+                    self._params_retries = 0
+                    self._pause("follower set_parameters got no response after "
+                                f"{self._set_params_max_retries} retries — "
+                                "check the follower, then Start to retry")
+                    return
+                self.get_logger().warn(
+                    f"set_parameters: no response in "
+                    f"{self._set_params_timeout:.0f}s — re-sending "
+                    f"(attempt {self._params_retries})")
+                self._params_sent = False   # rebuild + re-send next tick
+            return
+        self._params_sent = False
+        self._params_retries = 0
+        # future.done() != success: a rejected parameter (e.g. bad
+        # controller_type) returns successful=False per result.
+        try:
+            results = list(self._params_future.result().results)
+        except Exception as exc:
+            self._pause(f"follower set_parameters call failed: {exc}")
+            return
+        bad = [r.reason for r in results if not r.successful]
+        if bad:
+            self._pause("follower rejected params: " + "; ".join(bad))
+            return
+        self._enter(Phase.PUSH_RECIPE)
 
     def _tick_push_recipe(self):
         curve = self._cur_curve
@@ -1685,6 +1710,7 @@ class RunExecutor(Node):
             self._orch_kill(name)
         self._goto_sent = False
         self._params_sent = False
+        self._params_retries = 0
 
     def _reset_run_scratch(self):
         self._leg_bag_path = None

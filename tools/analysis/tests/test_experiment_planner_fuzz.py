@@ -11,6 +11,7 @@ Every returned stage must also pass the loader's containment gate.
 Run:  python3 tools/analysis/tests/test_experiment_planner_fuzz.py   (or pytest)
 """
 import math
+import multiprocessing as mp
 import os
 import random
 import sys
@@ -29,7 +30,11 @@ import venue_geom                 # noqa: E402
 FOOT, TRACK = 0.30, 0.30
 _M = 1.0 / 111320.0
 
-N_CASES = 60   # ~2-4 s/case worst-case; keep the suite under a few minutes
+# A/B-pair placement made plan_stages ~10-30x dearer than the single-curve
+# packer, so cases run in a process pool. Inputs are pre-generated from the
+# seeded rng in one sequential pass (identical draw order to the old serial
+# loop), so the suite stays deterministic.
+N_CASES = 60
 SEED = 20260611
 
 
@@ -86,55 +91,78 @@ def _rand_counts(rng, doc):
     return counts
 
 
+def _pool():
+    # fork: workers inherit the imported modules; spawn (macOS default)
+    # would re-import this file as __main__ and re-run the suite.
+    return mp.get_context("fork").Pool(max(1, (os.cpu_count() or 2) - 1))
+
+
+def _check_accounting_case(args):
+    case, venue, counts = args
+    doc = _doc()
+    failures = []
+    try:
+        plan = ep.plan_stages(venue, doc, counts, FOOT, TRACK)
+    except Exception as exc:  # noqa: BLE001 - that IS the test
+        return [f"case {case}: plan_stages raised {exc!r}"]
+    remaining = {(f, R) for (f, R, _n)
+                 in ep.remaining_geometries(doc, counts)}
+    staged = [(g["family"], g["R"]) for st in plan["stages"]
+              for g in st["geometries"]]
+    unfit = {(u["family"], u["R"]) for u in plan["unfittable"]}
+    if len(staged) != len(set(staged)):
+        failures.append(f"case {case}: geometry planned twice: {staged}")
+    accounted = set(staged) | unfit
+    if accounted != remaining:
+        failures.append(
+            f"case {case}: accounting broken — remaining {sorted(remaining)}"
+            f" vs staged {sorted(set(staged))} + unfit {sorted(unfit)}")
+    for u in plan["unfittable"]:
+        if not u.get("reason"):
+            failures.append(f"case {case}: unfittable without reason")
+    for st in plan["stages"]:
+        if len(st["glues"]) != len(st["experiments"]):
+            failures.append(
+                f"case {case}: {st['name']} glue/exp count mismatch")
+    return failures
+
+
 def test_fuzz_never_raises_and_accounts_for_every_geometry():
     rng = random.Random(SEED)
     doc = _doc()
-    hard_failures = []
-    for case in range(N_CASES):
-        venue = _rand_venue(rng)
-        counts = _rand_counts(rng, doc)
-        try:
-            plan = ep.plan_stages(venue, doc, counts, FOOT, TRACK)
-        except Exception as exc:  # noqa: BLE001 - that IS the test
-            hard_failures.append(f"case {case}: plan_stages raised {exc!r}")
-            continue
-        remaining = {(f, R) for (f, R, _n)
-                     in ep.remaining_geometries(doc, counts)}
-        staged = [(g["family"], g["R"]) for st in plan["stages"]
-                  for g in st["geometries"]]
-        unfit = {(u["family"], u["R"]) for u in plan["unfittable"]}
-        if len(staged) != len(set(staged)):
-            hard_failures.append(f"case {case}: geometry planned twice: {staged}")
-        accounted = set(staged) | unfit
-        if accounted != remaining:
-            hard_failures.append(
-                f"case {case}: accounting broken — remaining {sorted(remaining)}"
-                f" vs staged {sorted(set(staged))} + unfit {sorted(unfit)}")
-        for u in plan["unfittable"]:
-            if not u.get("reason"):
-                hard_failures.append(f"case {case}: unfittable without reason")
-        for st in plan["stages"]:
-            if len(st["glues"]) != len(st["experiments"]):
-                hard_failures.append(
-                    f"case {case}: {st['name']} glue/exp count mismatch")
+    cases = [(i, _rand_venue(rng), _rand_counts(rng, doc))
+             for i in range(N_CASES)]
+    with _pool() as pool:
+        results = pool.map(_check_accounting_case, cases)
+    hard_failures = [f for fs in results for f in fs]
     assert not hard_failures, "\n".join(hard_failures[:10])
+
+
+def _check_containment_case(args):
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from test_experiment_planner import _legs_from_stage
+    case, venue = args
+    plan = ep.plan_stages(venue, _doc(), {}, FOOT, TRACK)
+    failures, checked = [], 0
+    for st in plan["stages"]:
+        ok, report = venue_geom.check_legs_containment(
+            _legs_from_stage(st, venue), venue, FOOT, TRACK)
+        if not ok:
+            failures.append(f"case {case} {st['name']} rejected:\n{report}")
+        checked += 1
+    return failures, checked
 
 
 def test_fuzz_staged_output_passes_loader_gate():
     # Containment equivalence on a subset (it is the expensive half).
-    from test_experiment_planner import _legs_from_stage
     rng = random.Random(SEED + 1)
-    doc = _doc()
-    checked = 0
-    for case in range(20):
-        venue = _rand_venue(rng)
-        plan = ep.plan_stages(venue, doc, {}, FOOT, TRACK)
-        for st in plan["stages"]:
-            ok, report = venue_geom.check_legs_containment(
-                _legs_from_stage(st, venue), venue, FOOT, TRACK)
-            assert ok, f"case {case} {st['name']} rejected:\n{report}"
-            checked += 1
-    assert checked > 0, "fuzz never produced a stage — generator too hostile"
+    cases = [(i, _rand_venue(rng)) for i in range(20)]
+    with _pool() as pool:
+        results = pool.map(_check_containment_case, cases)
+    failures = [f for fs, _c in results for f in fs]
+    assert not failures, "\n".join(failures[:5])
+    assert sum(c for _fs, c in results) > 0, \
+        "fuzz never produced a stage — generator too hostile"
 
 
 if __name__ == "__main__":

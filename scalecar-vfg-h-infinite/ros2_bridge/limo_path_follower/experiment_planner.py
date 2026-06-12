@@ -494,6 +494,12 @@ def _plan_glue(end, exit_b, start, start_b, poly, excl, req, cfg):
                     + max(0.0, kmax - soft_k) * 3.0 - mn * 0.2
                 if best is None or penalty < best[0]:
                     best = (penalty, ctrl[1:-1], kmax)
+                    # NOTE: no good-enough early exit here — measured
+                    # 2026-06-11: returning the first acceptable variant
+                    # (instead of the penalty-best) degrades later
+                    # placements enough that full-matrix planning got
+                    # SLOWER overall (77-80 s vs 58 s). The polish pays
+                    # for itself.
     if best is not None:
         note = None
         if best[2] > soft_k:

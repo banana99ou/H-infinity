@@ -22,7 +22,7 @@ repetitions: 1
 
 # Auto-planner shape/glue knobs (experiment_planner.PLAN_DEFAULTS otherwise).
 plan:
-  max_geometries_per_stage: 3
+  max_geometries_per_stage: 2   # A/B opposed pair per stage
 
 # Gating/retry identical to the campaign yaml — the shakedown must exercise
 # the same gates it will run under.

@@ -1666,7 +1666,9 @@ const STACK_LABELS = {
   follower:     'path_follower_node',
   heading:      'heading_node (fused heading)',
   reposition:   'reposition_node',
-  sequencer:    'experiment_sequencer_node',
+  // experiment_sequencer_node (T6) is DEPRECATED — run_executor is the
+  // experiment pathway (operator decision 2026-06-12). Its orchestrator
+  // start/kill switch is removed here so it can't be brought up by mistake.
   ops:          'ops_node',
   bag:          'bag_node (manual rec)',
   // Leg-batch backends + safety layer: the Send/Start buttons and the pre-run

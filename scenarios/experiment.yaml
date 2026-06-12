@@ -36,15 +36,14 @@ repetitions: 10
 # Auto-layout planner overrides (deep-merged over experiment_planner.PLAN_DEFAULTS).
 plan:
   glue:
-    # Trackable min radius for reposition/glue curves. Set to 0.8 m in the
-    # field 2026-06-12: at the 0.7 default the A/B turnaround glues
-    # self-intersected and pure pursuit demanded sub-R_min (0.37 m) turns near
-    # the loop crossing, aborting the run mid-sweep. Wider glues track cleaner;
-    # 1.0 and 0.85 were tried first but left slalom unfittable, so 0.8 is the
-    # widest floor that still fits the venue. The hard chassis floor
-    # (hard_radius_m 0.37) is unchanged — this only widens what the gate accepts
-    # and what the Dubins fallback snaps up to.
-    track_radius_m: 0.8
+    # Trackable min radius for reposition/glue curves. 0.85 m: with the
+    # self-intersection reject added to the glue gate (2026-06-13), every
+    # geometry fits a clean 2-leg A/B pair whose turnarounds are wide U-turns
+    # (>= 0.85 m, no teardrop loop) — verified all 8 stages on rooftop, full
+    # 320-cell coverage. The earlier 0.8 left step stages single-curve; 0.85
+    # is non-monotonically better here because the search finds the clean
+    # U-turn slot. The hard chassis floor (hard_radius_m 0.37) is unchanged.
+    track_radius_m: 0.85
 
 gating:
   # Battery is VOLTS on /limo_status.battery_voltage (hw-confirmed ~12.0 V).

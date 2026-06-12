@@ -175,6 +175,72 @@ def test_entry_glue_passes_loader_containment():
         assert checked >= 1, "multi-stage plan produced no checkable entry glue"
 
 
+def _bez(ctrl, nseg):
+    out = []
+    for i in range(nseg + 1):
+        t = i / nseg
+        cur = list(ctrl)
+        while len(cur) > 1:
+            cur = [(a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t)
+                   for a, b in zip(cur[:-1], cur[1:])]
+        out.append(cur[0])
+    return out
+
+
+def _all_glue_pts(st, venue, lat0, lon0):
+    """Every glue in a stage as EN polylines (waypoints used directly, bezier
+    mids reconstructed exactly like the WebUI lbBuiltLegs)."""
+    exps, glues, m = st["experiments"], st["glues"], len(st["experiments"])
+    out = []
+    for gi, g in enumerate(glues):
+        wps = g.get("waypoints")
+        if wps:
+            out.append([venue_geom.latlon_to_en(w["lat"], w["lon"], lat0, lon0)
+                        for w in wps])
+            continue
+        prev, nxt = exps[gi], exps[(gi + 1) % m]
+        pen = venue_geom.recipe_points_en(prev["recipe"], prev["start"], lat0, lon0)
+        ctrl = ([(pen[-1][0], pen[-1][1])]
+                + [venue_geom.latlon_to_en(w["lat"], w["lon"], lat0, lon0)
+                   for w in g.get("mids", [])]
+                + [venue_geom.latlon_to_en(nxt["start"]["lat"],
+                                           nxt["start"]["lon"], lat0, lon0)])
+        L = sum(math.hypot(b[0] - a[0], b[1] - a[1])
+                for a, b in zip(ctrl[:-1], ctrl[1:]))
+        out.append(_bez(ctrl, max(12, min(300, int(L / 0.3)))))
+    return out
+
+
+def test_self_intersects_helper():
+    # interior crossing (seg (2,0)-(2,2) vs seg (1,1)-(3,1) at (2,1)); NOT the
+    # first/last pair, which the helper skips by design (glue ends meet pins)
+    assert ep._self_intersects(
+        [(0, 0), (2, 0), (2, 2), (1, 2), (1, 1), (3, 1)]) is True
+    pts, _fb = _arc(1.0, 120.0)
+    assert ep._self_intersects(pts) is False
+
+
+def test_gate_rejects_self_intersecting_glue():
+    # a teardrop with gentle curvature + a straight tail still fails the gate
+    loop = [(0, 0), (1.5, 0.2), (2.2, 1.4), (1.5, 2.4), (0.4, 2.0),
+            (0.2, 0.9), (1.0, 0.2), (2.0, 0.0), (3.0, 0.0)]
+    ok, why = ep.check_glue_tracking(loop, 90.0, G)
+    assert not ok and "self-intersect" in why, why
+
+
+def test_planned_glues_never_self_intersect_on_rooftop():
+    """C guarantee (field 2026-06-12): no planned reposition glue may loop
+    back on itself — pure pursuit latches the wrong branch at the crossing."""
+    venue, p = _plan_rooftop(radii=(1.0, 0.5))
+    assert p["ok"], p["unfittable"] or p["notes"]
+    lat0 = venue["corners_wgs84"][0]["lat"]
+    lon0 = venue["corners_wgs84"][0]["lon"]
+    for st in p["stages"]:
+        for gi, pts in enumerate(_all_glue_pts(st, venue, lat0, lon0)):
+            assert not ep._self_intersects(pts), \
+                f"{st['name']} glue {gi} self-intersects"
+
+
 if __name__ == "__main__":
     fails = 0
     for name, fn in sorted(globals().items()):

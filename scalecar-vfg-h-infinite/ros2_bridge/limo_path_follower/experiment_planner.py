@@ -269,6 +269,32 @@ def _ang_diff_deg(a, b):
     return abs((a - b + 180.0) % 360.0 - 180.0)
 
 
+def _self_intersects(pts):
+    """True if the sampled polyline crosses itself (a teardrop / racetrack
+    lap). A self-crossing reposition curve is NOT physically trackable even
+    when its min radius is legal: near the crossing, pure pursuit's lookahead
+    chord cuts across the loop and can latch the wrong branch, demanding a
+    sub-R_min turn (field 2026-06-12: the stage-1 turnaround aborted exactly
+    this way). Adjacent segments share an endpoint and are skipped; the
+    first/last pair is skipped too (they may meet a shared pin by design)."""
+    n = len(pts)
+    for i in range(n - 1):
+        ax, ay = pts[i]
+        bx, by = pts[i + 1]
+        for j in range(i + 2, n - 1):
+            if i == 0 and j == n - 2:
+                continue
+            cx, cy = pts[j]
+            dx, dy = pts[j + 1]
+            d1 = (dx - cx) * (ay - cy) - (dy - cy) * (ax - cx)
+            d2 = (dx - cx) * (by - cy) - (dy - cy) * (bx - cx)
+            d3 = (bx - ax) * (cy - ay) - (by - ay) * (cx - ax)
+            d4 = (bx - ax) * (dy - ay) - (by - ay) * (dx - ax)
+            if ((d1 > 0) != (d2 > 0)) and ((d3 > 0) != (d4 > 0)):
+                return True
+    return False
+
+
 def check_glue_tracking(pts, start_b, g):
     """B+ smoothness gate over one sampled glue polyline (endpoints included).
 
@@ -307,6 +333,9 @@ def check_glue_tracking(pts, start_b, g):
         acc += seg
         if acc >= tail_m:
             break
+    if _self_intersects(pts):
+        return False, ("glue self-intersects (teardrop/lap loop) — pure "
+                       "pursuit can latch the wrong branch at the crossing")
     return True, None
 
 

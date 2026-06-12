@@ -681,7 +681,9 @@ def plan_stages(venue, doc, counts, footprint_r=0.30, track_margin=0.30,
         guard += 1
         fam, R, rem = queue.pop(0)
         variants = []
-        for direction in ((1, -1) if fam == "step" else (1,)):
+        # Right step (direction -1) disabled 2026-06-12 (field): its shape was
+        # rejected on the roof. Left step (+1) only; slalom has no direction.
+        for direction in (1,):
             recipe = _recipe_for(fam, R, cfg, direction)
             if recipe is None:
                 break

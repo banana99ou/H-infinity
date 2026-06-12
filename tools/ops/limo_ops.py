@@ -26,6 +26,13 @@ ORCH_NAMES = {
     "odom_zero",
     "follower",
     "reposition",
+    # Fused-heading provider (compass cal + rate referee). Not a mover.
+    "heading",
+    # Webui leg-batch executor (the current experiment pathway). Motion-capable:
+    # it commands the movers, like the sequencer it supersedes.
+    "run_executor",
+    # Venue/legs loader for the leg-batch flow. Not a mover.
+    "venue_loader",
     "sequencer",
     # 1-cell smoke variant of the sequencer (orchestrator pins it to
     # scenarios/smoke.yaml). Motion-capable like 'sequencer'.
@@ -107,7 +114,7 @@ def cmd_start(args) -> int:
     if args.name not in ORCH_NAMES:
         print(f"unknown orchestrator process '{args.name}'. Known: {sorted(ORCH_NAMES)}", file=sys.stderr)
         return 2
-    if args.name in {"base", "base_vanilla", "base_gnss", "follower", "reposition", "sequencer", "sequencer_smoke"} and not args.allow_motion_capable:
+    if args.name in {"base", "base_vanilla", "base_gnss", "follower", "reposition", "run_executor", "sequencer", "sequencer_smoke"} and not args.allow_motion_capable:
         print(
             f"REFUSE: '{args.name}' is motion-capable or can lead to motion. "
             "Pass --allow-motion-capable after confirming the robot state.",
@@ -126,7 +133,7 @@ def cmd_kill(args) -> int:
 
 def cmd_stop_all(_args) -> int:
     rc = 0
-    for name in ("sequencer", "sequencer_smoke", "follower", "reposition"):
+    for name in ("sequencer", "sequencer_smoke", "run_executor", "follower", "reposition"):
         rc = topic_pub_once("/orchestrator/kill", "std_msgs/msg/String", f"data: {name}") or rc
     rc = topic_pub_once("/estop_trigger", "std_msgs/msg/Bool", "data: true") or rc
     return rc

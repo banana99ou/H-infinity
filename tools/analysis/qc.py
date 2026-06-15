@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import os
 import sys
@@ -160,6 +161,13 @@ def qc_leg(leg, target_len_v, rtk_pct_min, length_tol, gap_tol,
     duration = (t1 - t0) if t0 is not None else None
     m0, m1 = _motion_window(bag)
     motion_s = (m1 - m0) if m0 is not None else None
+    # D2: the length gate is the run-eval run window (has_path ∩ motion), the
+    # same span the scored metrics clip to — not the motion-only span. This
+    # reclassifies legs whose has_path and motion spans differ (e.g. motion
+    # before the path is pushed); accepted consciously (diff usable_legs.json
+    # before/after). motion_s stays as an informational column.
+    rw0, rw1 = run_eval.run_window(bag)
+    run_window_s = (rw1 - rw0) if rw0 is not None else None
 
     # 0) Run window. If neither odom nor status carries >=2 samples the window
     # can't be inferred: the length check is skipped and RTK%/estop fall back to
@@ -201,12 +209,13 @@ def qc_leg(leg, target_len_v, rtk_pct_min, length_tol, gap_tol,
     elif estop_fired(bag, t0, t1):
         reasons.append("estop_fired")
 
-    # 3) Length vs analytic — gate on the motion window, not whole-bag time.
+    # 3) Length vs analytic — gate on the run window (has_path ∩ motion), the
+    # same span the metrics score (D2), not whole-bag time.
     if target_len_v is not None and target_len_v > 0:
-        if motion_s is None:
-            reasons.append("no_motion")
+        if run_window_s is None:
+            reasons.append("no_run_window")
         else:
-            ratio = motion_s / target_len_v
+            ratio = run_window_s / target_len_v
             if not (1.0 - length_tol <= ratio <= 1.0 + length_tol):
                 reasons.append(f"length_ratio_{ratio:.2f}")
 
@@ -225,6 +234,8 @@ def qc_leg(leg, target_len_v, rtk_pct_min, length_tol, gap_tol,
             "rtk_fixed_pct": (round(pct, 1) if pct is not None else None),
             "duration_s": (round(duration, 2) if duration is not None else None),
             "motion_s": (round(motion_s, 2) if motion_s is not None else None),
+            "run_window_s": (round(run_window_s, 2)
+                             if run_window_s is not None else None),
             "sidecar_pass": sidecar_pass, "verdict_mismatch": mismatch}
 
 
@@ -263,8 +274,14 @@ def main(argv=None):
                     help="min RTK-FIXED %% of window (default: yaml gating)")
     ap.add_argument("--no-rtk-gate", action="store_true",
                     help="skip RTK checks (GPS-denied venues, e.g. basement)")
+    ap.add_argument("--paper-run-ids", default=None,
+                    help="comma-separated run_id allowlist; non-paper legs "
+                         "(smoke/manual/etc.) are kept out of usable_legs.json")
     ap.add_argument("--out-dir", default=None)
     args = ap.parse_args(argv)
+
+    allowlist = ([s.strip() for s in args.paper_run_ids.split(",") if s.strip()]
+                 if args.paper_run_ids else None)
 
     out_dir = args.out_dir or os.path.join(args.bag_root, "_manifest")
     os.makedirs(out_dir, exist_ok=True)
@@ -273,8 +290,19 @@ def main(argv=None):
     if os.path.isfile(args.experiment):
         expected, reps, doc = mf.load_experiment(args.experiment)
     target_n = args.target_n if args.target_n is not None else (reps or 1)
+    target_n_source = ("cli" if args.target_n is not None
+                       else ("yaml" if reps else "default"))
     rtk_pct_min = (args.rtk_pct_min if args.rtk_pct_min is not None
                    else float((doc.get("gating", {}) or {}).get("rtk_run_window_pct", 95)))
+
+    # Provenance of the gating config: a field-swapped experiment.yaml (e.g.
+    # repetitions:1 left in the tree, rooftop 2026-06-12) silently shrinks the
+    # rerun queue so a half-done matrix looks finished. Record exactly what was
+    # used, and warn loudly if N is below paper scale.
+    exp_sha = None
+    if os.path.isfile(args.experiment):
+        with open(args.experiment, "rb") as f:
+            exp_sha = hashlib.sha256(f.read()).hexdigest()[:12]
 
     legs = mf.discover_legs(args.bag_root)
     rows = []
@@ -293,37 +321,61 @@ def main(argv=None):
                 target_len_v = p.total_length / float(v)
             except Exception:
                 target_len_v = None
-        rows.append(qc_leg(leg, target_len_v, rtk_pct_min,
-                           args.length_tol, args.gap_tol,
-                           no_rtk_gate=args.no_rtk_gate))
+        row = qc_leg(leg, target_len_v, rtk_pct_min,
+                     args.length_tol, args.gap_tol,
+                     no_rtk_gate=args.no_rtk_gate)
+        is_paper, prov = mf.leg_provenance(sc.get("run_id"), allowlist)
+        row["is_paper"] = is_paper
+        row["provenance"] = prov
+        rows.append(row)
 
-    queue, usable_per_cell = rerun_queue(rows, expected, target_n)
+    # Only paper-provenance legs count toward the matrix / rerun queue: a smoke
+    # or manual leg at the same nominal cell would otherwise shrink the queue
+    # and pool into paper stats downstream.
+    paper_rows = [r for r in rows if r["is_paper"]]
+    queue, usable_per_cell = rerun_queue(paper_rows, expected, target_n)
 
     qc_csv = os.path.join(out_dir, "qc.csv")
-    cols = ["run_id", "cell_id", "leg", "controller", "v_const", "radius_m",
-            "path_family", "usable", "reasons", "rtk_fixed_pct", "duration_s",
-            "motion_s", "sidecar_pass", "verdict_mismatch", "bag_dir"]
+    cols = ["is_paper", "provenance", "run_id", "cell_id", "leg", "controller",
+            "v_const", "radius_m", "path_family", "usable", "reasons",
+            "rtk_fixed_pct", "duration_s", "motion_s", "run_window_s",
+            "sidecar_pass", "verdict_mismatch", "bag_dir"]
     with open(qc_csv, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=cols, extrasaction="ignore")
         w.writeheader()
         for r in rows:
             w.writerow(r)
 
-    usable_list = [r["bag_dir"] for r in rows if r["usable"]]
+    usable_list = [r["bag_dir"] for r in rows if r["usable"] and r["is_paper"]]
     with open(os.path.join(out_dir, "usable_legs.json"), "w", encoding="utf-8") as f:
         json.dump(usable_list, f, indent=2)
         f.write("\n")
     rerun_path = os.path.join(out_dir, "rerun_queue.json")
     with open(rerun_path, "w", encoding="utf-8") as f:
-        json.dump({"target_n": target_n, "rtk_pct_min": rtk_pct_min,
+        json.dump({"target_n": target_n,
+                   "target_n_source": target_n_source,
+                   "experiment_yaml": os.path.abspath(args.experiment),
+                   "experiment_sha256_12": exp_sha,
+                   "repetitions_in_yaml": reps,
+                   "rtk_pct_min": rtk_pct_min,
                    "cells": queue}, f, indent=2)
         f.write("\n")
 
-    n_usable = sum(1 for r in rows if r["usable"])
+    n_usable = sum(1 for r in rows if r["usable"] and r["is_paper"])
+    n_non_paper = sum(1 for r in rows if not r["is_paper"])
     n_mismatch = sum(1 for r in rows if r["verdict_mismatch"])
-    print(f"[qc] {n_usable}/{len(rows)} legs usable; wrote {qc_csv}")
+    print(f"[qc] {n_usable}/{len(rows)} legs usable (paper); wrote {qc_csv}")
+    if n_non_paper:
+        print(f"[qc] {n_non_paper} non-paper leg(s) (smoke/manual/etc.) "
+              "excluded from the usable set")
     print(f"[qc] rerun queue: {len(queue)} cells under N={target_n} "
           f"(wrote {rerun_path})")
+    if target_n < 10:
+        print(f"[qc] *** WARNING: target N={target_n} (from {target_n_source}, "
+              f"experiment.yaml repetitions={reps}, sha={exp_sha}) is below the "
+              "paper's N=10 — the rerun queue may understate remaining work. "
+              "Check that experiment.yaml is not a field-swapped test config. ***",
+              file=sys.stderr)
     if n_mismatch:
         print(f"[qc] WARNING: {n_mismatch} legs disagree with the live sidecar verdict")
     return 0

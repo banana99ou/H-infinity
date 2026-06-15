@@ -75,6 +75,9 @@ def discover_legs(bag_root):
     bag_root = os.path.abspath(bag_root)
     legs = []
     for dirpath, dirnames, filenames in os.walk(bag_root):
+        # Never descend into VCS / hidden dirs (e.g. the stray .git the artifact
+        # sync creates inside the bag-root) — wasted walk, and not recordings.
+        dirnames[:] = [d for d in dirnames if d != ".git" and not d.startswith(".")]
         if "metadata.yaml" in filenames:
             dirnames[:] = []  # do not descend into a bag dir
             sc_path = find_sidecar(dirpath)
@@ -89,6 +92,45 @@ def discover_legs(bag_root):
                          "sidecar": sc})
     legs.sort(key=lambda r: r["bag_dir"])
     return legs
+
+
+def discover_dropped(bag_root, legs):
+    """Inputs that look like recordings but are NOT ingested as usable legs.
+
+    Without this, two failure classes vanish silently:
+      * a dir holding a ``*.db3``/``*.mcap``/``*.bag`` but no ``metadata.yaml``
+        (recorder crashed / never finalized) — never even discovered;
+      * a discovered leg with no paired sidecar — present in manifest.csv but
+        dropped from every cell (no cell_params), so it disappears from
+        completeness/usable counts with no trace.
+
+    Returns a list of {path (relative to bag_root), reason}. ``path`` is
+    relative so the list is stable across machines.
+    """
+    bag_root = os.path.abspath(bag_root)
+    leg_dirs = {leg["bag_dir"] for leg in legs}
+    dropped = []
+    for dirpath, dirnames, filenames in os.walk(bag_root):
+        dirnames[:] = [d for d in dirnames if d != ".git" and not d.startswith(".")]
+        if "metadata.yaml" in filenames:
+            dirnames[:] = []  # a discovered leg dir — handled below via `legs`
+            continue
+        has_recording = any(
+            fn.endswith((".db3", ".mcap", ".bag")) for fn in filenames)
+        if has_recording:
+            dropped.append({
+                "path": os.path.relpath(dirpath, bag_root),
+                "reason": "recording without metadata.yaml "
+                          "(unfinalized / crashed recorder)",
+            })
+    for leg in legs:
+        if leg["sidecar"] is None:
+            dropped.append({
+                "path": os.path.relpath(leg["bag_dir"], bag_root),
+                "reason": "no sidecar (cannot derive cell; excluded from cells)",
+            })
+    dropped.sort(key=lambda d: d["path"])
+    return dropped
 
 
 def topics_in_bag(bag_dir):
@@ -171,6 +213,35 @@ def quick_gate(bag_dir):
             "duration_s": round(duration_s, 3)}
 
 
+# run_id substrings that mark a NON-paper run (shakedown / smoke / manual
+# teleop / ad-hoc test). Matched case-insensitively against the sidecar run_id.
+# Provenance matters because cells key only on (controller,v,family,R): a smoke
+# leg at the same nominal cell would otherwise pool into and corrupt paper stats
+# (the 2026-06-08 smoke leg passes QC today).
+NON_PAPER_RUN_PATTERNS = ("smoke", "manual", "shakedown", "test")
+
+
+def leg_provenance(run_id, allowlist=None,
+                   exclude_patterns=NON_PAPER_RUN_PATTERNS):
+    """Classify a leg's run_id. Returns (is_paper: bool, reason: str).
+
+    If ``allowlist`` is non-empty, a run_id MUST be in it to count as paper
+    (the strict mode for a finalized dataset). Otherwise any run_id that does
+    not match an exclude pattern counts (the permissive default mid-campaign,
+    where paper run_ids vary by session — e.g. ``rooftop_0612_fri``).
+    """
+    if run_id is None:
+        return False, "no_run_id"
+    rid = str(run_id)
+    low = rid.lower()
+    for pat in exclude_patterns:
+        if pat in low:
+            return False, f"non_paper_run_id(*{pat}*)"
+    if allowlist:
+        return (True, "allowlisted") if rid in allowlist else (False, "not_in_allowlist")
+    return True, "ok"
+
+
 def cell_key(cell_params):
     """Canonical per-cell grouping key (controller, v_const, path_family, R)."""
     if not cell_params:
@@ -213,7 +284,7 @@ def load_experiment(path):
     return expected, reps, doc
 
 
-def build_rows(legs):
+def build_rows(legs, allowlist=None):
     rows = []
     for leg in legs:
         sc = leg["sidecar"] or {}
@@ -223,7 +294,10 @@ def build_rows(legs):
         cls = sc.get("classification") or {}
         rtk = sc.get("rtk_summary") or {}
         wc = sc.get("wallclock") or {}
+        is_paper, prov_reason = leg_provenance(sc.get("run_id"), allowlist)
         rows.append({
+            "is_paper": is_paper,
+            "provenance": prov_reason,
             "run_id": sc.get("run_id"),
             "cell_id": sc.get("cell_id"),
             "leg": sc.get("leg"),
@@ -246,14 +320,25 @@ def build_rows(legs):
 
 
 def completeness(rows, expected_cells, target_n):
-    """Present-vs-expected cell inventory. Counts legs (pooled over direction)."""
+    """Present-vs-expected cell inventory. Counts legs (pooled over direction).
+
+    Only paper-provenance legs (``is_paper``) count toward a cell. A cell whose
+    paper legs span >1 run_id is flagged ``cross_session`` — different sessions
+    can be different venues/anchors (e.g. pedestrian-road ``rooftop`` vs actual
+    ``rooftop_0612_fri``, pins 2.82 m apart), so pooling them mixes frames; the
+    inventory warns rather than silently averaging.
+    """
     present = defaultdict(int)
+    run_ids_by_cell = defaultdict(set)
     for r in rows:
+        if not r.get("is_paper", True):
+            continue
         key = cell_key({
             "controller": r["controller"], "v_const": r["v_const"],
             "path_family": r["path_family"], "radius_m": r["radius_m"]})
         if key is not None:
             present[key] += 1
+            run_ids_by_cell[key].add(r.get("run_id"))
 
     cells = []
     for key in sorted(expected_cells, key=lambda k: tuple(str(x) for x in k)):
@@ -267,6 +352,11 @@ def completeness(rows, expected_cells, target_n):
         })
     # cells present in data but not in the expected matrix
     unexpected = [list(k) for k in present if k not in expected_cells]
+    # cells pooling legs from >1 run_id (cross-session frame-mixing hazard)
+    cross_session = [
+        {"cell": list(k), "run_ids": sorted(str(r) for r in v)}
+        for k, v in run_ids_by_cell.items() if len(v) > 1
+    ]
     return {
         "target_n_legs_per_cell": target_n,
         "n_expected_cells": len(expected_cells),
@@ -275,13 +365,14 @@ def completeness(rows, expected_cells, target_n):
         "n_under_target_cells": sum(1 for c in cells if c["under_target"]),
         "cells": cells,
         "unexpected_cells": unexpected,
+        "cross_session_cells": cross_session,
     }
 
 
 def write_csv(rows, path):
-    cols = ["run_id", "cell_id", "leg", "controller", "v_const", "radius_m",
-            "path_family", "rep", "venue", "sidecar_pass", "rtk_fixed_pct",
-            "duration_s", "required_topics_ok", "missing_topics",
+    cols = ["is_paper", "provenance", "run_id", "cell_id", "leg", "controller",
+            "v_const", "radius_m", "path_family", "rep", "venue", "sidecar_pass",
+            "rtk_fixed_pct", "duration_s", "required_topics_ok", "missing_topics",
             "has_sidecar", "bag_dir", "sidecar_path"]
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     with open(path, "w", newline="", encoding="utf-8") as f:
@@ -300,13 +391,20 @@ def main(argv=None):
                     help="target usable legs per cell (default: yaml repetitions)")
     ap.add_argument("--out-dir", default=None,
                     help="output dir (default: <bag_root>/_manifest)")
+    ap.add_argument("--paper-run-ids", default=None,
+                    help="comma-separated run_id allowlist; only these count as "
+                         "paper data (default: permissive — exclude *smoke*/"
+                         "*manual*/*shakedown*/*test* only)")
     args = ap.parse_args(argv)
 
     out_dir = args.out_dir or os.path.join(args.bag_root, "_manifest")
     os.makedirs(out_dir, exist_ok=True)
 
+    allowlist = ([s.strip() for s in args.paper_run_ids.split(",") if s.strip()]
+                 if args.paper_run_ids else None)
+
     legs = discover_legs(args.bag_root)
-    rows = build_rows(legs)
+    rows = build_rows(legs, allowlist=allowlist)
 
     expected, reps, _doc = (set(), 0, {})
     if os.path.isfile(args.experiment):
@@ -314,6 +412,7 @@ def main(argv=None):
     target_n = args.target_n if args.target_n is not None else (reps or 1)
 
     comp = completeness(rows, expected, target_n)
+    comp["dropped_inputs"] = discover_dropped(args.bag_root, legs)
 
     manifest_csv = os.path.join(out_dir, "manifest.csv")
     completeness_json = os.path.join(out_dir, "completeness.json")
@@ -331,6 +430,22 @@ def main(argv=None):
         print(f"[manifest] WARNING: {n_no_sidecar} legs have no sidecar")
     if n_bad_topics:
         print(f"[manifest] WARNING: {n_bad_topics} legs missing required topics")
+    dropped = comp["dropped_inputs"]
+    if dropped:
+        print(f"[manifest] WARNING: {len(dropped)} dropped input(s) "
+              "(would otherwise vanish silently):", file=sys.stderr)
+        for d in dropped:
+            print(f"[manifest]   - {d['path']}: {d['reason']}", file=sys.stderr)
+    n_non_paper = sum(1 for r in rows if not r["is_paper"])
+    if n_non_paper:
+        print(f"[manifest] {n_non_paper} leg(s) excluded as non-paper provenance "
+              "(smoke/manual/etc.) — not counted toward cells")
+    if comp["cross_session_cells"]:
+        print(f"[manifest] WARNING: {len(comp['cross_session_cells'])} cell(s) "
+              "pool legs from >1 run_id (cross-session frame-mixing hazard):",
+              file=sys.stderr)
+        for c in comp["cross_session_cells"]:
+            print(f"[manifest]   - {c['cell']}: {c['run_ids']}", file=sys.stderr)
     print(f"[manifest] cells: {comp['n_cells_with_data']}/{comp['n_expected_cells']} "
           f"with data, {comp['n_missing_cells']} missing, "
           f"{comp['n_under_target_cells']} under target N={target_n}")

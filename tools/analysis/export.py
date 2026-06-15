@@ -64,35 +64,47 @@ def _safe(s):
 
 
 def _leg_tag(sidecar, bag_dir):
-    run_id = (sidecar or {}).get("run_id") or "run"
-    cell_id = (sidecar or {}).get("cell_id") or os.path.basename(bag_dir)
-    leg = (sidecar or {}).get("leg") or "leg"
-    return f"{_safe(run_id)}__{_safe(cell_id)}__{_safe(leg)}"
+    # The bag-dir basename (e.g. 26_0612_1746_..._leg_1) is the SAME tag
+    # build_dataset uses for <tag>.metrics.json, so metrics <-> per-sample tables
+    # join on it directly. It embeds the recording timestamp, so two scored
+    # attempts of the same cell/rep land in distinct files (no silent overwrite);
+    # identity columns inside each table still carry run_id/cell_id/leg for
+    # joining to the cell-level data.
+    return _safe(os.path.basename(bag_dir.rstrip("/")))
 
 
 def write_table(columns, out_base):
-    """Write a dict[str->1d array] as Parquet (preferred) or CSV. Returns path."""
+    """Write a dict[str->1d array] as Parquet (preferred) or CSV. Returns path.
+
+    Every column is one value per recorded sample, so all columns MUST be the
+    same length. A mismatch is an upstream bug (a column built at the wrong
+    rate); raise rather than pad with ``np.resize``, which fabricates samples by
+    cyclic repetition. Callers isolate the failure per table.
+    """
     if not columns:
         return None
-    n = max(len(v) for v in columns.values())
-    cols = {}
-    for k, v in columns.items():
-        arr = np.asarray(v)
-        if len(arr) != n:  # broadcast scalars / pad
-            arr = np.resize(arr, n)
-        cols[k] = arr
+    lengths = {k: len(np.asarray(v)) for k, v in columns.items()}
+    n = max(lengths.values())
+    ragged = {k: L for k, L in lengths.items() if L != n}
+    if ragged:
+        raise ValueError(
+            f"ragged per-sample table (expected {n} rows): {ragged}; refusing "
+            "to pad (np.resize would fabricate samples by cyclic repetition)")
+    cols = {k: np.asarray(v) for k, v in columns.items()}
     if _HAVE_PARQUET:
         path = out_base + ".parquet"
         table = pa.table({k: pa.array(v) for k, v in cols.items()})
         pq.write_table(table, path)
         return path
-    # CSV fallback
+    # CSV fallback — use the csv module for correct quoting/escaping.
+    import csv as _csv
     path = out_base + ".csv"
     keys = list(cols.keys())
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(",".join(keys) + "\n")
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = _csv.writer(f)
+        w.writerow(keys)
         for i in range(n):
-            f.write(",".join(repr(float(cols[k][i])) if isinstance(cols[k][i], (int, float, np.floating, np.integer)) else str(cols[k][i]) for k in keys) + "\n")
+            w.writerow([cols[k][i] for k in keys])
     return path
 
 
@@ -125,25 +137,25 @@ def export_leg(leg, ps_dir, gnss_dir):
         return {"bag_dir": bag_dir, "tag": tag, "error": str(exc),
                 "written": written}
 
-    # 1) per-sample local-frame tables (odom + rtk)
-    if frame.get("odom"):
-        written["odom"] = write_table(
-            _keyed(frame["odom"], run_id, cell_id, legname),
-            os.path.join(ps_dir, f"{tag}__odom"))
-    if frame.get("rtk"):
-        written["rtk"] = write_table(
-            _keyed(frame["rtk"], run_id, cell_id, legname),
-            os.path.join(ps_dir, f"{tag}__rtk"))
+    def _w(name, sub, out_dir):
+        # Isolate each table: a ragged column (write_table raises) records the
+        # error for this table and continues, rather than aborting the leg/build.
+        if not frame.get(sub):
+            return
+        try:
+            written[name] = write_table(
+                _keyed(frame[sub], run_id, cell_id, legname),
+                os.path.join(out_dir, f"{tag}__{name}"))
+        except Exception as exc:
+            written[name] = {"error": str(exc)}
+            print(f"[export] {tag} {name}: {exc}")
 
+    # 1) per-sample local-frame tables (odom + rtk)
+    _w("odom", "odom", ps_dir)
+    _w("rtk", "rtk", ps_dir)
     # 2) GNSS lat/lon product (RAW, separate) — RTK + regular GPS
-    if frame.get("gnss_rtk"):
-        written["gnss_rtk"] = write_table(
-            _keyed(frame["gnss_rtk"], run_id, cell_id, legname),
-            os.path.join(gnss_dir, f"{tag}__gnss_rtk"))
-    if frame.get("gnss_pix"):
-        written["gnss_pix"] = write_table(
-            _keyed(frame["gnss_pix"], run_id, cell_id, legname),
-            os.path.join(gnss_dir, f"{tag}__gnss_pix"))
+    _w("gnss_rtk", "gnss_rtk", gnss_dir)
+    _w("gnss_pix", "gnss_pix", gnss_dir)
 
     return {
         "bag_dir": bag_dir, "tag": tag, "run_id": run_id, "cell_id": cell_id,
@@ -182,8 +194,17 @@ analytic reference rebuilt from the leg's recipe.
 
 ## extracted/per_sample/<leg>__rtk.(parquet|csv)
 Same columns plus lat/lon, but the trajectory is RTK ground truth (FIXED-only),
-projected to the venue-local frame. This is the "truth" half of the ADR-01
-belief-vs-truth comparison.
+projected to the per-leg path frame (origin = operator start pin, +x = pin
+heading). This is the "truth" half of the ADR-01 belief-vs-truth comparison.
+
+- `yaw` is the **body heading from `/heading/fused`** (heading_node EKF),
+  resampled onto the RTK fix times — not the differenced course-over-ground
+  (which is used only as a fallback when fused is absent). See the heading caveat
+  below.
+- `t` is **seconds since the run-window start** (the same origin as the
+  `__odom` table, so the two streams share one clock); it is negative over the
+  pre-path idle head, which is retained here (this layer is lossless — the
+  windowed clip applies only to the scored metrics).
 
 ## extracted/gnss/<leg>__gnss_rtk.(parquet|csv)  — RAW, for the GNSS paper
 RTK fix in **native lat/lon, untouched** (never projected/filtered). `is_fixed`
@@ -200,6 +221,37 @@ is 1 where rtk_status quality==4, 0 otherwise, -1 if rtk_status was absent.
 ## extracted/gnss/<leg>__gnss_pix.(parquet|csv)  — regular GPS (L5)
 Pixhawk/MAVROS GPS in native lat/lon (run-along data for the professor's
 separate dataset; no role in the path-following paper).
+
+## Methods caveat — heading independence (read once; lives ONLY here)
+
+Each error metric is reported on two channels (ADR-01):
+
+- **odom-belief** — the trajectory as the controller saw it (wheel odom). This is
+  the **headline** channel: max heading error vs turn radius R is computed from
+  the controller's own tracked state, exactly as the simulation computes it from
+  the simulated pose. Both PID and LPV-Hinf run on the same odom/gyro, so it is a
+  fair, sim-comparable PID-vs-Hinf comparison. It needs **no** RTK frame (odom is
+  already anchored at the path origin) — only the run-window clip.
+- **RTK-truth** — an independent reality check.
+  - **Position** (`e_d`, cross-track) is a genuine independent truth: the RTK fix
+    is ~1-2 cm, unrelated to wheel odom, so it confirms odom did not drift. The
+    trajectory is anchored on the operator's **start pin**; the residual `e_d`
+    (a ~0.1 m floor on the R=1.0 legs) is **real** — driven-vs-commanded radius
+    mismatch, not a frame artifact — and is reported as such.
+  - **Heading** uses `/heading/fused` (heading_node EKF) as the body-heading
+    reference. It is dense and standstill-stable (far better than differenced
+    course-over-ground), **but it fuses the same LIMO chassis gyro that wheel
+    odom uses** — so it is a good-enough heading *reference*, NOT a fully
+    independent witness of odom heading. The RTK *heading* cross-check is
+    therefore **secondary/caveated** and degrades under sideslip at small R; the
+    RTK *position* cross-check remains fully independent. A fully independent
+    body-heading truth would need OptiTrack / a total station (deferred
+    hardware). Working assumption: fused heading is accepted as good-enough once
+    this caveat is surfaced; if rejected, fall back to the course-over-ground
+    cross-check.
+
+This caveat is recorded **once, here** — it is deliberately NOT duplicated into
+the per-leg metrics JSONs, the cell CSVs, or the figures.
 """
 
 

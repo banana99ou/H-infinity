@@ -51,6 +51,7 @@ Twist = TS.types["geometry_msgs/msg/Twist"]
 String = TS.types["std_msgs/msg/String"]
 Bool = TS.types["std_msgs/msg/Bool"]
 Float32 = TS.types["std_msgs/msg/Float32"]
+Float64 = TS.types["std_msgs/msg/Float64"]
 Float32MultiArray = TS.types["std_msgs/msg/Float32MultiArray"]
 MultiArrayLayout = TS.types["std_msgs/msg/MultiArrayLayout"]
 Header = TS.types["std_msgs/msg/Header"]
@@ -175,6 +176,7 @@ def make(out_dir, rtk_bad=False, controller="lpv-hinf", R=0.5, v=0.5,
         c_fix = add("/gps_rtk_f9p_helical/gps/fix", NavSatFix.__msgtype__)
         c_rtks = add("/gps_rtk_f9p_helical/gps/rtk_status", String.__msgtype__)
         c_pix = add("/pixhawk/global_position/raw/fix", NavSatFix.__msgtype__)
+        c_head = add("/heading/fused", Float64.__msgtype__)
         c_stat = add("/path_follower/status", Float32MultiArray.__msgtype__)
         c_tim = add("/path_follower/timing", Float32.__msgtype__)
         c_done = add("/path_follower/done", Bool.__msgtype__)
@@ -209,6 +211,15 @@ def make(out_dir, rtk_bad=False, controller="lpv-hinf", R=0.5, v=0.5,
             if c_odomz is not None:
                 w.write(c_odomz, tns, TS.serialize_cdr(_odom(t, ox, oy, oyaw, v),
                                                        Odometry.__msgtype__))
+            # /heading/fused: body heading as a compass bearing (deg E-of-N, CW+).
+            # Inverse of run_eval.rtk_heading_reference's map
+            # (yaw_vlocal = radians(bearing - fused_deg)) so it round-trips to the
+            # driven venue-local yaw — a clean on-path leg keeps RTK-truth e_psi ~0
+            # through the fused path, exactly as it did through course-over-ground.
+            if c_head is not None:
+                fused_deg = po.BEARING_DEG - math.degrees(oyaw)
+                w.write(c_head, tns, TS.serialize_cdr(
+                    Float64(data=float(fused_deg)), Float64.__msgtype__))
             # status telemetry (e_psi ~ 0 since on-path)
             if c_stat is not None:
                 w.write(c_stat, tns, TS.serialize_cdr(

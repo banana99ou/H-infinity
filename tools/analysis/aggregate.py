@@ -38,6 +38,11 @@ from collections import defaultdict
 
 import numpy as np
 
+_HERE = os.path.dirname(os.path.abspath(__file__))
+if _HERE not in sys.path:
+    sys.path.insert(0, _HERE)
+import manifest as mf  # noqa: E402  (provenance filter — leg_provenance)
+
 # Headless rendering (no display on the NUC / CI).
 import matplotlib
 matplotlib.use("Agg")
@@ -86,12 +91,21 @@ def load_records(metrics_dir, pattern, split):
             "Run run_eval.py on each leg first.")
 
     records = []
+    n_non_paper = 0
     for p in paths:
         try:
             with open(p, "r", encoding="utf-8") as f:
                 d = json.load(f)
         except Exception as exc:
             print(f"[aggregate] WARNING: skipping unreadable {p}: {exc}")
+            continue
+
+        # Safety net: even if a non-paper leg's metrics slipped through (e.g. a
+        # standalone aggregate over a hand-built metrics dir), keep smoke/manual
+        # runs out of the paper cells. The pipeline normally excludes them at qc.
+        is_paper, _reason = mf.leg_provenance(d.get("run_id"))
+        if not is_paper:
+            n_non_paper += 1
             continue
 
         tuning = d.get("controller_tuning", {}) or {}
@@ -124,6 +138,9 @@ def load_records(metrics_dir, pattern, split):
             "compute_cost": d.get("compute_cost"),
             "steering_effort": d.get("steering_effort"),
         })
+    if n_non_paper:
+        print(f"[aggregate] excluded {n_non_paper} non-paper metrics file(s) "
+              "(smoke/manual/etc.)")
     return records, paths
 
 
@@ -159,9 +176,9 @@ def aggregate_cells(records):
         summary = {"controller": controller, "v_const": v_const,
                    "path_family": path_family, "R": R, "n": len(ms),
                    "n_forward": sum(1 for r in rs if str(r["leg"]).lower() in
-                                    ("atob", "a_to_b", "forward")),
+                                    ("atob", "a_to_b", "forward", "leg_1")),
                    "n_return": sum(1 for r in rs if str(r["leg"]).lower() in
-                                   ("btoa", "b_to_a", "return"))}
+                                   ("btoa", "b_to_a", "return", "leg_2"))}
         for key in _METRIC_KEYS:
             vals = np.array([m[key] for m in ms
                              if m.get(key) is not None], dtype=float)
@@ -186,6 +203,40 @@ def slices_of(cells):
 def _slice_label(v_const, path_family):
     v = f"v{v_const:g}" if v_const is not None else "vNA"
     return f"{v}_{path_family or 'NA'}"
+
+
+def slice_coverage(scells, target_n):
+    """Coverage of one operating slice for an honest LPV-vs-PID headline (E1).
+
+    The headline figure (max heading error vs R, both controllers) is only
+    meaningful when (a) >= 2 turn radii are present for BOTH controllers, so the
+    curves can actually be compared across R, and (b) every plotted cell has
+    reached the target N reps (so the error bars are real, not n=1 points). When
+    either fails we skip the figure rather than draw a misleading one from
+    insufficient data — mid-campaign this is the normal state, not an error.
+
+    Returns ``{sufficient, shared_R_across_both_controllers, under_N_cells,
+    reason}``.
+    """
+    by_ctrl_R = defaultdict(set)
+    for c in scells:
+        if c["R"] is not None and c.get("max_e_psi_deg_mean") is not None:
+            by_ctrl_R[c["controller"]].add(c["R"])
+    shared = sorted(set(by_ctrl_R.get("LPV", set())) & set(by_ctrl_R.get("PID", set())))
+    under_n = [{"controller": c["controller"], "R": c["R"], "n": c["n"]}
+               for c in scells if (c["n"] or 0) < target_n]
+    reasons = []
+    if len(shared) < 2:
+        reasons.append(
+            f"<2 turn radii shared across both controllers (have {len(shared)})")
+    if under_n:
+        reasons.append(f"{len(under_n)} cell(s) under target N={target_n}")
+    return {
+        "sufficient": not reasons,
+        "shared_R_across_both_controllers": shared,
+        "under_N_cells": under_n,
+        "reason": "; ".join(reasons) if reasons else "ok",
+    }
 
 
 # =============================================================================
@@ -265,8 +316,11 @@ def curvature_tolerance_index(cells, tol_deg=10.0):
             if e <= tol_deg:
                 cti = max(cti, 1.0 / R)
                 passing.append({"R": R, "kappa": 1.0 / R, "max_e_psi_deg": e})
-            else:
-                break  # first failure at increasing curvature stops the run
+            # E1: keep scanning sharper radii rather than break at the first
+            # failure. CTI is now "the sharpest radius that passes anywhere"
+            # (best passing curvature), not "the curvature at first failure"
+            # (profile flatness). Documented spec drift, intended for the future
+            # full-R sweep where a non-monotonic profile is possible.
         out[ctrl] = {"cti_kappa": cti, "tol_deg": tol_deg,
                      "passing_cells": passing}
     return out
@@ -388,6 +442,10 @@ def main(argv=None):
                     help="which metrics split to aggregate (default rtk_truth)")
     ap.add_argument("--cti-tol-deg", type=float, default=10.0,
                     help="max-heading-error tolerance for the CTI [deg]")
+    ap.add_argument("--target-n", type=int, default=10,
+                    help="target reps/cell for the coverage gate (E1); a slice "
+                         "with <2 shared R across both controllers or any cell "
+                         "under N gets no headline figure (default: paper N=10)")
     ap.add_argument("--wilcoxon-metric", default="max_e_psi_deg",
                     help="metric for the LPV-vs-PID Wilcoxon test")
     ap.add_argument("--out-dir", default=None,
@@ -408,21 +466,33 @@ def main(argv=None):
     # Per operating slice (v_const, path_family): headline + CTI + Wilcoxon,
     # since each is a single-slice claim (mixing speeds/families is meaningless).
     slice_results = {}
+    insufficient_coverage = []
     for (v_const, path_family) in slices_of(cells):
         label = _slice_label(v_const, path_family)
         scells = [c for c in cells
                   if c["v_const"] == v_const and c["path_family"] == path_family]
         srecs = [r for r in records
                  if r["v_const"] == v_const and r["path_family"] == path_family]
-        headline = plot_headline(
-            scells, os.path.join(out_dir, f"headline_{label}.png"),
-            args.split, title_suffix=f", {label}")
+        # E1: only draw the headline when coverage supports it; otherwise record
+        # WHY and skip the figure (no misleading file). stats.json is still
+        # written and we still return 0 — build_dataset ignores our return.
+        cov = slice_coverage(scells, args.target_n)
+        if cov["sufficient"]:
+            headline = plot_headline(
+                scells, os.path.join(out_dir, f"headline_{label}.png"),
+                args.split, title_suffix=f", {label}")
+        else:
+            headline = None
+            insufficient_coverage.append({"slice": label, **cov})
+            print(f"[aggregate] {label}: headline figure SKIPPED "
+                  f"(insufficient coverage — {cov['reason']})")
         cti = curvature_tolerance_index(scells, tol_deg=args.cti_tol_deg)
         cti_png = plot_cti(cti, os.path.join(out_dir, f"cti_{label}.png"))
         wilcox = wilcoxon_lpv_vs_pid(srecs, metric=args.wilcoxon_metric)
         slice_results[label] = {
             "v_const": v_const, "path_family": path_family,
             "n_cells": len(scells),
+            "coverage": cov,
             "wilcoxon_lpv_vs_pid": wilcox,
             "curvature_tolerance_index": cti,
             "figures": {"headline": headline, "cti": cti_png},
@@ -439,6 +509,8 @@ def main(argv=None):
         "split": args.split,
         "n_legs": len(records),
         "n_cells": len(cells),
+        "target_n": args.target_n,
+        "insufficient_coverage": insufficient_coverage,
         "cells": cells,
         "slices": slice_results,
         "compute_cost_figure": cost_png,
@@ -449,6 +521,10 @@ def main(argv=None):
         f.write("\n")
     print(f"[aggregate] wrote {summary_path} + cell_summary.csv "
           f"({len(cells)} cells, {len(slice_results)} slices)")
+    if insufficient_coverage:
+        print(f"[aggregate] {len(insufficient_coverage)} slice(s) had "
+              "insufficient coverage; headline figure(s) skipped (see "
+              "stats.json insufficient_coverage)")
     return 0
 
 

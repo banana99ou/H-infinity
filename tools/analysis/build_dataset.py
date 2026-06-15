@@ -53,6 +53,9 @@ def main(argv=None):
     ap.add_argument("--no-rtk-gate", action="store_true",
                     help="GPS-denied venue (e.g. basement): skip qc RTK gate "
                          "and aggregate the odom_belief split")
+    ap.add_argument("--paper-run-ids", default=None,
+                    help="comma-separated run_id allowlist (forwarded to "
+                         "manifest + qc); only these count as paper data")
     args = ap.parse_args(argv)
 
     # GPS-denied venues have no RTK-truth; fall back to the odom-belief split.
@@ -79,6 +82,8 @@ def main(argv=None):
     common = ["--experiment", args.experiment]
     if args.target_n is not None:
         common += ["--target-n", str(args.target_n)]
+    if args.paper_run_ids:
+        common += ["--paper-run-ids", args.paper_run_ids]
 
     # ---- Stage 1: manifest ----------------------------------------------
     print("== manifest ==")
@@ -95,27 +100,65 @@ def main(argv=None):
     print("== run_eval (usable legs) ==")
     with open(os.path.join(derived, "usable_legs.json"), encoding="utf-8") as f:
         usable = json.load(f)
+
+    # Idempotency: prune metrics for legs no longer in the usable set. Without
+    # this, a leg that drops out (gate change, sidecar fix, deleted bag, smoke
+    # leg now excluded) leaves a stale <leg>.metrics.json that aggregate globs
+    # forever — silently averaged into cell stats. Re-run on usable legs below
+    # overwrites the rest, so the store ends up exactly the current usable set.
+    expected_metrics = {
+        os.path.basename(b.rstrip("/")) + ".metrics.json" for b in usable}
+    pruned = 0
+    for fn in os.listdir(metrics_dir):
+        if fn.endswith(".metrics.json") and fn not in expected_metrics:
+            os.remove(os.path.join(metrics_dir, fn))
+            pruned += 1
+    if pruned:
+        print(f"[build] pruned {pruned} stale metrics file(s) "
+              "(legs no longer usable)")
+
     n_ok = 0
+    failed = []
     for bag_dir in usable:
         tag = os.path.basename(bag_dir.rstrip("/"))
         out_metrics = os.path.join(metrics_dir, f"{tag}.metrics.json")
         try:
             run_eval.main([bag_dir, "--out", out_metrics])
             n_ok += 1
-        except SystemExit as exc:
-            print(f"[build] run_eval failed on {bag_dir}: {exc}")
-    print(f"[build] evaluated {n_ok}/{len(usable)} usable legs")
+        except (SystemExit, Exception) as exc:
+            # One bad leg must not abort the whole build: run_eval raises
+            # SystemExit (unreadable bag / missing sidecar) AND ValueError
+            # (malformed path_recipe, build_path_from_recipe) — the latter was
+            # uncaught and crashed Stage 4. KeyboardInterrupt is neither, so
+            # Ctrl-C still propagates and stops the run.
+            failed.append({"bag_dir": bag_dir, "error": repr(exc)})
+            print(f"[build] run_eval FAILED on {bag_dir}: {exc}")
+    print(f"[build] evaluated {n_ok}/{len(usable)} usable legs"
+          + (f"; {len(failed)} FAILED (see above)" if failed else ""))
 
     # ---- Stage 5/6: aggregate (cells + stats + figures) -----------------
     print("== aggregate ==")
     if n_ok:
-        agg.main([metrics_dir, "--glob", "*.metrics.json",
-                  "--split", args.split, "--out-dir", derived])
+        agg_args = [metrics_dir, "--glob", "*.metrics.json",
+                    "--split", args.split, "--out-dir", derived]
+        if args.target_n is not None:
+            agg_args += ["--target-n", str(args.target_n)]
+        agg.main(agg_args)
     else:
         print("[build] no metrics to aggregate (no usable legs yet)")
 
     # ---- Stage 7: export per-sample + GNSS product ----------------------
     print("== export ==")
+    # Idempotency: the per-sample / gnss tables are fully regenerated for the
+    # current usable set, so clear them first — otherwise tables from legs that
+    # dropped out of the usable set survive while dataset_manifest.json lists
+    # only the current ones (manifest and tables diverge).
+    import shutil
+    extracted = os.path.join(out, "extracted")
+    for sub in ("per_sample", "gnss"):
+        d = os.path.join(extracted, sub)
+        if os.path.isdir(d):
+            shutil.rmtree(d)
     exp.main([bag_root, "--out", out, "--usable-only", "--manifest-dir", derived])
 
     print(f"\n[build] dataset ready at {out}")

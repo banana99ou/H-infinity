@@ -217,15 +217,43 @@ def test_exclusion_is_respected():
         assert ok, f"{st['name']} violates exclusion:\n{report}"
 
 
-def test_unfittable_reported_not_silent():
-    # A 6x6 m postage stamp cannot host a step R1.0 with 1.1 m clearance:
-    # the planner must say so, not shrink R.
+def test_unfittable_surfaced_not_silent():
+    # A 6x6 m postage stamp cannot host a step R1.0 with 1.1 m clearance.
+    # The planner must SURFACE that — as a needs_fix best-effort stage the
+    # operator drags in, or in unfittable — never silently shrink R or drop
+    # the geometry, and the plan is not "ok" until it is fixed.
     tiny = {"name": "tiny", "safety_margin_m": 0.5,
             "corners_wgs84": [_ll(0, 0), _ll(6, 0), _ll(6, 6), _ll(0, 6)]}
     plan = ep.plan_stages(tiny, _doc(), {}, FOOT, TRACK)
-    assert plan["unfittable"], "tiny venue should defeat at least one geometry"
+    fix_stages = [st for st in plan["stages"] if st.get("needs_fix")]
+    assert fix_stages or plan["unfittable"], \
+        "tiny venue should defeat at least one geometry"
+    assert not plan["ok"], "best-effort/unfittable geometry => plan not ok"
+    for st in fix_stages:
+        assert st.get("fix_reason"), "best-effort stage must explain itself"
+        # Still a real, editable A/B pair: 2 experiments, 2 glues, valid pins.
+        assert len(st["glues"]) == len(st["experiments"]) >= 1
+        for e in st["experiments"]:
+            assert "lat" in e["start"] and "lon" in e["start"]
     for u in plan["unfittable"]:
         assert u["reason"]
+
+
+def test_best_effort_keeps_every_geometry_in_the_editor():
+    # No geometry may silently vanish on a cramped venue: every remaining
+    # (family, R) is still reachable in the editor — a clean stage, a
+    # needs_fix best-effort stage, or an unfittable note. (Drop = a 320-run
+    # matrix quietly becomes fewer.)
+    tiny = {"name": "tiny", "safety_margin_m": 0.5,
+            "corners_wgs84": [_ll(0, 0), _ll(6, 0), _ll(6, 6), _ll(0, 6)]}
+    plan = ep.plan_stages(tiny, _doc(), {}, FOOT, TRACK)
+    staged = {(g["family"], g["R"]) for st in plan["stages"]
+              for g in st["geometries"]}
+    unfit = {(u["family"], u["R"]) for u in plan["unfittable"]}
+    remaining = {(f, R) for (f, R, _n) in ep.remaining_geometries(_doc(), {})}
+    assert staged | unfit == remaining, "a geometry vanished from the plan"
+    assert any(st.get("needs_fix") for st in plan["stages"]), \
+        "a 6x6 venue should force at least one best-effort stage"
 
 
 def test_dubins_endpoint_verification():

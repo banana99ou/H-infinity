@@ -6,7 +6,9 @@ and a half-finished manifest. The planner must NEVER raise, must terminate,
 and must ACCOUNT for every remaining geometry: each one either appears in
 exactly one returned stage or is listed in ``unfittable`` with a reason —
 silent loss is how a 320-run matrix quietly becomes a 280-run paper.
-Every returned stage must also pass the loader's containment gate.
+Every CLEAN (non-needs_fix) stage must also pass the loader's containment
+gate; needs_fix best-effort stages are exempt by design (the operator drags
+them into spec in the WebUI).
 
 Run:  python3 tools/analysis/tests/test_experiment_planner_fuzz.py   (or pytest)
 """
@@ -145,6 +147,8 @@ def _check_containment_case(args):
     plan = ep.plan_stages(venue, _doc(), {}, FOOT, TRACK)
     failures, checked = [], 0
     for st in plan["stages"]:
+        if st.get("needs_fix"):
+            continue   # best-effort stages are exempt — the operator fixes them
         ok, report = venue_geom.check_legs_containment(
             _legs_from_stage(st, venue), venue, FOOT, TRACK)
         if not ok:

@@ -3893,6 +3893,10 @@ function lbApplyPlan(d) {
     // Inter-stage transit glue (planner-sampled waypoints, not editable):
     // carried verbatim into the Send payload; drawn dashed on the map.
     entry_glue: st.entry_glue || null,
+    // Best-effort stages: the planner could not auto-fit this geometry and
+    // seated a rough opposed pair for the operator to drag into spec.
+    needs_fix: !!st.needs_fix,
+    fix_reason: st.fix_reason || '',
   }));
   lbPlanMeta = { unfittable: d.unfittable || [], notes: d.notes || [] };
   $('lb-plan-apply').style.display = 'none';
@@ -3909,6 +3913,10 @@ function lbRenderPlanState(d) {
   const total = lbStages.reduce((s, st) => s + st.exps.length, 0);
   let html = `<span class="ok">plan: ${lbStages.length} stage(s), ${total} curve` +
     `${total === 1 ? '' : 's'}; the batch runs ALL stages unattended.</span>`;
+  const nFix = lbStages.filter(s => s.needs_fix).length;
+  if (nFix) html += `<br><span class="err">⚠ ${nFix} stage(s) auto-placed ` +
+    `BEST-EFFORT — drag the red curves/glue to green before Send ` +
+    `(the NUC rejects out-of-spec legs on load).</span>`;
   // Resume credit is keyed by VENUE NAME (= run_id in the sidecars): renaming
   // the venue between field days silently resets progress to 0. Surface it.
   if (d.counts_runs_done != null)
@@ -3926,7 +3934,7 @@ function lbRebuildStageSelect() {
   (lbStages || []).forEach((st, i) => {
     const o = document.createElement('option');
     o.value = i;
-    o.textContent = `${i + 1}/${lbStages.length}: ` +
+    o.textContent = `${st.needs_fix ? '⚠ ' : ''}${i + 1}/${lbStages.length}: ` +
       st.geometries.map(g => `${g.family} R${g.R}`).join(', ');
     sel.appendChild(o);
   });

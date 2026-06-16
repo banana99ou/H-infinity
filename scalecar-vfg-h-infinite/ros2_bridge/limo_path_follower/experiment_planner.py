@@ -19,8 +19,13 @@ Placement is a deterministic coarse-to-fine grid search (position x heading
 x direction); glue is a Bezier whose control mids force a straight,
 heading-aligned tail (the reposition tracker achieves arrival heading by
 geometry, not in-place rotation — see reposition_node). A geometry that fits
-nowhere is reported in ``unfittable`` with the reason: the matrix is locked
-spec, so the planner must fail loudly, never silently shrink an R.
+nowhere is NOT dropped (silent loss is how a 320-run matrix quietly becomes
+fewer): the planner seats a BEST-EFFORT opposed pair and flags the stage
+``needs_fix=True`` with a ``fix_reason`` so the operator drags it into spec in
+the WebUI — the NUC venue_loader re-validates on Send, so an out-of-spec leg
+never drives. ``ok`` is False while any stage needs_fix; the matrix is locked
+spec, so the planner still never silently shrinks an R. (Truly unbuildable
+recipes — bad family / vfg import — still land in ``unfittable``.)
 """
 import math
 
@@ -655,6 +660,46 @@ def _glue_out(glue_en, cfg, lat0, lon0):
 
 
 # ----------------------------------------------------------------------
+# Best-effort placement (field 2026-06-15): when a geometry cannot be
+# auto-placed to clear the margin with a trackable glue, the planner used to
+# DROP it into ``unfittable`` (operator could then never touch it). Instead
+# emit a rough opposed pair flagged ``needs_fix`` so the operator drags it
+# into spec in the WebUI; the NUC venue_loader still validates on Send, so a
+# red leg never drives.
+# ----------------------------------------------------------------------
+
+def _poly_centroid(poly):
+    n = max(1, len(poly))
+    return (sum(p[0] for p in poly) / n, sum(p[1] for p in poly) / n)
+
+
+def _poly_major_bearing(poly):
+    """Compass bearing of the polygon's PCA major axis (its long direction)."""
+    cx, cy = _poly_centroid(poly)
+    n = len(poly)
+    sxx = sum((p[0] - cx) ** 2 for p in poly) / n
+    syy = sum((p[1] - cy) ** 2 for p in poly) / n
+    sxy = sum((p[0] - cx) * (p[1] - cy) for p in poly) / n
+    t = sxx + syy
+    disc = math.sqrt(max(t * t - 4.0 * (sxx * syy - sxy * sxy), 0.0))
+    lam = (t + disc) / 2.0
+    if abs(sxy) > 1e-12:
+        ve, vn = sxy, lam - sxx
+    else:
+        ve, vn = (1.0, 0.0) if sxx >= syy else (0.0, 1.0)
+    return math.degrees(math.atan2(ve, vn)) % 360.0
+
+
+def _naive_glue(end, exit_b, start, start_b, cfg):
+    """A simple un-validated hook end -> start, emitted so a best-effort stage
+    always carries an editable glue (the operator reshapes it in the WebUI)."""
+    g = cfg["glue"]
+    ctrl = _glue_ctrl(end, exit_b, start, start_b, cfg,
+                      float(g["lead_m"]), float(g["tail_m"]))
+    return {"kind": "mids", "pts": ctrl[1:-1]}
+
+
+# ----------------------------------------------------------------------
 # Public entry
 # ----------------------------------------------------------------------
 
@@ -732,7 +777,7 @@ def plan_stages(venue, doc, counts, footprint_r=0.30, track_margin=0.30,
                     "exit_b": _exit_bearing(h, end_yaw),
                     "end_en": _place(pts, x, y, h)[-1]}
 
-        placed, glues_en = None, None
+        placed, glues_en, best_effort = None, None, False
 
         if ab_pair:
             target = req + float(cfg["fit_buffer_m"])
@@ -817,6 +862,43 @@ def plan_stages(venue, doc, counts, footprint_r=0.30, track_margin=0.30,
                     break
                 if placed:
                     break
+        if placed is None and ab_pair:
+            # Best-effort opposed pair: nothing here clears the margin with a
+            # trackable glue, but DON'T drop the geometry. Seat a rough A/B
+            # pair (closed-form racetrack slot) the operator drags to green;
+            # flagged needs_fix and the loader re-validates on Send.
+            recipe, pts, end_yaw = variants[0]
+            xA = yA = hA = None
+            for relax in (0.6, 0.3, 0.1):     # ease the margin to find a seat
+                seats = _candidates(pts, poly, excl, req * relax, cfg)
+                if seats:
+                    _s, xA, yA, hA = seats[0]
+                    break
+            if xA is None:                    # curve larger than the polygon
+                xA, yA = _poly_centroid(poly)
+                hA = _poly_major_bearing(poly)
+            A = _entry(recipe, pts, end_yaw, xA, yA, hA, 1)
+            opp = (hA + 180.0) % 360.0
+            ex_, ey_ = _bearing_vec(A["exit_b"])
+            B = _entry(recipe, pts, end_yaw,
+                       A["end_en"][0] + ey_ * 2.4,
+                       A["end_en"][1] - ex_ * 2.4, opp, 2)
+            g1, n1 = _plan_glue(A["end_en"], A["exit_b"], B["start_en"],
+                                B["h"], poly, excl, req, cfg)
+            if g1 is None:
+                g1 = _naive_glue(A["end_en"], A["exit_b"], B["start_en"],
+                                 B["h"], cfg)
+                n1 = "best-effort hook — reshape in the WebUI"
+            g2, n2 = _plan_glue(B["end_en"], B["exit_b"], A["start_en"],
+                                A["h"], poly, excl, req, cfg)
+            if g2 is None:
+                g2 = _naive_glue(B["end_en"], B["exit_b"], A["start_en"],
+                                 A["h"], cfg)
+                n2 = "best-effort hook — reshape in the WebUI"
+            placed, glues_en, best_effort = [A, B], [(g1, n1), (g2, n2)], True
+            notes.append(
+                f"{fam} R{R}: BEST-EFFORT opposed pair (does not clear "
+                f"{req:.2f}m) — drag it to green in the WebUI before Send")
         if placed is None:
             unfittable.append({
                 "family": fam, "R": R,
@@ -843,7 +925,13 @@ def plan_stages(venue, doc, counts, footprint_r=0.30, track_margin=0.30,
                               heading_deg=round(p["h"], 1)),
             } for p in placed],
             "glues": glues,
+            "needs_fix": best_effort,
         })
+        if best_effort:
+            stages[-1]["fix_reason"] = (
+                "auto-placed best-effort: no trackable A/B pair clears "
+                f"{req:.2f}m in this venue — adjust the curves/glue until the "
+                "legs render green, then Send")
         stage_geo.append({"exit_en": placed[-1]["end_en"],
                           "exit_b": placed[-1]["exit_b"],
                           "entry_en": placed[0]["start_en"],
@@ -887,7 +975,8 @@ def plan_stages(venue, doc, counts, footprint_r=0.30, track_margin=0.30,
             "end_heading_deg": round(b["entry_b"], 1),
         }
 
-    return {"ok": bool(stages) and not unfittable,
+    return {"ok": (bool(stages) and not unfittable
+                   and not any(st.get("needs_fix") for st in stages)),
             "req_clearance_m": req,
             "stages": stages,
             "unfittable": unfittable,

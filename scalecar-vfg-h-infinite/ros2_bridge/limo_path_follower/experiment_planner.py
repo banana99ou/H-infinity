@@ -941,42 +941,61 @@ def plan_stages(venue, doc, counts, footprint_r=0.30, track_margin=0.30,
             unfittable.append({"family": fam, "R": R,
                                "reason": "planner retry budget exhausted"})
 
-    # One inter-stage transit glue per boundary (C, field design 2026-06-11):
-    # the robot finishes stage i at SOME exp end (not statically known), walks
-    # the stage's own already-validated loop to the stage EXIT pose (the last
-    # experiment's end), then drives this glue to stage i+1's first start pin.
-    # Emitted as explicit waypoints (planner-sampled, not hand-editable) on
-    # the DESTINATION stage. Failure degrades to the executor's path-join
-    # fallback — noted, never fatal.
+    # One inter-stage transit glue per boundary. The robot finishes stage i at
+    # SOME exp end (not statically known), walks the stage's own already-
+    # validated loop to the stage EXIT pose (the last experiment's end), then
+    # drives this glue to stage i+1's first start pin.
+    #
+    # B (2026-06-16): NEVER skipped — a boundary with no trackable glue gets a
+    # best-effort editable hook (flagged needs_fix), not a silent drop to the
+    # executor's blind path-join. C: emitted with editable control ``mids`` and
+    # its START pin ``start_wgs84`` (the prev stage's exit, which is NOT in the
+    # destination stage's experiments) so the WebUI can rebuild + hand-edit the
+    # Bezier; ``waypoints_wgs84`` stays the source of truth for the loader /
+    # executor (the WebUI regenerates it from the mids on Send). Dubins-fallback
+    # glues carry waypoints only (non-editable, as the intra-stage ones do).
     for i in range(len(stages) - 1):
         a, b = stage_geo[i], stage_geo[i + 1]
         glue_en, note = _plan_glue(a["exit_en"], a["exit_b"],
                                    b["entry_en"], b["entry_b"],
                                    poly, excl, req, cfg)
         pair = f"{stages[i]['name']} -> {stages[i + 1]['name']}"
+        eg_fix = False
         if glue_en is None:
-            notes.append(f"no inter-stage glue {pair} ({note}); the executor "
-                         "falls back to a reposition path-join at the advance")
-            continue
-        if note:
+            glue_en = _naive_glue(a["exit_en"], a["exit_b"],
+                                  b["entry_en"], b["entry_b"], cfg)
+            eg_fix = True
+            notes.append(f"inter-stage glue {pair}: BEST-EFFORT hook (does not "
+                         f"clear {req:.2f}m) — drag it to green before Send")
+        elif note:
             notes.append(f"inter-stage glue {pair}: {note}")
-        if glue_en["kind"] == "mids":
-            pts_en = _bezier_samples([a["exit_en"]] + list(glue_en["pts"])
-                                     + [b["entry_en"]])
+        mids_en = list(glue_en["pts"]) if glue_en["kind"] == "mids" else None
+        if mids_en is not None:
+            pts_en = _bezier_samples([a["exit_en"]] + mids_en + [b["entry_en"]])
         else:
-            pts_en = list(glue_en["pts"])
-        stages[i + 1]["entry_glue"] = {
+            pts_en = list(glue_en["pts"])     # Dubins: non-editable waypoints
+        entry = {
             "from_stage": stages[i]["name"],
+            "start_wgs84": dict(zip(("lat", "lon"),
+                                    _en_to_latlon(*a["exit_en"], lat0, lon0))),
             "waypoints_wgs84": [
                 dict(zip(("lat", "lon"), _en_to_latlon(e, n, lat0, lon0)))
                 for (e, n) in pts_en],
             "v_const": float(cfg["glue"]["v_const"]),
             "pos_tol_m": float(cfg["glue"]["pos_tol_m"]),
             "end_heading_deg": round(b["entry_b"], 1),
+            "needs_fix": eg_fix,
         }
+        if mids_en is not None:
+            entry["mids"] = [
+                dict(zip(("lat", "lon"), _en_to_latlon(e, n, lat0, lon0)))
+                for (e, n) in mids_en]
+        stages[i + 1]["entry_glue"] = entry
 
-    return {"ok": (bool(stages) and not unfittable
-                   and not any(st.get("needs_fix") for st in stages)),
+    needs_attention = (any(st.get("needs_fix") for st in stages)
+                       or any((st.get("entry_glue") or {}).get("needs_fix")
+                              for st in stages))
+    return {"ok": bool(stages) and not unfittable and not needs_attention,
             "req_clearance_m": req,
             "stages": stages,
             "unfittable": unfittable,

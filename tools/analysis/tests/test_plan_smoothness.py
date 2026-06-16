@@ -115,12 +115,8 @@ def test_entry_glue_lands_on_next_stage_start_pin():
     lon0 = venue["corners_wgs84"][0]["lon"]
     for prev, st in zip(p["stages"], p["stages"][1:]):
         eg = st.get("entry_glue")
-        if eg is None:
-            # Allowed only when the plan SAYS the boundary has no glue.
-            assert any("no inter-stage glue" in n and st["name"] in n
-                       for n in p["notes"]), \
-                f"{st['name']}: entry glue silently missing"
-            continue
+        assert eg is not None, \
+            f"{st['name']}: entry glue missing (B 2026-06-16: never skip)"
         assert eg["from_stage"] == prev["name"]
         end = venue_geom.latlon_to_en(eg["waypoints_wgs84"][-1]["lat"],
                                       eg["waypoints_wgs84"][-1]["lon"],
@@ -173,6 +169,61 @@ def test_entry_glue_passes_loader_containment():
         checked += 1
     if len(p["stages"]) >= 2:
         assert checked >= 1, "multi-stage plan produced no checkable entry glue"
+
+
+def test_entry_glue_carries_editable_mids_and_start():
+    """C: a bezier-mids inter-stage glue carries its START pin + editable control
+    mids, and rebuilding the Bezier from [start, *mids, dest_start] (exactly
+    what the WebUI does on Send) reproduces the waypoints the loader checks and
+    lands on the next stage's first pin. (slalom 1.0->0.7 on rooftop yields a
+    mids boundary; rooftop's step boundaries fall back to Dubins.)"""
+    venue, p = _plan_rooftop(families=("slalom",), radii=(1.0, 0.7))
+    assert p["ok"], p["unfittable"] or p["notes"]
+    lat0 = venue["corners_wgs84"][0]["lat"]
+    lon0 = venue["corners_wgs84"][0]["lon"]
+    checked = 0
+    for st in p["stages"]:
+        eg = st.get("entry_glue")
+        if eg is None or "mids" not in eg:        # Dubins fallback: waypoints only
+            continue
+        assert "start_wgs84" in eg, "editable glue missing its start pin"
+        start_en = venue_geom.latlon_to_en(eg["start_wgs84"]["lat"],
+                                            eg["start_wgs84"]["lon"], lat0, lon0)
+        mids_en = _glue_pts_en(eg["mids"], lat0, lon0)
+        pin = st["experiments"][0]["start"]
+        dest_en = venue_geom.latlon_to_en(pin["lat"], pin["lon"], lat0, lon0)
+        rebuilt = ep._bezier_samples([start_en] + mids_en + [dest_en])
+        have = _glue_pts_en(eg["waypoints_wgs84"], lat0, lon0)
+        assert len(rebuilt) == len(have), "rebuild changed the sample count"
+        worst = max(math.hypot(a[0] - b[0], a[1] - b[1])
+                    for a, b in zip(rebuilt, have))
+        assert worst < 1e-3, f"{st['name']}: rebuild drifts {worst:.4f} m"
+        d = math.hypot(rebuilt[-1][0] - dest_en[0], rebuilt[-1][1] - dest_en[1])
+        assert d < 0.05, f"{st['name']}: glue ends {d:.2f} m off the start pin"
+        checked += 1
+    assert checked >= 1, "no editable (mids) entry glue to check"
+
+
+def test_entry_glue_always_present_on_every_boundary():
+    """B: no stage boundary is ever left without an inter-stage glue, and each
+    one lands on the next stage's first start pin. Best-effort ones (if any)
+    are flagged needs_fix, which forces the plan not-ok."""
+    venue, p = _plan_rooftop(families=("slalom",), radii=(1.0, 0.7, 0.5))
+    assert len(p["stages"]) >= 2, "need a multi-stage plan to test boundaries"
+    lat0 = venue["corners_wgs84"][0]["lat"]
+    lon0 = venue["corners_wgs84"][0]["lon"]
+    for prev, st in zip(p["stages"], p["stages"][1:]):
+        eg = st.get("entry_glue")
+        assert eg is not None, f"{st['name']}: entry glue missing (B: never skip)"
+        assert eg["from_stage"] == prev["name"]
+        end = venue_geom.latlon_to_en(eg["waypoints_wgs84"][-1]["lat"],
+                                      eg["waypoints_wgs84"][-1]["lon"], lat0, lon0)
+        pin = venue_geom.latlon_to_en(st["experiments"][0]["start"]["lat"],
+                                      st["experiments"][0]["start"]["lon"],
+                                      lat0, lon0)
+        assert math.hypot(end[0] - pin[0], end[1] - pin[1]) < 0.05
+        if eg.get("needs_fix"):
+            assert not p["ok"], "best-effort entry glue must force plan not-ok"
 
 
 def _bez(ctrl, nseg):

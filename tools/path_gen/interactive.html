@@ -3660,6 +3660,54 @@ function lbRebuildGapSelect() {
   if (Number.isInteger(prev) && prev < n) sel.value = String(prev);
 }
 
+// Project a dragged point onto the line through `pin` along its compass heading
+// (D: the arrival-tail control point slides ALONG the start-heading line, never
+// off it — guarantees the glue inserts straight into the experiment curve).
+function lbProjectOntoHeadingLine(pin, lat, lon) {
+  const lat0 = pin.lat, lon0 = pin.lon;
+  const h = (pin.heading_deg || 0) * Math.PI / 180;
+  const uE = Math.sin(h), uN = Math.cos(h);
+  const [e, nn] = lbLatlonToEN(lat, lon, lat0, lon0);   // pt relative to pin
+  const t = e * uE + nn * uN;                            // scalar along heading
+  const pe = t * uE, pn = t * uN;                        // projected EN
+  return { lat: lat0 + pn / 111320.0,
+           lon: lon0 + pe / (111320.0 * Math.cos(lat0 * Math.PI / 180)) };
+}
+// Draw a glue's editable control mids. The LAST mid (the arrival tail) is
+// LOCKED to the destination start-heading line (D, arrival-only): dragging it
+// slides along that line; all other mids drag freely.
+function lbDrawGlueMids(mids, arrivalPin) {
+  if (!mids || !mids.length) return;
+  mids.forEach((m, idx) => {
+    const tail = (idx === mids.length - 1);
+    const col = tail ? '#ff0' : '#3cf';     // yellow = locked-to-heading tail
+    const mm = L.circleMarker([m.lat, m.lon], { radius: 5, color: col, weight: 2,
+      fillColor: col, fillOpacity: 0.5, pane: 'markerPane', interactive: true })
+      .addTo(map).bindTooltip(tail ? 'tail — locked to arrival heading' : 'glue mid');
+    lbBindDrag(mm, (ll) => {
+      if (tail) { const p = lbProjectOntoHeadingLine(arrivalPin, ll.lat, ll.lng);
+                  m.lat = p.lat; m.lon = p.lon; }
+      else      { m.lat = ll.lat; m.lon = ll.lng; }
+      lbRedrawAll();
+    });
+    lbAdd(mm);
+  });
+}
+// Regenerate the inter-stage glue's waypoints_wgs84 from the (possibly hand-
+// edited) control mids so the loader / executor drive what the operator sees.
+// Dubins glues (no mids) pass through verbatim.
+function lbEntryGlueForSend(st) {
+  const eg = st.entry_glue;
+  if (!eg || !eg.mids || !eg.mids.length || !st.exps || !st.exps.length)
+    return eg;
+  const ctrl = [eg.start_wgs84, ...eg.mids,
+                { lat: st.exps[0].start.lat, lon: st.exps[0].start.lon }];
+  const len = lbPolylineLenM(ctrl.map(c => [c.lat, c.lon]));
+  const ns = Math.max(12, Math.min(300, Math.round(len / 0.3)));
+  const wps = lbBezierSample(ctrl, ns).map(([la, lo]) => ({ lat: la, lon: lo }));
+  return { ...eg, waypoints_wgs84: wps };
+}
+
 // ---- draw everything ----
 function lbRedrawAll() {
   lbClearLayers();
@@ -3696,17 +3744,25 @@ function lbRedrawAll() {
     const s = lbRepoSamples(g), v = lbValidate(s);
     lbAdd(L.polyline(s, { color: v.ok ? '#3cf' : '#f55', weight: active ? 4 : (drawn ? 3 : 2),
       dashArray: (drawn || active) ? null : '4 6', opacity: (drawn || active) ? 1 : 0.6 }).addTo(map));
-    (lbRepos[g] ? lbRepos[g].mids : []).forEach((m) => {
-      const mm = L.circleMarker([m.lat, m.lon], { radius: 5, color: '#3cf', weight: 2,
-        fillColor: '#3cf', fillOpacity: 0.5, pane: 'markerPane', interactive: true }).addTo(map);
-      lbBindDrag(mm, (ll) => { m.lat = ll.lat; m.lon = ll.lng; lbRedrawAll(); });
-      lbAdd(mm);
-    });
+    if (lbRepos[g] && lbRepos[g].mids)
+      lbDrawGlueMids(lbRepos[g].mids, lbExps[(g + 1) % n].start);
   }
-  // Inter-stage transit glue INTO the current stage (planner waypoints, not
-  // editable — dashed violet so it reads as "arrival route", not a leg).
+  // Inter-stage transit glue INTO the current stage. Editable (C): if it
+  // carries control mids, draw the live Bezier + draggable handles (the last
+  // one locked to the arrival heading, D); else (Dubins fallback) the planner
+  // waypoints. Dashed violet either way so it reads as "arrival route".
   const stEg = (lbStages && lbStages[lbStageIdx]) ? lbStages[lbStageIdx].entry_glue : null;
-  if (stEg && (stEg.waypoints_wgs84 || []).length >= 2) {
+  if (stEg && stEg.mids && stEg.mids.length && lbExps.length) {
+    const ctrl = [stEg.start_wgs84, ...stEg.mids,
+                  { lat: lbExps[0].start.lat, lon: lbExps[0].start.lon }];
+    const len = lbPolylineLenM(ctrl.map(c => [c.lat, c.lon]));
+    const ns = Math.max(12, Math.min(300, Math.round(len / 0.3)));
+    const samp = lbBezierSample(ctrl, ns), ev = lbValidate(samp);
+    lbAdd(L.polyline(samp, { color: ev.ok ? '#c6f' : '#f55', weight: 3,
+      dashArray: '8 6', opacity: 0.9 }).addTo(map)
+      .bindTooltip(`entry from ${stEg.from_stage} (editable)`));
+    lbDrawGlueMids(stEg.mids, lbExps[0].start);
+  } else if (stEg && (stEg.waypoints_wgs84 || []).length >= 2) {
     lbAdd(L.polyline(stEg.waypoints_wgs84.map(w => [w.lat, w.lon]),
       { color: '#c6f', weight: 3, dashArray: '8 6', opacity: 0.9 }).addTo(map)
       .bindTooltip(`entry from ${stEg.from_stage} (inter-stage transit)`));
@@ -3744,7 +3800,9 @@ function lbRestore() {
       lbStages = d.stages
         .map(st => ({ name: st.name, geometries: st.geometries || [],
                       exps: (Array.isArray(st.exps) ? st.exps : []).filter(okExp),
-                      repos: okRepos(st.repos) }))
+                      repos: okRepos(st.repos),
+                      entry_glue: st.entry_glue || null,
+                      needs_fix: !!st.needs_fix, fix_reason: st.fix_reason || '' }))
         .filter(st => st.exps.length);
       lbPlanMeta = d.planMeta || null;
       lbStageIdx = (finite(d.stageIdx) && d.stageIdx >= 0
@@ -3913,7 +3971,7 @@ function lbRenderPlanState(d) {
   const total = lbStages.reduce((s, st) => s + st.exps.length, 0);
   let html = `<span class="ok">plan: ${lbStages.length} stage(s), ${total} curve` +
     `${total === 1 ? '' : 's'}; the batch runs ALL stages unattended.</span>`;
-  const nFix = lbStages.filter(s => s.needs_fix).length;
+  const nFix = lbStages.filter(s => s.needs_fix || (s.entry_glue && s.entry_glue.needs_fix)).length;
   if (nFix) html += `<br><span class="err">⚠ ${nFix} stage(s) auto-placed ` +
     `BEST-EFFORT — drag the red curves/glue to green before Send ` +
     `(the NUC rejects out-of-spec legs on load).</span>`;
@@ -3934,7 +3992,7 @@ function lbRebuildStageSelect() {
   (lbStages || []).forEach((st, i) => {
     const o = document.createElement('option');
     o.value = i;
-    o.textContent = `${st.needs_fix ? '⚠ ' : ''}${i + 1}/${lbStages.length}: ` +
+    o.textContent = `${(st.needs_fix || (st.entry_glue && st.entry_glue.needs_fix)) ? '⚠ ' : ''}${i + 1}/${lbStages.length}: ` +
       st.geometries.map(g => `${g.family} R${g.R}`).join(', ');
     sel.appendChild(o);
   });
@@ -3962,7 +4020,7 @@ function lbBuildPayload() {
   if (lbStages && lbStages.length) {
     v.plan_stages = lbStages.map(st => {
       const out = { name: st.name, legs: lbBuiltLegsForStage(st) };
-      if (st.entry_glue) out.entry_glue = st.entry_glue;
+      if (st.entry_glue) out.entry_glue = lbEntryGlueForSend(st);
       return out;
     });
     v.legs = v.plan_stages[0].legs;   // stage-unaware consumers see stage 1

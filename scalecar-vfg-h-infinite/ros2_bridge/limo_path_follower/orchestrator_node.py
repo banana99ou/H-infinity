@@ -104,6 +104,14 @@ PROCS = {
         # ever re-enabled, re-measure mag_frame_offset_rad against the
         # then-current compass cal (~-91.8 deg vs the 2026-06-11 +16.6 cal).
         '-p', 'enable_mag:=false',
+        # Compass fusion OFF (field 2026-06-16): two field recals left the
+        # Pixhawk compass offset ~24 deg off COG, so the fused heading SNAPPED
+        # ~24 deg to the wrong compass value the instant the robot stopped at a
+        # pin (COG drops out at standstill) — poisoning every run's start
+        # heading. COG (GPS course-over-ground, un-calibratable) + gyro carry
+        # the heading instead. Re-enable once the compass offset is recalibrated
+        # against COG as ground truth.
+        '-p', 'enable_compass:=false',
     ],
     # T4 (R1-R4, P3): RTK go-to-pose between recorded runs. Publishes cmd_vel_raw
     # only while repositioning. MUST NOT run concurrently with 'follower' (C6) —

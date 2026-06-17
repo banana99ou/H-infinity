@@ -617,6 +617,21 @@ class RepositionNode(Node):
             self._abort('bad /reposition/goto payload: not a JSON object')
             return
 
+        # Same-goto re-send dedupe (field 2026-06-16): run_executor RE-SENDS the
+        # same goto at ~1 Hz (stable seq) until it sees our status echo — a
+        # dropped-goto workaround. Re-committing would reset _seg_i and re-run the
+        # one-shot path JOIN mid-drive, snapping to the CLOSEST segment (wrong
+        # ORDER wherever the curve passes near itself: turnaround, tight glue,
+        # the locked tail). If this is the seq we are already driving/arrived on,
+        # just re-echo and return; do NOT re-commit. A genuinely dropped FIRST
+        # goto still carries a seq != self._goto_seq, so its re-send still
+        # commits — the recovery the re-send was built for survives.
+        _new_seq = d.get('seq', None)
+        if (_new_seq is not None and _new_seq == self._goto_seq
+                and self._state in ('driving', 'arrived')):
+            self._publish_status_current()
+            return
+
         # Adopt the caller's goto id FIRST, so even an abort below (geo not
         # loaded, bad waypoints, R3 breach) is attributed to THIS goto in the
         # status stream, not silently to the previous one.

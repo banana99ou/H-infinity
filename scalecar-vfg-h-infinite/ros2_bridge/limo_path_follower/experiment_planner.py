@@ -65,8 +65,12 @@ PLAN_DEFAULTS = {
              # driven by reposition's pure pursuit with a 0.6 m look-ahead — a
              # legal-but-tight Dubins loop (R 0.45) breaks the steering cone
              # mid-arc and aborts. Glue must be drivable WITH MARGIN, not
-             # merely chassis-possible.
-             "track_radius_m": 0.7,
+             # merely chassis-possible. Raised 0.7 -> 1.0 (field 2026-06-16):
+             # a w=1.8 racetrack turnaround (R 0.9) still UNDERSHOT — pure
+             # pursuit cut the corner, landed short at the end pin facing
+             # ~opposite, and the run failed. 1.0 m floor forces the closed-form
+             # B candidates to w>=2.0 (R>=1.0), clearing the observed undershoot.
+             "track_radius_m": 1.0,
              # Straight-tail arrival condition: the final tail_check_m of every
              # glue must lie within tail_align_deg of the start-pin heading —
              # reposition converges heading through the tail, so this is what
@@ -731,6 +735,11 @@ def plan_stages(venue, doc, counts, footprint_r=0.30, track_margin=0.30,
                               "— planner fails closed like the loader"]}
     req = float(venue.get("safety_margin_m", 0.0)) \
         + float(footprint_r) + float(track_margin)
+    # C (field 2026-06-16): lay each A/B racetrack ALONG the venue's long axis —
+    # the curves point down the length, the lateral A/B separation opens across
+    # the short axis (which has the most room for a wider, trackable turnaround).
+    # Biases A's heading; B follows opposed, so the whole pair tracks the axis.
+    major_bearing = _poly_major_bearing(poly)
 
     remaining = remaining_geometries(doc, counts, key_fn=key_fn)
     if not remaining:
@@ -800,43 +809,59 @@ def plan_stages(venue, doc, counts, footprint_r=0.30, track_margin=0.30,
                 return B, [(g1, n1), (g2, n2)]
 
             for (recipe, pts, end_yaw) in variants:
-                for (_sA, xA, yA, hA) in _candidates(
-                        pts, poly, excl, req, cfg)[:6]:
-                    A = _entry(recipe, pts, end_yaw, xA, yA, hA, 1)
-                    opp = (hA + 180.0) % 360.0
-                    # Closed-form racetrack slots first: B.start = A.end +
-                    # lateral offset w (+ optional slide s along the exit),
-                    # heading exactly opposed. The same recipe rotated 180
-                    # then ENDS at A.start + the same offset, so BOTH glues
-                    # are clean ~w/2-radius turnarounds by construction —
-                    # the grid search rarely lands in this slot on its own.
-                    ex_, ey_ = _bearing_vec(A["exit_b"])
-                    cand_B = []
-                    for sgn in (1.0, -1.0):
-                        nx_, ny_ = ey_ * sgn, -ex_ * sgn
-                        for w in (1.8, 2.4, 3.0, 3.6):
-                            for s_ in (0.0, 1.0, 2.0):
-                                cand_B.append(
-                                    (A["end_en"][0] + nx_ * w + ex_ * s_,
-                                     A["end_en"][1] + ny_ * w + ey_ * s_,
-                                     opp))
-                    for (xB, yB, hB) in cand_B:
-                        got = _try_B(A, recipe, pts, end_yaw, xB, yB, hB)
-                        if got is not None:
-                            placed, glues_en = [A, got[0]], got[1]
-                            break
-                    if placed is None:
-                        # Grid fallback: anywhere opposed-ish that glues.
-                        for (_sB, xB, yB, hB) in _candidates(
-                                pts, poly, excl, req, cfg,
-                                prefer_near=A["end_en"],
-                                prefer_heading=opp)[:6]:
-                            if _ang_diff_deg(hB, opp) > 60.0:
-                                continue   # not opposed enough to de-bias
+                # align_major: try with major-axis heading bias first; if no
+                # A/B pair fits from those positions, retry without the bias
+                # so the venue constraint never fully blocks pairing.
+                _prefer_list = ([major_bearing, None]
+                                if cfg.get("align_major", True) else [None])
+                for _a_prefer in _prefer_list:
+                    for (_sA, xA, yA, hA) in _candidates(
+                            pts, poly, excl, req, cfg,
+                            prefer_heading=_a_prefer)[:6]:
+                        A = _entry(recipe, pts, end_yaw, xA, yA, hA, 1)
+                        opp = (hA + 180.0) % 360.0
+                        # Closed-form racetrack slots first: B.start = A.end +
+                        # lateral offset w (+ optional slide s along the exit),
+                        # heading exactly opposed. The same recipe rotated 180
+                        # then ENDS at A.start + the same offset, so BOTH glues
+                        # are clean ~w/2-radius turnarounds by construction —
+                        # the grid search rarely lands in this slot on its own.
+                        ex_, ey_ = _bearing_vec(A["exit_b"])
+                        cand_B = []
+                        for sgn in (1.0, -1.0):
+                            nx_, ny_ = ey_ * sgn, -ex_ * sgn
+                            # w = lateral A/B offset; the return turnaround radius
+                            # is ~w/2. Fine-grained 1.8..3.6 (field 2026-06-16): the
+                            # track_radius_m gate rejects any w whose R=w/2 is below
+                            # the floor, so the FIRST surviving w is the tightest
+                            # TRACKABLE separation that still seats an A/B pair —
+                            # gentler than the old undershooting 1.8 (R 0.9) but not
+                            # so wide it forces a single-curve fallback.
+                            for w in (1.8, 2.0, 2.2, 2.4, 2.8, 3.2, 3.6):
+                                for s_ in (0.0, 1.0, 2.0):
+                                    cand_B.append(
+                                        (A["end_en"][0] + nx_ * w + ex_ * s_,
+                                         A["end_en"][1] + ny_ * w + ey_ * s_,
+                                         opp))
+                        for (xB, yB, hB) in cand_B:
                             got = _try_B(A, recipe, pts, end_yaw, xB, yB, hB)
                             if got is not None:
                                 placed, glues_en = [A, got[0]], got[1]
                                 break
+                        if placed is None:
+                            # Grid fallback: anywhere opposed-ish that glues.
+                            for (_sB, xB, yB, hB) in _candidates(
+                                    pts, poly, excl, req, cfg,
+                                    prefer_near=A["end_en"],
+                                    prefer_heading=opp)[:6]:
+                                if _ang_diff_deg(hB, opp) > 60.0:
+                                    continue   # not opposed enough to de-bias
+                                got = _try_B(A, recipe, pts, end_yaw, xB, yB, hB)
+                                if got is not None:
+                                    placed, glues_en = [A, got[0]], got[1]
+                                    break
+                        if placed:
+                            break
                     if placed:
                         break
                 if placed:

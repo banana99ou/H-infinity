@@ -46,6 +46,7 @@ NS = _extract({'_wrap', 'point_seg_dist', 'polyline_dist'})
 
 class _Log:
     def info(self, *_a, **_k): pass
+    def warn(self, *_a, **_k): pass
 
 
 class Robot:

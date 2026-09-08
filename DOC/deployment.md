@@ -92,7 +92,10 @@ means **reposition geometry is exercised only up to its R3 area-gate, not valida
 as correct end-to-end**. A self-consistent bench venue is needed for a full walk.
 **Not validated (needs the floor):** real wheel odometry, real RTK acquisition +
 FIXED hold, real motor actuation, real vehicle dynamics / tracking accuracy, and
-the real venue geometry (`rooftop.json` is placeholder).
+the real venue geometry. (The bench finding above was against the **old**
+placeholder `rooftop.json`; that file was replaced with the **surveyed polygon**
+on 2026-06-11, so the placeholder-geometry artifact no longer applies to the
+current venue.)
 
 ## Runbook — autonomous smoke e2e start (field)
 
@@ -101,9 +104,17 @@ the real venue geometry (`rooftop.json` is placeholder).
 
 The canonical field procedure: this is what "run the full e2e test" means (see the
 field-vs-bench table above). It arms the **autonomous** sequencer for the single
-smoke cell (`scenarios/smoke.yaml`: 1× `lpv-hinf`, step, conservative `v_const`);
-the same steps with `scenarios/experiment.yaml` and the `sequencer` PROC run the
-full 320-cell matrix. To drive one leg **by hand** instead, use the **Manual run
+smoke cell (`scenarios/smoke.yaml`: 1× `lpv-hinf`, step, conservative `v_const`).
+
+> **Experiment pathway — `run_executor` (current) vs sequencer (DEPRECATED).** The
+> full data-gathering matrix is driven by **`run_executor_node`** + the webui
+> leg-batch workflow + the auto-planner (operator decision 2026-06-12), **not** by
+> this sequencer. `experiment_sequencer_node` (PROCs `sequencer` / `sequencer_smoke`)
+> is **DEPRECATED**, kept only for the `run_smoke_e2e` smoke path described in this
+> runbook until it is repointed to `run_executor`. Fix bugs in `run_executor`, not
+> the sequencer.
+
+To drive one leg **by hand** instead, use the **Manual run
 (per-phase)** panel in the battle station (+ `bag_node` over `/bag/cmd`, which
 lands the same bag + sidecar) — that path is for when the autonomous loop is
 blocked.
@@ -145,7 +156,8 @@ command (step 3) starts the sequencer, and the sequencer brings up
 bash ~/H-infinity/tools/preflight/preflight.sh   # must exit 0
 ```
 Checks the node graph, the `cmd_vel_raw → estop → /cmd_vel` chain with a single
-`cmd_vel_raw` publisher (C6), Ackermann, battery ≥ 10.5 V, `/wheel/odom` > 30 Hz,
+`cmd_vel_raw` publisher (C6), Ackermann, battery (preflight code still gates ≥ 10.5 V;
+**canonical M2 halt is 10.0 V** — code sync pending, see `ToDo.md`), `/wheel/odom` > 30 Hz,
 and **RTK FIXED (quality=4)**. FLOAT (quality=5) only WARNs here, but the
 sequencer's M1/F2 gate is FIXED-only and will pause the batch on FLOAT.
 
@@ -174,21 +186,22 @@ leg → done.
   **ABORT** stops the batch *and* latches the E-stop. **E-STOP** is the hard stop.
 - Pass = a bag + sidecar under `Experiment Data/` and `phase: done` with `fail: 0`.
 
-### Current tight-venue caveats (separate workstream)
-The steps above are unchanged, but on the present rooftop venue two known issues
-will interrupt the loop until fixed elsewhere:
-- **Path footprint exceeds the venue.** The step recipe carries only `R`; the
-  follower's defaults `L1 = L2 = 5.0 m` give an ~5.7 × 5.7 m driven path inside an
-  ~8.3 × 2.2 m inset, so the run leaves the box until per-venue path geometry is
-  plumbed through `_recipe_for_leg`. Keep the E-stop / geofence ready, or wait for
-  the path-fit.
-- **Reposition heading limit-cycle** hangs the reposition phase (no compass; COG
-  is noise-dominated near the pin). No-code workaround: use a venue whose start
-  and end pin **coincide (A == B)** — `_reposition_is_noop()` then skips reposition
-  (`experiment_sequencer_node.py`), the operator hand-places the robot, and
-  odom-reset → bag → follow → classify run normally. The driven path comes from the
-  odom-zero origin, not the pin coordinates, so pin heading is irrelevant in that
-  case.
+### Tight-venue caveats — mostly superseded (kept for history)
+Both issues below were against the **deprecated** sequencer path; both are now
+addressed on the `run_executor` path:
+- **Path footprint exceeds the venue** — **RESOLVED for `run_executor`.** This was a
+  deprecated-sequencer artifact: its `_recipe_for_leg` sent only `R`, so the
+  follower fell back to its 5 m sim defaults (`L1 = L2 = 5.0 m` → ~5.7 × 5.7 m path
+  in an ~8.3 × 2.2 m inset). The `run_executor` path sends operator-authored
+  recipes that carry the explicit, venue-fitted geometry (planner hardware
+  defaults `L1 = L2 = 1.0 m`), so the path stays in the box. Keep E-stop / geofence
+  ready regardless.
+- **Reposition heading limit-cycle** — **SUPERSEDED by the `heading_node` EKF
+  (2026-06-08).** reposition now consumes `/heading/fused` instead of steering on
+  COG alone, and field-passed on 2026-06-12. (Legacy no-code workaround, still
+  valid: a venue whose start and end pin **coincide (A == B)** makes
+  `_reposition_is_noop()` skip reposition; the operator hand-places the robot and
+  odom-reset → bag → follow → classify run normally.)
 
 ## Support scripts inventory
 
@@ -216,8 +229,8 @@ infrastructure — reuse them, do not re-implement.
 ### Data logging
 - `Data_Logger.py` — wraps `ros2 bag record`; publishes `/data_logger/recording`
   and `/data_logger/health`. Records the GPS-RTK + Pixhawk GPS topics,
-  `/cmd_vel`, `/cmd_vel_raw`, `/wheel/odom`, `/imu`, `/estop` (TOPICS list ~L30).
-  The canonical required bag set is in `system_spec.md §4`.
+  `/cmd_vel`, `/cmd_vel_raw`, `/wheel/odom`, `/imu`, `/estop` (the `TOPICS` list in
+  `Data_Logger.py`, ~L44). The canonical required bag set is in `system_spec.md §4`.
 
 ### GNSS dataset support
 - `GPS-RTK_ROS2_pub_node.py` — publishes GNSS fix / NMEA / RTK-status for the
@@ -226,13 +239,14 @@ infrastructure — reuse them, do not re-implement.
 
 ### Run-artifact analysis & backup (project tooling, not legacy)
 
-The automatic per-leg pipeline: when the sequencer reaches `STOP_LEG` it (1)
+The automatic per-leg pipeline: when the run executor reaches `STOP_LEG` it (1)
 stops the bag, (2) classifies the outcome (D4), (3) writes a sidecar, then (4)
-fires the backup — all unattended. Offline, the analysis tools turn the archived
+fires the backup — all unattended. (Same `_archive_leg` logic in the deprecated
+sequencer.) Offline, the analysis tools turn the archived
 bags into a dataset + metrics.
 
-- `tools/sync/push_artifact.sh` — runs on the NUC; fired detached by the
-  sequencer (`_archive_leg`) after the bag + sidecar are finalized. Pushes the
+- `tools/sync/push_artifact.sh` — runs on the NUC; fired detached by the run
+  executor (`_archive_leg`) after the bag + sidecar are finalized. Pushes the
   bag to **MacBook (priority) → NAS → local repo**, rate-limited (`--bwlimit`) +
   `nice`/`ionice` so it never disturbs the next leg. `.git` excluded; each target
   is its own **local-only git archive** (pre-push hook blocks upload; never
@@ -288,8 +302,9 @@ The authoritative interface contract (topic names, types, directions) is
 The operator watches a run from the battle station
 (`tools/path_gen/interactive.html`) over rosbridge. It raises a **browser
 alert** — toast + beep + flashing tab title, plus an OS desktop notification
-when the browser permits — on: low battery (≤10.8 V warn / ≤10.5 V halt), RTK
-not FIXED, RTK fix / correction-chain hang, any sequencer pause or abort
+when the browser permits — on: low battery (**canonical 10.3 V warn / 10.0 V
+halt**; the webui code still uses 10.5/10.2 — sync pending, see `ToDo.md`), RTK
+not FIXED, RTK fix / correction-chain hang, any run-executor pause or abort
 (battery halt, circuit breaker, RTK loss), and rosbridge disconnect. This is the
 **local** channel — it works on the LIMO AP with no internet. Grant the
 browser's notification permission when prompted on Connect; OS desktop popups
@@ -304,7 +319,7 @@ What happens after each leg ends, unattended (see the script inventory above):
 
 ```mermaid
 flowchart LR
-    stopLeg["sequencer STOP_LEG"] --> bag["bag (Experiment Data/)"]
+    stopLeg["run executor STOP_LEG"] --> bag["bag (Experiment Data/)"]
     stopLeg --> classify["D4 classify + sidecar"]
     classify --> bag
     bag --> push["push_artifact.sh (detached)"]

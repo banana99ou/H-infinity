@@ -5,6 +5,81 @@ Working checklist for getting the professor-provided H-infinity stack from
 
 ## Status
 
+**2026-06-12 field day (rooftop, run_id `rooftop_0612_fri`) — SUCCESS.** Banked a
+good chunk of the dataset and caught + fixed a live controller-switch bug. The
+experiment is now driven by `run_executor_node` + the webui leg-batch workflow
+(the auto-planner), **not** `experiment_sequencer_node` — that node is
+**DEPRECATED** as of this date (operator decision); see `DOC/system_spec.md` §4,
+`DOC/deployment.md`, and the README repo map. `sequencer_smoke` is still wired for
+the `run_smoke_e2e` smoke path until repointed. Three fixes committed (see git log):
+- **Controller-switch hang FIXED** (`run_executor_node._tick_set_params`): the
+  set_parameters call that switches the follower (lpv-hinf ↔ pid-ff) waited on the
+  future with NO timeout; a dropped service response (rmw "failed to send response
+  (timeout)" right after a follower respawn) hung the leg forever. Now re-sends the
+  idempotent call at 5 s ×3, then pauses. Proven live (the dropout recurred,
+  "re-sending (attempt 1)" fired, the run continued).
+- **Right step (`direction=-1`) DISABLED** — VENDOR bug, not ours.
+  `StepCurvaturePath.position()` runs backward at the arc start for dir=-1 → cusp
+  (~180° on-the-spot reversal at R≈0.20 m, then continue). `+1` (left) is clean.
+  Side effect: where +1 can't fit an A/B pair, the step stage goes single-curve.
+- **`track_radius_m` 0.7 → 0.85** (yaml `plan.glue.track_radius_m`). 0.7
+  self-intersected the A/B turnarounds (pure pursuit demanded sub-R_min near the
+  loop → abort). track_radius is a MIN-radius FLOOR — higher = wider forced curves
+  = fits LESS (counterintuitive). Settled at 0.85 alongside the
+  self-intersecting-glue reject (commit b46e987, 2026-06-13); at 0.8 the slalom 0.4
+  cell was the one unfittable cell (40 runs deferred).
+
+**2026-06-08 heading integration — LANDED (synced + built + bench-verified on NUC).**
+The always-on `heading_node` EKF, the `reposition`→`/heading/fused` cutover, and the
+`heading` orchestrator PROC are in place (both nodes construct; `/heading/fused`
+links heading_node→reposition with matched QoS). reposition no longer steers on COG
+alone, which **supersedes the 2026-06-05 reposition heading limit-cycle blocker**
+(see the re-labelled entry under "Test coverage backlog"). Still unverified in the
+field: the outdoor no-limit-cycle convergence gate — confirm on the first run.
+
+**Auto-experiment-planner — decisions in force (decided 2026-06-11):**
+- **Stage packing = A/B opposed pairs**: each stage = one geometry placed twice,
+  headings 180° apart, glued as a racetrack (synthetic B slot first, grid fallback,
+  loud single-curve note if both fail). Knob `plan.max_geometries_per_stage`
+  (≤1 = legacy single-curve).
+- **Slalom shape (hardware)**: `n_arcs=2, θ=90°, L_mid=0.5, L1=1.0, L_end=1.0` (the
+  sim's `n_arcs=6 / L_end=25 m` cannot fit any real venue). `plan.slalom:` in
+  `experiment.yaml`; planner defaults in `experiment_planner.PLAN_DEFAULTS`. Affects
+  paper comparability with the sim slalom → professor's call.
+- **Step shape (hardware)**: `L1=L2=1.0, θ=90°` (sim used 5 m straights). `plan.step:`.
+- **Cell ordering**: `plan.geometry_order` = `matrix` (default, yaml axis order) |
+  `finish-nearest` (fewest-remaining geometries first).
+- **ntfy.sh topic stays "" (disabled)**; Discord is the push channel (`discord.env`
+  present on the NUC; the executor pages pause/abort/battery/stage-advance/done).
+- **Assumptions baked in (flag if wrong)**: **venue name == resume key** — manifest
+  credit filters on `run_id == venue name`, so keep the SAME venue name across field
+  days or progress resets to 0; one geometry per (family, R) reused across
+  controllers/speeds/reps; 2 geometries/stage (`plan.max_geometries_per_stage` default 2 — the A/B pair); glue hard floor 0.37 m turn radius
+  (chassis R_min).
+
+**Auto-planner — still open / next field day:**
+- **Inter-stage TRANSIT (entry_glue) NOT validated on the robot.** At 0.8 the planner
+  fit ZERO entry glues (all boundaries = path-join), so only the plain path-join
+  inter-stage reposition ran. To exercise `_build_transit`, need a plan where an
+  entry glue fits (different venue spacing, or a hand-built 2-stage demo).
+- **`repetitions` reverted 1 → 10** and re-synced — N=1 was a TEST-ONLY change to
+  force a fast stage advance. Do NOT ship N=1.
+- A/B **step** pairs degraded to single-curve once right-step was disabled;
+  directional-bias cancellation for step is OFF until +1 pairs can fit.
+
+**Follow-ups (CODE — recorded by the 2026-06-14 docs pass, not done there):**
+- **Battery thresholds: canonical = 10.3 V warn / 10.0 V halt** (docs now state
+  this). Code/UI still diverge and must be synced to it: `tools/preflight/preflight.sh`
+  (10.8/10.5), `run_executor_node` (`BATT_WARN_V` / `battery_volts_halt` 10.8/10.5),
+  `tools/path_gen/interactive.html` (`BATT_WARN_V` / `BATT_HALT_V` 10.5/10.2),
+  `experiment_sequencer_node` config (11.0/10.5).
+- `path_follower_node.py:86` comment `# LIMO max ~3 m/s` contradicts the 1.0 m/s
+  firmware cap (spec C2) — fix the comment.
+- `estop_cli.py:214` dead-code condition (the comment itself admits `not ok` is
+  always False inside that `else`).
+
+---
+
 **2026-06-08 base-serial dropout survival (laptop code; NUC offline — DEFERRED steps below).**
 Root cause from the 2026-06-05 field run: the chassis↔NUC USB (CP2102 `/dev/limo_base`)
 drops under **vibration** → `/wheel/odom` silent → preflight fails / would drive blind.
@@ -704,8 +779,9 @@ pipeline.
     **STILL PENDING: on-robot nudge test (place at S1, reposition, few cm -> nose toward E1)
     before any autonomous run — the empirical tie-breaker.** See [[project_heading_convention_bug]].
 
-- [!] **FIELD BUG (2026-06-05) — reposition heading does NOT converge (limit cycle); BLOCKS
-  autonomous runs.** Standalone `/reposition/goto` to S1 of the re-measured rooftop venue
+- [~] **FIELD BUG (2026-06-05) — reposition heading limit cycle — SUPERSEDED by the
+  2026-06-08 `heading_node` integration (see Status, top); field-passed 2026-06-12.
+  Kept below for root-cause history.** Standalone `/reposition/goto` to S1 of the re-measured rooftop venue
   (S1 heading_deg=308.9, ~2.8 m away). Existing `reposition_node` code (unmodified).
   **Position converges** (err_m 3.0 -> ~0.4 m, near `pos_tol_m`=0.15) but **heading never
   settles**: over the full 120 s window `err_deg` swung ±150° (−20,+176,−141,+43,−150,+143…)

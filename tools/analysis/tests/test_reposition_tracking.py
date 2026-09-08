@@ -27,7 +27,7 @@ SRC = os.path.join(
 _FUNCS = {'_wrap', 'point_seg_dist', 'point_seg_nearest', 'polyline_dist',
           'seg_circle_far_t'}
 _METHODS = {'_lookahead_target', '_control_cb', '_active_tol',
-            '_select_join_segment'}
+            '_select_join_segment', '_eff_lookahead'}
 _CONSTS = {'_RTK_FIXED', '_ALLOWED_RTK'}
 
 
@@ -82,6 +82,12 @@ class Robot:
         self._fix_xy = xy
         self._heading_est = math.radians(heading_deg)
         self._lookahead = lookahead
+        self._la_taper = 0.60
+        self._la_min = 0.25
+        self._la_eff = lookahead
+        self._la_arc_margin = 0.5 * lookahead
+        self._la_branch = '-'
+        self._la_tgt_xy = None
         self._infeasible = math.radians(infeasible_deg)
         self._seg_i = 0
         self._state = 'driving'
@@ -127,6 +133,9 @@ class Robot:
 
     def _lookahead_target(self):
         return NS['_lookahead_target'](self)
+
+    def _eff_lookahead(self, d_end):
+        return NS['_eff_lookahead'](self, d_end)
 
     def _select_join_segment(self):       # join already done in these tests
         return True
@@ -187,12 +196,20 @@ def test_field_2026_06_11_join_plus_reacquire_targets_start():
     assert r._seg_i == 0
 
 
-def test_near_end_still_drives_straight_in():
-    """Within a look-ahead of the end, ON the path: final point is the target
-    (the legitimate original fallback)."""
+def test_near_end_tracks_tail_in_then_latches_pin():
+    """Near the end, ON the path: with the look-ahead taper (undershoot/heading
+    fix 2026-06-25) the robot TRACKS THE TAIL straight in — the target is a point
+    on the last segment AHEAD toward the pin — and latches the bare pin only once
+    within lookahead_min_m. (Old behaviour aimed at the pin from 0.6 m out and
+    arrived ~12-22 deg off-heading.)"""
     pts = [(0.0, 0.0), (1.0, 0.0), (2.0, 0.0)]
-    r = Robot(pts, (1.7, 0.0), 0.0)
-    assert r._lookahead_target() == pts[-1]
+    # d_end = 0.3 m (> lookahead_min 0.25): on-tail point, ahead, toward the pin.
+    far = Robot(pts, (1.7, 0.0), 0.0)._lookahead_target()
+    assert far != pts[-1] and far[0] > 1.7 and abs(far[1]) < 1e-9, (
+        f'near-end must track the tail in (ahead, on the segment): {far}')
+    # d_end = 0.15 m (< lookahead_min): latch the bare pin to finish.
+    near = Robot(pts, (1.85, 0.0), 0.0)._lookahead_target()
+    assert near == pts[-1], f'within lookahead_min the target is the pin: {near}'
 
 
 def test_on_path_crossing_unchanged():

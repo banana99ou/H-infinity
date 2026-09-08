@@ -50,6 +50,14 @@ Robot-verification checklist items 1–4 are now resolved (see Part C).
 
 ## Part A — Gap matrix (ROC → current state)
 
+> **Snapshot caveat (added 2026-06-14).** Part A is the **original** ROC→code gap
+> snapshot. Most ❌/⚠️ rows below have since been implemented — the experiment
+> sequencer/executor, venue persistence (`scenarios/venues/`), D4 classification,
+> and the M-series monitors all now exist (see the Part B tasks' "❌ → ✅" markers).
+> For **live** status trust `ToDo.md` and `DOC/deployment.md`, not these cells. The
+> experiment driver is now `run_executor_node`; `experiment_sequencer_node` is
+> **DEPRECATED** (operator decision 2026-06-12).
+
 ### 3.1 Reference path generation
 | ROC | State | Evidence |
 |---|---|---|
@@ -81,8 +89,8 @@ Robot-verification checklist items 1–4 are now resolved (see Part C).
 ### 3.4 Repositioning — **all ❌** (no reposition node exists)
 R1 RTK go-to-pose / R2 straight-approach heading / R3 abort on area breach / R4 no-op when start==end. Reuse: `local_to_latlon()` (`tools/path_gen/path_overlay.py:182-206`) — needs an inverse.
 
-### 3.5 Venue & working area — **all ❌**
-V1 persist venue / V2 RTK corner pins / V3 exclusion-aware placement / V4 validation. Today the rooftop anchor is hardcoded (`interactive.html` ~219-226, `path_overlay.py:33-38`); no `scenarios/venues/`. INI scenarios (`scenarios/*.ini`) are unrelated (legacy open-loop).
+### 3.5 Venue & working area — ~~all ❌~~ → ✅ (T5 done)
+V1 persist venue / V2 RTK corner pins / V3 exclusion-aware placement / V4 validation. **Now implemented (T5):** `scenarios/venues/` holds `rooftop.json` (the surveyed polygon, 2026-06-11) + `smoke_2026_05_29.json`; the editor captures RTK corner pins. *(Original snapshot: the rooftop anchor was hardcoded in `interactive.html`/`path_overlay.py` with no `scenarios/venues/`.)* INI scenarios (`scenarios/*.ini`) are unrelated (legacy open-loop).
 
 ### 3.6 Orchestration / autonomy
 | ROC | State | Evidence |
@@ -102,7 +110,7 @@ V1 persist venue / V2 RTK corner pins / V3 exclusion-aware placement / V4 valida
 | ROC | State | Evidence |
 |---|---|---|
 | M1 preflight gate | ⚠️ | `preflight.sh` now adds an RTK-FIXED gate + `cmd_vel_raw` publisher check (T9, **hw-verified** FAIL→exit 1). Still standalone (T6 must invoke it per-cell) and run-window RTK-% (Y) unset. |
-| M2 battery alert/halt | ⚠️ | `/limo_status.battery_voltage` available; preflight warns <10.8 V / fails <10.5 V. **Spec says 30%/20% but telemetry is VOLTS** — thresholds must be restated in volts (open item). Runtime halt **is** wired (sequencer M2 pauses + notifies at a cell boundary when <10.5 V) + a web-UI browser alert (`interactive.html`). |
+| M2 battery alert/halt | ⚠️ | `/limo_status.battery_voltage` available. **%→V RESOLVED (2026-06-14):** spec M2 now states **10.3 V warn / 10.0 V halt** (canonical). Remaining work is a **code/UI sync** — preflight (10.8/10.5), run_executor (10.8/10.5), webui (10.5/10.2) still diverge from the canonical pair. Runtime halt **is** wired (M2 pause + notify at a cell boundary) + a web-UI browser alert (`interactive.html`). |
 | M3 wallclock heartbeat | ❌ | none. |
 | M4 alerts (ntfy + web UI) | ⚠️ | `tools/notify/ntfy.py` + sequencer hooks exist (batch start/complete, leg fail, M2/F2/F4). **The ntfy wiring was dead** — topic/server never forwarded, so no push ever sent; fixed 2026-06 (`set_notify_channel`, off-thread). Push not yet field-verified; default topic empty (disabled). **Web-UI browser alerts** (`interactive.html`) now cover the same events locally (toast + beep + tab flash + OS notification). |
 | M5 live batch progress | ✅ | battle station subscribes `/experiment/status` (cell / ETA / pass-fail) + pause/resume/abort controls, and raises a browser alert on pause/abort (`interactive.html`, `onExpStatus`). |
@@ -208,7 +216,7 @@ completion signal, and time each control cycle.
 ### T8 — Notifications + battery/wallclock/RTK monitors
 **ROC:** M2, M3, M4, F2/F4 alerts. **Status:** ❌/⚠️ → ✅.
 **Create:** `tools/notify/ntfy.py` (single POST to an ntfy topic from `experiment.yaml`).
-**Modify:** sequencer (T6) hooks — batch start/complete, per-failure, **battery: alert/halt in VOLTS** (resolve the %→V open item; align with preflight's 10.8/10.5 V or a user-confirmed curve), wallclock heartbeat (M3).
+**Modify:** sequencer (T6) hooks — batch start/complete, per-failure, **battery: alert/halt in VOLTS** (%→V **decided 2026-06-14: 10.3 V warn / 10.0 V halt** canonical; code/UI sync to that pair still pending), wallclock heartbeat (M3).
 **Reuse:** `/limo_status.battery_voltage` (see `preflight.sh:109`).
 **Deps:** T6. **Verify:** trigger a test push; simulate low voltage → confirm halt.
 **Done (2026-06):** `ntfy.py` + sequencer hooks landed; the dead topic-forwarding bug fixed (`set_notify_channel`, off-thread). Added a **web-UI browser-alert channel** (`interactive.html`) as the primary local path — low battery, bad/stale RTK, RTK fix hang, sequencer pause/abort, disconnect. ntfy push still needs a real topic + a field-verify.
@@ -280,8 +288,8 @@ exact patterns and the four NUC deployment caveats.
 1. ✅ `limo_base` exposes **no** odom-reset service (only MAVROS `*/reset|clear`). → T3 overlay is the mechanism.
 2. ✅ `/limo_status` is `limo_msgs/msg/LimoStatus`; `battery_voltage` is **float64 VOLTS** (live 12.0–12.1), `motion_mode=1` (Ackermann), `control_mode=1`.
 3. ✅ `rtk_status` is `std_msgs/String`, a rich line carrying a `quality=N` token (NO-FIX gave `quality=0`). `quality=4`=FIXED, `5`=FLOAT per the **NMEA GGA standard** + driver `fix_quality_to_desc()` (`GPS-RTK_ROS2_pub_node.py:164-171`) — authoritative, no open-sky test needed. Reacquisition time not measured (no fix indoors).
-4. ⏳ Reposition tolerances + battery volt thresholds (M2) still open — need a wheels-on-floor session and a user decision on the %→V mapping (observed 12.0 V healthy).
+4. ⏳ Reposition tolerances still open (wheels-on-floor session). Battery volt thresholds (M2) **decided 2026-06-14: 10.3 V warn / 10.0 V halt** (canonical; code/UI sync pending). (Observed 12.0 V healthy.)
 
-**Open spec items to resolve with the user (not blocking most tasks):** battery %→volts
-mapping (M2), exact RTK-FIXED dwell K and run-window RTK % Y (M1/§5), retry limit + circuit-
-breaker K (O4/F4), bag-length tolerance X (§5).
+**Open spec items to resolve with the user (not blocking most tasks):** ~~battery %→volts
+mapping (M2)~~ (resolved 2026-06-14: 10.3/10.0 V), exact RTK-FIXED dwell K and run-window
+RTK % Y (M1/§5), retry limit + circuit-breaker K (O4/F4), bag-length tolerance X (§5).

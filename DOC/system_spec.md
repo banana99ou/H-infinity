@@ -91,7 +91,9 @@ a hole). Usable space is the periphery around the island; curves and turnarounds
 
 ### 3.8 Monitoring & alerting
 - **M1** **Preflight gate** each cell: **RTK FIXED** (quality 4) sustained for K s, topic health, `motion_mode == Ackermann`, battery OK. On loss of FIXED: alert + wait, do not start.
-- **M2** Battery **alert at 30%**, **halt new runs at 20%**.
+- **M2** Battery **alert at 10.3 V**, **halt new runs at 10.0 V** (telemetry is volts —
+  `/limo_status.battery_voltage`; nominal 11.1 V LiPo). *Code/UI are not yet synced to
+  this pair — see the `ToDo.md` follow-ups.*
 - **M3** **Wallclock heartbeat** ping at a configured interval.
 - **M4** **Failure / batch-complete** alerts. Channel: **ntfy.sh**.
 - **M5** **Live progress** (current cell, ETA, pass/fail tally) visible in the battle station.
@@ -130,6 +132,12 @@ a hole). Usable space is the periphery around the island; curves and turnarounds
 | `/reposition/{goto,status}` | JSON / status | sequencer ↔ reposition | go-to-pose (R1,R2) |
 | `/orchestrator/{start,kill,status}` | `std_msgs/String` | sequencer ↔ supervisor | process control (O5) |
 | battery / `motion_mode` source | TBD (`/limo_status`?) | base → preflight/sequencer | gating (M1,M2) — **verify on robot** |
+
+> **"sequencer" in this table = the experiment-driver role**, not a specific node.
+> That role is now `run_executor_node` (the webui leg-batch + auto-planner pathway).
+> The original `experiment_sequencer_node` is **DEPRECATED** (operator decision
+> 2026-06-12), kept only for the `sequencer_smoke` smoke-e2e until repointed. The
+> topic contract is unchanged either way.
 
 **Required bag topic set (D1):** `/wheel/odom` (raw L1 reference),
 `/wheel/odom_zeroed` (the stream the follower actually tracks; required for the

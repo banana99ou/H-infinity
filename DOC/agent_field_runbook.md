@@ -27,10 +27,16 @@ the AgileX LIMO. The end goal is a **paper-grade dataset** comparing LPV-H∞ vs
 PID-FF across a curvature sweep at fixed speed, gathered **unattended** on a
 rooftop track, with **RTK as post-hoc ground truth**.
 
-The system is **autonomous**: an experiment **sequencer** drives the whole loop —
+The system is **autonomous**: an experiment **executor** drives the whole loop —
 it repositions the robot to a start pin via RTK, zeroes odom, starts recording,
 runs the controller down a reference path, classifies the leg, turns around, and
 returns. Your job is to **start it correctly and supervise it**, not to drive it.
+
+> **Which executor:** the real data-gathering matrix runs through
+> **`run_executor_node`** + the webui leg-batch workflow (operator decision
+> 2026-06-12). The original `experiment_sequencer_node` is **DEPRECATED**, kept only
+> for the `run_smoke_e2e` smoke path this runbook arms (§5). The loop behaviour an
+> agent supervises is the same either way.
 
 **Definition of done (PASS):** `/experiment/status` reaches `phase: done` with
 `fail: 0`, and a **bag + sidecar** land under `Experiment Data/`. Anything else is
@@ -167,7 +173,8 @@ rr "$SRC timeout 8 ros2 topic hz /imu"             # ~100 Hz
 rr "bash ~/H-infinity/tools/preflight/preflight.sh"   # MUST exit 0
 ```
 Checks: node graph, the `cmd_vel_raw → estop → /cmd_vel` chain with a **single**
-`cmd_vel_raw` publisher (C6), Ackermann, battery ≥ 10.5 V, `/wheel/odom` > 30 Hz,
+`cmd_vel_raw` publisher (C6), Ackermann, battery (preflight code still gates ≥ 10.5 V;
+**canonical M2 halt is 10.0 V** — code sync pending, see `ToDo.md`), `/wheel/odom` > 30 Hz,
 and **RTK FIXED (quality=4)**.
 
 Then confirm the items preflight can't:
@@ -199,9 +206,11 @@ Get the **human "go"** (placement, Ackermann, wheels-on-floor, area clear) befor
 rr "$SRC ros2 topic pub --once /ops/cmd std_msgs/String \
   '{data: \"{\\\"action\\\":\\\"run_smoke_e2e\\\",\\\"confirmed_wheels_on_floor\\\":true}\"}'"
 ```
-`ops_node` kills the matrix `sequencer`, starts `sequencer_smoke` pinned to
-`smoke.yaml`, and auto-sends `{action:start}` once it idles. (Full matrix = the
-`sequencer` PROC + `experiment.yaml` instead.) `confirmed_wheels_on_floor:true` is
+`ops_node` kills the matrix driver, starts `sequencer_smoke` pinned to
+`smoke.yaml`, and auto-sends `{action:start}` once it idles. (This smoke path uses
+the **DEPRECATED** `sequencer_smoke`; the full data-gathering matrix runs through
+`run_executor` + the webui leg-batch workflow, **not** `experiment.yaml` + a
+sequencer PROC.) `confirmed_wheels_on_floor:true` is
 **mandatory** — `ops_node` refuses the arm without it.
 
 **The sequencer now runs itself** through its phase order — **do not touch it:**

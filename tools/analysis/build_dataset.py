@@ -56,6 +56,10 @@ def main(argv=None):
     ap.add_argument("--paper-run-ids", default=None,
                     help="comma-separated run_id allowlist (forwarded to "
                          "manifest + qc); only these count as paper data")
+    ap.add_argument("--rtk-frame", default="pin", choices=["pin", "achieved"],
+                    help="RTK-truth path-frame anchor (forwarded to run_eval + "
+                         "export): 'pin' (operator marker, default) or "
+                         "'achieved' (robot's actual RTK start pose)")
     args = ap.parse_args(argv)
 
     # GPS-denied venues have no RTK-truth; fall back to the odom-belief split.
@@ -123,7 +127,8 @@ def main(argv=None):
         tag = os.path.basename(bag_dir.rstrip("/"))
         out_metrics = os.path.join(metrics_dir, f"{tag}.metrics.json")
         try:
-            run_eval.main([bag_dir, "--out", out_metrics])
+            run_eval.main([bag_dir, "--out", out_metrics,
+                           "--rtk-frame", args.rtk_frame])
             n_ok += 1
         except (SystemExit, Exception) as exc:
             # One bad leg must not abort the whole build: run_eval raises
@@ -159,7 +164,8 @@ def main(argv=None):
         d = os.path.join(extracted, sub)
         if os.path.isdir(d):
             shutil.rmtree(d)
-    exp.main([bag_root, "--out", out, "--usable-only", "--manifest-dir", derived])
+    exp.main([bag_root, "--out", out, "--usable-only", "--manifest-dir", derived,
+              "--rtk-frame", args.rtk_frame])
 
     print(f"\n[build] dataset ready at {out}")
     print(f"[build]   raw/        -> pointer to {bag_root}")

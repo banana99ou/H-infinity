@@ -867,8 +867,24 @@ def load_sidecar(bag_dir, sidecar_arg):
 # Main
 # =============================================================================
 
-def evaluate(bag_dir, sidecar, t_transient=2.0, k_e=3.0):
-    """Run the full per-leg evaluation; return the metrics dict."""
+def evaluate(bag_dir, sidecar, t_transient=2.0, k_e=3.0, rtk_frame="pin"):
+    """Run the full per-leg evaluation; return the metrics dict.
+
+    ``rtk_frame`` selects the per-leg anchor the RTK-truth trajectory is scored
+    against:
+      * ``"pin"`` (default) — the operator's nominal start marker
+        (``venue.path_frame_anchor``). RTK-truth then carries the reposition
+        offset (the deliberate ~11 cm along-track undershoot + the start-heading
+        error), so its e_d/e_psi blend reposition with controller tracking.
+      * ``"achieved"`` — the robot's ACTUAL RTK pose at leg start
+        (``venue.achieved_anchor``). The reference curve "moves" to the real
+        start, absorbing the reposition offset so RTK-truth measures controller
+        tracking from where the robot really began — apples-to-apples with the
+        odom-belief side (which already re-anchors via /wheel/odom_zeroed). A
+        rigid SE(2) re-anchor removes a constant start offset but NOT a *growing*
+        error, so a genuine driven-vs-commanded shape mismatch (under-steer)
+        survives and is exactly what's left to measure.
+    """
     recipe = sidecar.get("path_recipe")
     if not recipe:
         raise SystemExit(
@@ -994,13 +1010,26 @@ def evaluate(bag_dir, sidecar, t_transient=2.0, k_e=3.0):
         result["rtk_heading_source"] = heading_src
         if heading_warn:
             result["warnings"].append(heading_warn)
-        # Re-anchor venue-local -> per-leg path frame using the start-pin pose
-        # carried in the sidecar (D4: trust the operator's pin; the residual e_d
-        # is reported as real — Increment 0 found the pin frame near-optimal and
-        # the ~0.1 m floor to be real driven-vs-commanded radius mismatch, not a
-        # frame error). Pass-through if absent (old bags).
+        # Re-anchor venue-local -> per-leg path frame. rtk_frame picks the anchor:
+        # "pin" = operator's nominal marker (path_frame_anchor); "achieved" = the
+        # robot's actual RTK pose at start (venue.achieved_anchor), which absorbs
+        # the reposition undershoot+heading so RTK-truth measures tracking from
+        # the real start. Falls back to the pin if "achieved" is missing/invalid.
+        leg_anchor, frame_source = path_frame_anchor, (
+            "start_pin" if path_frame_anchor is not None else "venue")
+        if rtk_frame == "achieved":
+            ach = venue.get("achieved_anchor") or {}
+            if (ach.get("valid") and ach.get("lat") is not None
+                    and ach.get("heading_deg") is not None):
+                leg_anchor = {"lat": ach["lat"], "lon": ach["lon"],
+                              "heading_deg": ach["heading_deg"]}
+                frame_source = "achieved"
+            else:
+                result["warnings"].append(
+                    "rtk_frame=achieved requested but achieved_anchor "
+                    "missing/invalid; fell back to the start pin")
         x, y, yaw = transform_to_path_frame(
-            x, y, yaw_vlocal, anchor, path_frame_anchor)
+            x, y, yaw_vlocal, anchor, leg_anchor)
         # RTK has no native body velocity; approximate from successive fixes.
         v = _speed_from_track(rtk["stamp"], x, y)
         sr_rtk = build_sim_result(
@@ -1015,15 +1044,16 @@ def evaluate(bag_dir, sidecar, t_transient=2.0, k_e=3.0):
             "lat0": anchor.lat0, "lon0": anchor.lon0,
             "bearing_deg": anchor.bearing_deg,
             "from_sidecar": anchor_spec is not None,
-            # D4 provenance: which frame the RTK-truth position was scored in.
-            "frame_source": ("start_pin" if path_frame_anchor is not None
-                             else "venue"),
+            # provenance: which per-leg frame the RTK-truth was scored in.
+            "rtk_frame_requested": rtk_frame,
+            "frame_source": frame_source,
+            "leg_anchor": (dict(leg_anchor) if leg_anchor is not None else None),
         }
         result["path_frame_anchor"] = (
             None if path_frame_anchor is None else dict(path_frame_anchor))
-        if path_frame_anchor is None:
+        if leg_anchor is None:
             result["warnings"].append(
-                "no venue.path_frame_anchor in sidecar; RTK-truth scored "
+                "no per-leg anchor (pin/achieved) in sidecar; RTK-truth scored "
                 "against the venue frame, not the per-leg path frame "
                 "(metrics may carry a fixed SE(2) offset)")
         if anchor_spec is None:
@@ -1055,8 +1085,11 @@ def _speed_from_track(stamp, x, y):
     return np.nan_to_num(v, nan=0.0)
 
 
-def build_per_sample_frame(bag_dir, sidecar, k_e=3.0, bag=None):
+def build_per_sample_frame(bag_dir, sidecar, k_e=3.0, bag=None, rtk_frame="pin"):
     """Per-sample aligned arrays for one leg, for the lossless export layer (T11).
+
+    ``rtk_frame`` matches ``evaluate``: "pin" (operator marker) or "achieved"
+    (robot's actual RTK start pose) for the RTK-truth path frame.
 
     Returns ``{"odom": {...}, "rtk": {...}, "gnss_rtk": {...}, "gnss_pix": {...},
     "meta": {...}}`` where each sub-dict maps column -> 1-D array. Reuses the same
@@ -1124,8 +1157,15 @@ def build_per_sample_frame(bag_dir, sidecar, k_e=3.0, bag=None):
         # D-HEAD: same fused-heading reference as the metrics path.
         yaw_vlocal, _hsrc, _hwarn = rtk_heading_reference(
             bag, r["stamp"], yaw_cog, _anchor, t0, t1)
+        leg_anchor = path_frame_anchor
+        if rtk_frame == "achieved":
+            ach = venue.get("achieved_anchor") or {}
+            if (ach.get("valid") and ach.get("lat") is not None
+                    and ach.get("heading_deg") is not None):
+                leg_anchor = {"lat": ach["lat"], "lon": ach["lon"],
+                              "heading_deg": ach["heading_deg"]}
         x, y, yaw = transform_to_path_frame(
-            x, y, yaw_vlocal, _anchor, path_frame_anchor)
+            x, y, yaw_vlocal, _anchor, leg_anchor)
         e_d, e_psi, kappa, rho, s_star, psi_des = errors_along_path(
             path, x, y, yaw, k_e=eff_k_e)
         t = _zero_to(r["stamp"], t0)
@@ -1162,11 +1202,15 @@ def main(argv=None):
     ap.add_argument("--k-e", type=float, default=3.0,
                     help="VFG convergence gain for e_psi reconstruction "
                          "(overridden by sidecar controller_tuning.k_e if set)")
+    ap.add_argument("--rtk-frame", default="pin", choices=["pin", "achieved"],
+                    help="anchor for the RTK-truth path frame: 'pin' (operator "
+                         "marker, default) or 'achieved' (robot's actual RTK "
+                         "start pose, absorbing the reposition offset)")
     args = ap.parse_args(argv)
 
     sidecar, sidecar_path = load_sidecar(args.bag, args.sidecar)
     result = evaluate(args.bag, sidecar, t_transient=args.t_transient,
-                      k_e=args.k_e)
+                      k_e=args.k_e, rtk_frame=args.rtk_frame)
     result["sidecar_path"] = os.path.abspath(sidecar_path)
 
     out = args.out or default_out_path(args.bag)

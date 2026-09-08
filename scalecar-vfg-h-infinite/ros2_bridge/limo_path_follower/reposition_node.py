@@ -339,6 +339,13 @@ class RepositionNode(Node):
         self.declare_parameter('slowdown_m', 0.50)           # ramp start dist to pin
         # Pure pursuit look-ahead distance.
         self.declare_parameter('lookahead_m', 0.60)
+        # Near-end look-ahead taper (undershoot/heading fix, field 2026-06-25):
+        # within ~lookahead/taper of the pin the effective look-ahead shrinks to
+        # lookahead_taper*d_end (floored at lookahead_min_m), so the robot tracks
+        # the authored tail STRAIGHT IN aligned instead of latching the bare pin
+        # from 0.6 m and arcing at it (which arrived ~12-22 deg off-heading).
+        self.declare_parameter('lookahead_taper', 0.60)
+        self.declare_parameter('lookahead_min_m', 0.25)
         # Geometric minimum turn radius (system_spec §6). kappa_max = 1/R_min.
         self.declare_parameter('r_min_m', 0.37)
         # Synthesised straight-tail length for a bare single-pin+heading goto, so
@@ -374,6 +381,12 @@ class RepositionNode(Node):
         self._min_speed = float(g('min_speed').value)
         self._slowdown = float(g('slowdown_m').value)
         self._lookahead = float(g('lookahead_m').value)
+        self._la_taper = float(g('lookahead_taper').value)
+        self._la_min = float(g('lookahead_min_m').value)
+        # Arc-length slack beyond the look-ahead for the crossing scan: lets the
+        # circle's forward crossing be found despite cross-track offset, while
+        # still bounding the scan so a far loop-back branch can't be latched.
+        self._la_arc_margin = 0.5 * self._lookahead
         r_min = max(1e-3, float(g('r_min_m').value))
         self._kappa_max = 1.0 / r_min
         self._tail_m = float(g('single_pin_tail_m').value)
@@ -420,6 +433,9 @@ class RepositionNode(Node):
         self._goto_seq = None
         self._waypoints = None       # list of (x, y) local, the curve to follow
         self._seg_i = 0              # current pure-pursuit segment index (monotone)
+        self._la_branch = '-'        # [io-dbg] which _lookahead_target branch fired
+        self._la_eff = self._lookahead  # effective (tapered) look-ahead this tick
+        self._la_tgt_xy = None       # last look-ahead target (local xy) for status
         self._end_yaw = None         # arrival heading target in local frame (rad); None = position-only
         self._speed = self._cruise   # forward speed for this mission
         self._pos_tol = self._pos_tol_default  # FIXED arrival radius for this mission
@@ -456,6 +472,13 @@ class RepositionNode(Node):
             durability=QoSDurabilityPolicy.TRANSIENT_LOCAL)
         self.pub_status = self.create_publisher(
             String, '/reposition/status', status_qos)
+        # Latched glue geometry for the WebUI overlay: the lat/lon waypoint
+        # polyline the node is following, published once per goto. TRANSIENT_LOCAL
+        # so a browser that connects mid-run still gets the current path. The live
+        # selected-segment index rides /reposition/status (seg_i), so the operator
+        # can watch which waypoint the tracker has latched (field 2026-06-25).
+        self.pub_path = self.create_publisher(
+            String, '/reposition/path', status_qos)
 
         self._timer = self.create_timer(1.0 / rate, self._control_cb)
 
@@ -711,6 +734,7 @@ class RepositionNode(Node):
             self._state = 'arrived'
             self._reason = 'already within tolerance (R4 no-op)'
             self._zero_cmd()
+            self._publish_path()
             self.get_logger().info(
                 f'goto: start pose already within tolerance (err {d_final:.3f} m); '
                 'no-op (R4).')
@@ -729,6 +753,8 @@ class RepositionNode(Node):
         self._min_dfinal = None      # closest approach to the final point
         self._state = 'driving'
         self._reason = ''
+        self._la_tgt_xy = None
+        self._publish_path()
         _eh = ('position-only' if end_yaw is None
                else f'{math.degrees(end_yaw):.1f} deg (local)')
         self.get_logger().info(
@@ -844,7 +870,11 @@ class RepositionNode(Node):
         # Arrival: GATED ON POSITION (an Ackermann robot can't fix heading once
         # stopped at the point — heading is achieved by tracking the authored
         # tail and is reported, not blocked on). The reason notes heading vs band.
-        if d_final <= pos_tol:
+        # PROGRESS-GATED (field 2026-06-17): within pos_tol of the end pin is
+        # arrival ONLY once the tracker has driven to the last segment — else a
+        # path that passes within pos_tol of its own end pin MID-RUN (close pins
+        # / self-intersection) falsely "arrives" and the run jumps start->end.
+        if d_final <= pos_tol and self._seg_i >= len(self._waypoints) - 2:
             self._state = 'arrived'
             self._zero_cmd()
             if self._end_yaw is None:
@@ -900,6 +930,7 @@ class RepositionNode(Node):
 
         # Pure-pursuit steering target on the polyline.
         tx, ty = self._lookahead_target()
+        self._la_tgt_xy = (tx, ty)       # for the WebUI overlay target marker
         bearing = math.atan2(ty - self._fix_xy[1], tx - self._fix_xy[0])
         alpha = _wrap(bearing - self._heading_est)
 
@@ -918,7 +949,8 @@ class RepositionNode(Node):
             # pos_tol + slack as arrival; report the TRUE miss distance.
             closest = d_final if self._min_dfinal is None else self._min_dfinal
             if (d_final <= self._lookahead
-                    and closest <= pos_tol + self._pos_tol_slack):
+                    and closest <= pos_tol + self._pos_tol_slack
+                    and self._seg_i >= len(self._waypoints) - 2):
                 self._state = 'arrived'
                 self._zero_cmd()
                 self._reason = (
@@ -935,11 +967,15 @@ class RepositionNode(Node):
             self._abort(f'look-ahead target {math.degrees(alpha):.0f} deg off '
                         'the nose while tracking (forward-only cannot reach '
                         'it) — overshot the path end or joined a backward '
-                        'segment')
+                        f'segment [io-dbg seg={self._seg_i} la={self._la_branch} '
+                        f'tgt=({tx:.2f},{ty:.2f}) d_final={d_final:.2f}]')
             return
 
-        # Curvature to the look-ahead point, clamped to the physical R_min.
-        kappa_raw = 2.0 * math.sin(alpha) / self._lookahead
+        # Curvature to the look-ahead point, clamped to the physical R_min. Uses
+        # the TAPERED look-ahead (_la_eff, set by _lookahead_target this tick): a
+        # shorter look-ahead near the pin steers tighter onto the authored tail,
+        # so the robot arrives aligned (undershoot/heading fix 2026-06-25).
+        kappa_raw = 2.0 * math.sin(alpha) / self._la_eff
         kappa = max(-self._kappa_max, min(self._kappa_max, kappa_raw))
 
         # Constant cruise, ramped down approaching the final point.
@@ -952,12 +988,13 @@ class RepositionNode(Node):
         # seg/target/alpha/kappa explain WHY it steered where it did. *CLAMP means
         # R_min is binding (path demands a tighter turn than the chassis can make).
         self.get_logger().info(
-            f'[io-dbg] CTL seg={self._seg_i} tgt=({tx:.2f},{ty:.2f}) '
+            f'[io-dbg] CTL seg={self._seg_i} la={self._la_branch} '
+            f'tgt=({tx:.2f},{ty:.2f}) L={self._la_eff:.2f} '
             f'd_final={d_final:.2f} xtrack={xtrack:.2f} '
             f'alpha={math.degrees(alpha):.1f}deg '
             f'kappa={kappa:.2f}/{kappa_raw:.2f}'
             f'{"*CLAMP" if kappa != kappa_raw else ""} q={self._rtk_quality}',
-            throttle_duration_sec=1.0)
+            throttle_duration_sec=0.25)
         self._publish_status(
             err_m=d_final,
             err_deg=(float('nan') if head_err is None
@@ -993,9 +1030,19 @@ class RepositionNode(Node):
         # and tracks all of it instead of cutting to whatever segment is
         # nearest (field failure 2026-06-11: parked before the start, the
         # node joined seg 30/30 5.5 m away and arrived heading-off).
-        on_path = polyline_dist((rx, ry), wps) <= self._acquire_radius
+        xtrack0 = polyline_dist((rx, ry), wps)
+        on_path = xtrack0 <= self._acquire_radius
         best = None                      # (cross-track dist, segment index)
+        # [io-dbg] per-segment join diagnostics: (i, target_j, alpha_deg,
+        # feasible, cross-track_d). One-shot per mission — verbose on purpose so
+        # the next field log shows WHY a segment was chosen (H1 join-anchor vs
+        # H2 window-too-tight). nearest_seg = where the robot actually sits.
+        diag = []
+        nearest_seg, nearest_d = 0, float('inf')
         for i in range(n - 1):
+            d = point_seg_dist((rx, ry), wps[i], wps[i + 1])
+            if d < nearest_d:
+                nearest_d, nearest_seg = d, i
             # Join target: first waypoint beyond i that is usefully ahead.
             tx, ty = None, None
             for j in range(i + 1, n):
@@ -1003,20 +1050,44 @@ class RepositionNode(Node):
                     tx, ty = wps[j]
                     break
             if tx is None:
+                diag.append((i, None, None, False, d))
                 continue                 # only near-coincident points remain
             alpha = _wrap(math.atan2(ty - ry, tx - rx) - self._heading_est)
-            if abs(alpha) > self._infeasible:
+            feasible = abs(alpha) <= self._infeasible
+            diag.append((i, j, math.degrees(alpha), feasible, d))
+            if not feasible:
                 continue
-            d = point_seg_dist((rx, ry), wps[i], wps[i + 1])
             if on_path:
                 if best is None or d < best[0]:
                     best = (d, i)
             else:
                 best = (d, i)            # earliest feasible wins
                 break
+        # [io-dbg] JOIN dump — pose, both endpoints, where the robot really is,
+        # and the full feasibility map. Decisive for H1 vs H2.
+        d0 = math.hypot(wps[0][0] - rx, wps[0][1] - ry)
+        dN = math.hypot(wps[-1][0] - rx, wps[-1][1] - ry)
+        feas_idx = [e[0] for e in diag if e[3]]
+        self.get_logger().info(
+            f'[io-dbg] JOIN robot=({rx:.2f},{ry:.2f}) '
+            f'hdg={math.degrees(self._heading_est):.1f}deg n={n} '
+            f'on_path={on_path} xtrack={xtrack0:.2f} | '
+            f'wp0=({wps[0][0]:.2f},{wps[0][1]:.2f}) d0={d0:.2f} | '
+            f'wpN=({wps[-1][0]:.2f},{wps[-1][1]:.2f}) dN={dN:.2f} | '
+            f'nearest_seg={nearest_seg} (d={nearest_d:.2f})')
+        self.get_logger().info(
+            f'[io-dbg] JOIN feasible_segs={feas_idx} | '
+            f'segmap=' + ','.join(
+                f'{e[0]}:{("%.0f" % e[2]) if e[2] is not None else "--"}'
+                f'{"F" if e[3] else "x"}d{e[4]:.2f}' for e in diag))
         if best is None:
+            self.get_logger().warn(
+                '[io-dbg] JOIN -> NO feasible segment (abort)')
             return False
         self._seg_i = best[1]
+        self.get_logger().info(
+            f'[io-dbg] JOIN -> seg_i={best[1]}/{n - 2} '
+            f'(d={best[0]:.2f} cross-track, nearest_seg={nearest_seg})')
         if best[1] != 0:
             self.get_logger().info(
                 f'joining path at segment {best[1]}/{n - 2} '
@@ -1024,43 +1095,108 @@ class RepositionNode(Node):
                 'the path prefix behind the robot is skipped, not driven.')
         return True
 
-    def _lookahead_target(self):
-        """Pure-pursuit look-ahead point on the polyline.
+    def _eff_lookahead(self, d_end):
+        """Tapered look-ahead near the pin (undershoot/heading fix 2026-06-25).
 
-        Walk forward from the current segment; the first segment that the
-        look-ahead circle crosses gives the target (farthest crossing). If none
-        crosses (within a look-ahead of the end, or off-path), aim at the final
-        point — driving straight in, or re-acquiring. self._seg_i only advances.
+        Far from the end the full ``lookahead_m`` is used; within ~lookahead/
+        taper of the pin the effective look-ahead shrinks to ``taper * d_end``,
+        floored at ``lookahead_min_m``. The smaller look-ahead makes the crossing
+        scan (and the kappa it feeds) track the authored TAIL straight in, so the
+        robot arrives ALIGNED instead of latching the bare pin from 0.6 m and
+        arcing at it from the side. Shared by _lookahead_target and _control_cb.
+        """
+        return max(self._la_min, min(self._lookahead, self._la_taper * d_end))
+
+    def _lookahead_target(self):
+        """Pure-pursuit look-ahead point on the polyline (field 2026-06-25).
+
+        Restores HEAD's robust off-path-reacquire + near-end-endpin behaviour
+        AND keeps the curve from JUMPING start->end on close-pin / self-
+        intersecting glue, by tracking ``_seg_i`` honestly first:
+
+          1. ADVANCE ``_seg_i`` past every waypoint the robot has gone beyond —
+             monotone and CONTIGUOUS (one segment at a time, only when the foot-
+             point projects past the segment end). Contiguous advance cannot skip
+             across a self-intersection to a far branch, and it makes the seg_i-
+             based progress gates below actually reachable.
+          2. ENDGAME (progress-gated seg_i>=last-1): within ``lookahead_min_m`` of
+             the end pin, aim straight at it. Decoupled from the look-ahead so the
+             tapered crossing scan tracks the tail in (aligned) first; still gated
+             so a mid-run end-pin pass never latches it (the jump).
+          3. CROSSING scan from seg_i with the TAPERED look-ahead, BOUNDED by arc
+             length and FORWARD-only — a far loop-back branch within the circle
+             but a long way along the path can never be latched.
+          4. FALLBACK: nearest point on the CURRENT segment (off-path reacquire;
+             the 2026-06-11 fix — never beeline to the curve end from off-path).
+
+        _control_cb's arrival + undershoot gates carry the same seg_i>=last-1
+        condition, so a mid-run end-pin pass is never mistaken for arrival.
+        Validated in sim across the off-path/near-end regressions, the self-
+        intersecting + end-pin-mid-run adversarial paths, AND the undershoot
+        taper sweep. self._seg_i only advances.
         """
         wps = self._waypoints
         n = len(wps)
         if n == 1:
+            self._la_branch = 'single'
+            self._la_eff = self._lookahead
             return wps[0]
         last = n - 1
         rx, ry = self._fix_xy
-        # Endgame first: within a look-ahead of the final point, aim straight
-        # at it. This must PRECEDE the crossing loop — near the end the far
-        # crossing leaves the path and the loop degenerates to the crossing
-        # BEHIND the robot, which only ever "worked" via the alpha~180
-        # steering singularity the forward-cone guard now forbids.
-        if math.hypot(wps[last][0] - rx, wps[last][1] - ry) <= self._lookahead:
+        d_end = math.hypot(wps[last][0] - rx, wps[last][1] - ry)
+        self._la_eff = self._eff_lookahead(d_end)   # shared with _control_cb kappa
+        # 1. Advance _seg_i past waypoints the robot has gone beyond. The foot-
+        # point projection parameter t>=1 means the robot is beyond this
+        # segment's far end; step one segment and re-test (contiguous, monotone).
+        # GATED on proximity to the waypoint being passed (<= acquire_radius): a
+        # robot joined at seg 0 but sitting OFF-path near the tail must NOT fast-
+        # forward to the end — the join chose seg 0 to drive the whole curve, and
+        # the reacquire fallback walks it to the START (field failure 2026-06-11).
+        while self._seg_i < last - 1:
+            ax, ay = wps[self._seg_i]
+            bx, by = wps[self._seg_i + 1]
+            dx = bx - ax
+            dy = by - ay
+            d2 = dx * dx + dy * dy
+            t = 0.0 if d2 < 1e-12 else ((rx - ax) * dx + (ry - ay) * dy) / d2
+            if t >= 1.0 and math.hypot(bx - rx, by - ry) <= self._acquire_radius:
+                self._seg_i += 1
+            else:
+                break
+        # 2. Endgame (progress-gated): on the last segment AND within LMIN of the
+        # end pin -> aim straight at it. Decoupled from the look-ahead so the
+        # tapered crossing scan below tracks the tail in (aligned) first.
+        if self._seg_i >= last - 1 and d_end <= self._la_min:
+            self._la_branch = f'endpin[{self._seg_i}]'
             return wps[last]
+        # 3. Crossing scan from seg_i with the TAPERED look-ahead, bounded by arc
+        # length so a far loop-back cannot be latched; forward-only rejects a
+        # behind-the-nose crossing.
+        arc = 0.0
+        behind = 0
         for i in range(self._seg_i, last):
-            t = seg_circle_far_t(self._fix_xy, self._lookahead, wps[i], wps[i + 1])
+            t = seg_circle_far_t(self._fix_xy, self._la_eff, wps[i], wps[i + 1])
             if t is not None:
-                self._seg_i = i
                 ax, ay = wps[i]
                 bx, by = wps[i + 1]
-                return (ax + (bx - ax) * t, ay + (by - ay) * t)
-        # No crossing and not near the end: the robot is off-path. Re-acquire
-        # by aiming at the nearest point on the CURRENT segment only — the
-        # old fallback aimed at the curve END, so a robot 1.2 m off-path
-        # beelined past the whole authored curve (field failure 2026-06-11).
-        # Restricting to _seg_i (not the globally nearest remaining point)
-        # preserves the join decision: a robot joined at seg 0 walks to the
-        # curve START even when the tail happens to be nearer. Normal pursuit
-        # resumes as soon as the look-ahead circle crosses the path again; a
-        # target that ends up behind the nose trips the forward-cone guard.
+                px = ax + (bx - ax) * t
+                py = ay + (by - ay) * t
+                fwd = (self._heading_est is None
+                       or abs(_wrap(math.atan2(py - ry, px - rx)
+                                    - self._heading_est)) <= math.pi / 2)
+                if fwd:
+                    self._seg_i = i
+                    self._la_branch = f'win{i}'
+                    return (px, py)
+                behind += 1
+            arc += math.hypot(wps[i + 1][0] - wps[i][0], wps[i + 1][1] - wps[i][1])
+            if arc > self._la_eff + self._la_arc_margin:
+                break
+        # 4. Off-path reacquire: nearest point on the CURRENT segment only (never
+        # the curve end — a robot 1.2 m off-path used to beeline past the whole
+        # curve, field failure 2026-06-11). Normal pursuit resumes as soon as the
+        # circle crosses the path again.
+        self._la_branch = f'reacquire[{self._seg_i}]b{behind}'
         return point_seg_nearest((rx, ry), wps[self._seg_i],
                                  wps[min(self._seg_i + 1, last)])
 
@@ -1111,6 +1247,30 @@ class RepositionNode(Node):
             err_deg = float('nan')
         self._publish_status(err_m=err_m, err_deg=err_deg, reason=reason)
 
+    def _publish_path(self):
+        """Publish the current glue polyline (lat/lon) for the WebUI overlay.
+
+        Converts the LOCAL waypoints the tracker actually follows back to lat/lon
+        (sub-mm round-trip) so the drawn polyline is 1:1 with ``seg_i`` — the
+        single-pin synthesised-entry case keeps the overlay and the tracked curve
+        identical. Latched (TRANSIENT_LOCAL): published once per goto; the live
+        ``seg_i`` selection rides ``/reposition/status``.
+        """
+        if self._waypoints is None or self._geo is None or self._anchor is None:
+            return
+        try:
+            ll = self._geo.local_to_latlon(self._waypoints, self._anchor)
+            wl = [[round(float(p[0]), 7), round(float(p[1]), 7)] for p in ll]
+        except Exception as exc:
+            self.get_logger().warn(f'[io-dbg] path overlay convert failed: {exc}')
+            return
+        m = String()
+        m.data = json.dumps({'seq': self._goto_seq, 'n': len(wl),
+                             'waypoints': wl})
+        self.pub_path.publish(m)
+        self.get_logger().info(
+            f'[io-dbg] OUT path -> seq={self._goto_seq} n={len(wl)} (latched)')
+
     def _publish_status(self, err_m, err_deg, reason=None):
         payload = {
             'state': self._state,
@@ -1120,7 +1280,23 @@ class RepositionNode(Node):
             # Echo of the goto's 'seq' (None for manual/legacy gotos): lets the
             # orchestrator ignore status that narrates an older goto.
             'seq': self._goto_seq,
+            # Live tracker selection for the WebUI overlay (field 2026-06-25):
+            # which segment the pure-pursuit has latched, the polyline length, and
+            # the look-ahead branch tag — the operator sees the curve march (or
+            # stick at seg 0, the seq-6 failure signature).
+            'seg_i': self._seg_i,
+            'n': (len(self._waypoints) if self._waypoints is not None else 0),
+            'la': self._la_branch,
         }
+        # Look-ahead target -> lat/lon for the overlay X marker (where it aims).
+        if (self._la_tgt_xy is not None and self._geo is not None
+                and self._anchor is not None):
+            try:
+                t_ll = self._geo.local_to_latlon([self._la_tgt_xy], self._anchor)[0]
+                payload['tgt'] = [round(float(t_ll[0]), 7),
+                                  round(float(t_ll[1]), 7)]
+            except Exception:
+                pass
         m = String()
         m.data = json.dumps(payload)
         self.pub_status.publish(m)

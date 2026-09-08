@@ -30,8 +30,8 @@ canonical — fix that one.
 
 | Path | What |
 |---|---|
-| `scalecar-vfg-h-infinite/` | Professor's controller + guidance library (vendored). `vfg_pathfollowing/` is the algorithm; `ros2_bridge/` is our `path_follower_node`. Keep upstream drops isolated from our patches. |
-| `tools/path_gen/` | Browser battle station: Leaflet map + parametric path designer + rosbridge live link + run controls + inline teleop + operator alerts (low battery, bad/stale RTK, sequencer pause, disconnect) (`interactive.html`). |
+| `scalecar-vfg-h-infinite/` | Professor's controller + guidance library (vendored). `vfg_pathfollowing/` is the algorithm; `ros2_bridge/` is our ROS layer: `path_follower_node`, **`run_executor_node` (the live experiment driver)**, and `experiment_sequencer_node` (**`DEPRECATED`** 2026-06-12 — `sequencer_smoke` smoke-e2e only). Keep upstream drops isolated from our patches. |
+| `tools/path_gen/` | Browser battle station: Leaflet map + parametric path designer + rosbridge live link + run controls + inline teleop + operator alerts (low battery, bad/stale RTK, run pause, disconnect) (`interactive.html`). |
 | `tools/orchestrator/` | `start_battle.sh`, the `limo-battle` systemd service + installer. |
 | `tools/network/` | NetworkManager AP-on-tether dispatcher (auto-switch client WiFi ↔ LIMO AP). |
 | `tools/preflight/` | `preflight.sh` — pre-rooftop field-readiness checks. |

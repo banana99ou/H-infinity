@@ -120,7 +120,7 @@ def _keyed(columns, run_id, cell_id, leg):
     return out
 
 
-def export_leg(leg, ps_dir, gnss_dir):
+def export_leg(leg, ps_dir, gnss_dir, rtk_frame="pin"):
     """Export one leg's per-sample + GNSS tables. Returns a provenance record."""
     bag_dir = leg["bag_dir"]
     sc = leg["sidecar"] or {}
@@ -132,7 +132,8 @@ def export_leg(leg, ps_dir, gnss_dir):
     written = {}
     try:
         bag = run_eval.read_bag(bag_dir)
-        frame = run_eval.build_per_sample_frame(bag_dir, sc, bag=bag)
+        frame = run_eval.build_per_sample_frame(
+            bag_dir, sc, bag=bag, rtk_frame=rtk_frame)
     except Exception as exc:
         return {"bag_dir": bag_dir, "tag": tag, "error": str(exc),
                 "written": written}
@@ -263,6 +264,8 @@ def main(argv=None):
                     help="restrict to qc's usable_legs.json under the bag-root")
     ap.add_argument("--manifest-dir", default=None,
                     help="where qc/manifest outputs live (default <bag_root>/_manifest)")
+    ap.add_argument("--rtk-frame", default="pin", choices=["pin", "achieved"],
+                    help="RTK-truth path-frame anchor: 'pin' or 'achieved'")
     args = ap.parse_args(argv)
 
     extracted = os.path.join(args.out, "extracted")
@@ -286,7 +289,8 @@ def main(argv=None):
 
     provenance = []
     for leg in legs:
-        provenance.append(export_leg(leg, ps_dir, gnss_dir))
+        provenance.append(export_leg(leg, ps_dir, gnss_dir,
+                                     rtk_frame=args.rtk_frame))
 
     with open(os.path.join(extracted, "data_dictionary.md"), "w",
               encoding="utf-8") as f:

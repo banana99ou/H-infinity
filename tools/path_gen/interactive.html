@@ -931,6 +931,13 @@ let startMarker = null, endMarker = null, robotMarker = null, robotHeadingLine =
 let rtkMarker = null, gpsRawMarker = null;
 let rtkHeadingLine = null;                      // fused-heading vector on the RTK marker
 let robotFusedLine = null;                      // fused-heading vector on the belief dot
+// Reposition glue overlay (field 2026-06-25): the latched /reposition/path
+// polyline + per-waypoint dots, plus the live selected-segment ring and the
+// look-ahead target marker driven by /reposition/status. Lets the operator
+// watch which waypoint the tracker has latched (seg-0 stick = the seq-6 fail).
+let repoPathLayer = null, repoDotLayer = null;
+let repoSelMarker = null, repoTgtMarker = null;
+let repoPathLL = null;                          // [[lat,lon],...] indexable by seg_i
 let lastFusedHeading = { deg: null, t: 0 };     // /heading/fused (compass deg E-of-N)
 let pathAnchorPosMarker = null, pathAnchorTipMarker = null, pathAnchorLine = null;
 
@@ -1241,6 +1248,7 @@ let topicOdomStatus = null;       // latched /odom_zero/status feedback
 // the same robot contracts the autonomous sequencer uses. Pure rosbridge; the
 // per-phase primitives (reposition, recipe, set_parameters, bag) already exist.
 let topicRepoGoto = null, topicRepoStatus = null;  // /reposition/{goto,status}
+let topicRepoPath = null;                          // /reposition/path (latched overlay)
 let topicBagCmd = null, topicBagStatus = null;     // /bag/{cmd,status} (bag_node)
 let topicRefRecipe = null;        // /reference_path_recipe (analytic curve, latched)
 let manualPins = [];              // venue pins mirrored for the manual-run dropdown
@@ -1600,6 +1608,12 @@ function subscribeAll() {
     ros, name: '/reposition/status', messageType: 'std_msgs/msg/String'
   });
   topicRepoStatus.subscribe(onRepoStatus);
+  // Glue geometry overlay: latched, so we get the current path on (re)connect.
+  topicRepoPath = new ROSLIB.Topic({
+    ros, name: '/reposition/path', messageType: 'std_msgs/msg/String',
+    queue_length: 1, latch: true
+  });
+  topicRepoPath.subscribe(onRepoPath);
   // Manual bag recorder (bag_node): start/stop + live status. Records only.
   topicBagCmd = new ROSLIB.Topic({
     ros, name: '/bag/cmd', messageType: 'std_msgs/msg/String'
@@ -2991,15 +3005,61 @@ function refreshManualPins() {
   }).join('');
   if (prev !== '' && manualPins[prev]) sel.value = prev;
 }
+function clearRepoOverlay() {
+  for (const o of [repoPathLayer, repoDotLayer, repoSelMarker, repoTgtMarker]) {
+    if (o) map.removeLayer(o);
+  }
+  repoPathLayer = repoDotLayer = repoSelMarker = repoTgtMarker = null;
+}
+
+// Latched /reposition/path: the glue polyline (lat/lon, 1:1 with the tracker's
+// seg_i). Redraw the polyline + a small dot per waypoint; the live selection
+// ring + target marker are added by onRepoStatus.
+function onRepoPath(msg) {
+  let d; try { d = JSON.parse(msg.data); } catch (e) { return; }
+  const wl = d.waypoints;
+  if (!Array.isArray(wl) || wl.length < 1) { clearRepoOverlay(); repoPathLL = null; return; }
+  repoPathLL = wl.map(p => [+p[0], +p[1]]);
+  clearRepoOverlay();
+  repoPathLayer = L.polyline(repoPathLL, { color: '#0bf', weight: 2, opacity: 0.9 }).addTo(map);
+  repoDotLayer = L.layerGroup(repoPathLL.map((ll, i) => L.circleMarker(ll, {
+    radius: 3, color: '#0bf', fillColor: '#fff', fillOpacity: 1, weight: 1,
+  }).bindTooltip(`wp ${i}`, { direction: 'top' }))).addTo(map);
+}
+
+// Live selected waypoint (seg_i) + look-ahead target (tgt) from the status.
+function updateRepoSelection(d) {
+  if (repoPathLL && d.seg_i != null && d.seg_i >= 0 && d.seg_i < repoPathLL.length) {
+    const sll = repoPathLL[d.seg_i];
+    if (!repoSelMarker) {
+      repoSelMarker = L.circleMarker(sll, {
+        radius: 9, color: '#ff0', fillColor: '#f80', fillOpacity: 0.85, weight: 3,
+      }).addTo(map);
+    } else { repoSelMarker.setLatLng(sll); }
+    repoSelMarker.bindTooltip(`seg ${d.seg_i}/${(d.n || 1) - 1} · ${d.la || ''}`,
+                              { direction: 'bottom' });
+  }
+  if (Array.isArray(d.tgt) && d.tgt.length === 2) {
+    const tll = [+d.tgt[0], +d.tgt[1]];
+    if (!repoTgtMarker) {
+      repoTgtMarker = L.circleMarker(tll, {
+        radius: 5, color: '#f0f', fillColor: '#f0f', fillOpacity: 0.5, weight: 2,
+      }).addTo(map).bindTooltip('look-ahead target');
+    } else { repoTgtMarker.setLatLng(tll); }
+  }
+}
+
 function onRepoStatus(msg) {
   let d; try { d = JSON.parse(msg.data); } catch (e) { return; }
+  updateRepoSelection(d);              // overlay update is independent of the DOM
   const el = $('mr-repo-state'); if (!el) return;
   const state = d.state || '?';
   const em = (d.err_m != null) ? ` err=${(+d.err_m).toFixed(2)}m` : '';
   const ed = (d.err_deg != null) ? ` ${(+d.err_deg).toFixed(0)}°` : '';
+  const seg = (d.seg_i != null) ? ` seg ${d.seg_i}/${(d.n || 1) - 1}` : '';
   const reason = d.reason ? ` — ${d.reason}` : '';
   const cls = state === 'arrived' ? 'ok' : (state === 'aborted' ? 'err' : '');
-  el.innerHTML = `<span class="${cls}">reposition: ${state}${em}${ed}${reason}</span>`;
+  el.innerHTML = `<span class="${cls}">reposition: ${state}${em}${ed}${seg}${reason}</span>`;
 }
 function onBagStatus(msg) {
   let d; try { d = JSON.parse(msg.data); } catch (e) { return; }

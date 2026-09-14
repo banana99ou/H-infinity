@@ -43,6 +43,78 @@ NUC. Keep them in mind before declaring a runtime environment "ready".
    ```
    Recreate the symlink if the repo moves.
 
+## Gotchas that will bite you (read before debugging anything)
+
+Each of these has cost real hours. They look like bugs in your code; they are not.
+
+### G1 · `git pull` on the NUC aborts: "untracked working tree files would be overwritten"
+
+**Cause.** Two sync mechanisms overlap. `tools/sync/sync.sh push` rsyncs files
+laptop→NUC, where they land **untracked**. When those same paths later arrive as
+*tracked* files in a commit, `git pull --ff-only` refuses rather than clobber them.
+`git reset` does **not** help — reset does not touch untracked files.
+
+**Symptom.** The NUC sits many commits behind `origin/main` and every pull aborts.
+`git status` shows a clean tree, which makes it look like nothing is wrong.
+
+**Fix.** List the real collisions, move them aside, pull:
+
+```bash
+cd /home/agilex/H-infinity
+git fetch origin main
+# NOTE: -uall is required. Plain `git status --porcelain` collapses untracked
+# DIRECTORIES into one entry, so files inside them are invisible and you will
+# under-count the collisions.
+git status --porcelain -uall | awk '/^\?\?/{ $1=""; sub(/^ /,""); print }' | sort > /tmp/untracked.txt
+git diff --name-status HEAD origin/main | awk '$1=="A"{ $1=""; sub(/^\t?[ ]?/,""); print }' | sort > /tmp/incoming.txt
+comm -12 /tmp/incoming.txt /tmp/untracked.txt > /tmp/collisions.txt
+
+BK=/home/agilex/nuc_untracked_backup_$(date +%Y%m%d-%H%M%S); mkdir -p "$BK"
+while IFS= read -r f; do
+  [ -f "$f" ] && { mkdir -p "$BK/$(dirname "$f")"; mv "$f" "$BK/$f"; }
+done < /tmp/collisions.txt
+
+git pull --ff-only origin main
+```
+
+Move, never delete — a colliding file is occasionally a local draft that was never
+committed. Diff against `origin/main` before discarding the backup.
+
+**Avoiding it.** Prefer `git pull` on the NUC for *code*, and use `sync.sh push`
+only for work that is not committed yet. The two paths fight whenever both carry
+the same file.
+
+### G2 · Pin headings render mirrored vs `reposition_node`
+
+The battle-station venue editor and `reposition_node` disagree on heading sign, so
+a venue that looks correct on screen can steer the robot the opposite way. Never
+trust the rendered arrow alone — verify the commanded heading on the robot before
+a run, especially after hand-editing a venue JSON.
+
+### G3 · A duplicate `odom_zero_node` silently corrupts a run
+
+A manually started `ros2 run ... odom_zero_node` left over from an earlier session
+keeps publishing alongside the stack's own. Two publishers on
+`/wheel/odom_zeroed` produce conflicting zero points and unexpected motion.
+
+Check before every drive — it must be exactly 1:
+
+```bash
+ros2 topic info /wheel/odom_zeroed --verbose | grep -c "Node name"
+```
+
+### G4 · The compass is silent indoors, and that is normal
+
+`/pixhawk/global_position/compass_hdg` and every other fused MAVROS topic stay
+silent without a GPS/EKF fix; only raw IMU streams. Indoors this looks exactly
+like a dead compass or bad wiring. It is neither. Confirm `compass_hdg` is live
+under RTK outdoors as the first field step, before concluding anything is broken.
+
+The Pixhawk is also mounted rotated 90°, so its heading carries a fixed offset
+that must be calibrated against RTK course-over-ground.
+
+---
+
 ## Bench / pedestal testing (synthetic sim) — NOT the field test
 
 **There are two distinct test paths; do not confuse them.** A fresh session told

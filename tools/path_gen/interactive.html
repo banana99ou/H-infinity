@@ -1223,6 +1223,7 @@ let ros = null;
 let topicEstop = null, topicEstopState = null, topicRefPath = null, topicReset = null;
 let topicOdom = null, topicStatus = null;
 let topicOrchStart = null, topicOrchKill = null, topicOrchStatus = null;
+let latestOrchState = null;       // last /orchestrator/status (PROC -> alive)
 let topicRtkFix = null, topicPixhawkFix = null;
 let topicFusedHeading = null;     // /heading/fused (heading_node EKF, Float64 deg E-of-N)
 let topicHeadingCmd = null;       // /heading/cmd (explicit recalibration command)
@@ -1692,10 +1693,12 @@ const STACK_LABELS = {
   run_executor:  'run_executor_node (Start backend)',
   geofence:      'geofence_watchdog (safety)',
   odom_watchdog: 'odom_watchdog (base-serial recovery)',
+  rtk_watchdog:  'rtk_watchdog (RTK health + auto-pause)',
 };
 function onOrchStatus(msg) {
   let state;
   try { state = JSON.parse(msg.data); } catch (e) { return; }
+  latestOrchState = state;
   const detail = state._detail || {};
   const rows = Object.keys(STACK_LABELS).map(name => {
     const alive = !!state[name];
@@ -2232,9 +2235,17 @@ function onHeadingStatus(msg) {
   const el = $('heading-cal-state');
   const btn = $('btn-recal-heading');
   const collecting = (d.cal_state || '').startsWith('collecting');
-  if (btn && !btn.disabled) {
-    btn.textContent = collecting
-      ? `Cancel calibration (${d.cal_state})` : 'Recalibrate heading';
+  // Compass fusion is OFF by field decision (2026-06-16): heading is gyro + RTK
+  // course-over-ground and there is no compass offset to calibrate. Say so on
+  // the button instead of letting a press be silently refused in the log.
+  const compassOff = d.compass_enabled === false;
+  if (btn) {
+    btn.disabled = compassOff;
+    btn.title = compassOff
+      ? 'compass fusion is OFF (enable_compass:=false) — nothing to calibrate'
+      : '';
+    btn.textContent = compassOff ? 'Compass OFF — no calibration needed'
+      : (collecting ? `Cancel calibration (${d.cal_state})` : 'Recalibrate heading');
   }
   if (!el) return;
   const off = (d.compass_offset_deg !== null && d.compass_offset_deg !== undefined)
@@ -2242,12 +2253,28 @@ function onHeadingStatus(msg) {
     : 'no offset';
   let cal;
   if (collecting) {
-    cal = `<span class="warn">${d.cal_state} — drive STRAIGHT FORWARD under RTK</span>`;
+    // cal_state already carries the specific blocker (heading_node appends it),
+    // so only fall back to the generic advice when nothing is blocking. Field
+    // 2026-09-16: a bare "collecting 0/5" hid 88 RTK dropouts for nine minutes.
+    const hint = d.cal_block_reason ? '' : ' — drive STRAIGHT FORWARD under RTK';
+    const resets = d.cal_resets
+      ? ` <br><span class="err">baseline discarded ${d.cal_resets}x — the fix or the driving keeps breaking the run</span>`
+      : '';
+    const need = (d.cal_need_travel_m !== null && d.cal_need_travel_m !== undefined)
+      ? ` <br><span class="warn">needs ${d.cal_need_travel_m.toFixed(2)} m straight per sample at this fix quality${d.cal_forced ? ' (FORCED)' : ''}</span>`
+      : '';
+    cal = `<span class="warn">${d.cal_state}${hint}</span>${need}${resets}`;
   } else if (d.cal_state === 'calibrated') {
     cal = `<span class="ok">calibrated</span>, ${off}`;
   } else {
     cal = `<span class="err">${d.cal_state || 'unknown'}</span>, ${off}`;
   }
+  if (compassOff) {
+    cal = `<span class="ok">compass OFF</span> — heading = gyro + RTK course-over-ground (anchors on the first forward drive under RTK)`;
+  }
+  const refused = d.cal_refusal
+    ? ` <br><span class="err">recalibration REFUSED: ${d.cal_refusal}</span>`
+    : '';
   const conflict = d.src_conflict
     ? ' <br><span class="err">SOURCE CONFLICT: compass vs mag disagree — heading NOT trustworthy; recalibrate under RTK</span>'
     : '';
@@ -2256,7 +2283,7 @@ function onHeadingStatus(msg) {
     : '';
   el.innerHTML =
     `heading ${Number(d.fused_deg).toFixed(1)}&deg; &plusmn;${Number(d.heading_std_deg).toFixed(1)} ` +
-    `(${d.mode}) — ${cal}${conflict}${susp}`;
+    `(${d.mode}) — ${cal}${refused}${conflict}${susp}`;
 }
 
 // Heading vector on the RTK marker. /heading/fused is already a compass
@@ -4089,9 +4116,34 @@ function lbBuildPayload() {
   }
   return v;
 }
+// Send's backend is venue_loader. If it is dead the payload goes nowhere and
+// the only symptom is "awaiting /venue/load_status" forever (field 2026-06-10,
+// commit 158f1a2). So Send starts it itself, then publishes once the
+// orchestrator reports it alive. Idempotent: the orchestrator ignores a start
+// for a running PROC.
+function lbEnsureVenueLoader(onReady, waitedMs = 0) {
+  const alive = !!(latestOrchState && latestOrchState.venue_loader);
+  if (alive) { onReady(); return; }
+  if (waitedMs === 0 && topicOrchStart) {
+    topicOrchStart.publish(new ROSLIB.Message({ data: 'venue_loader' }));
+    $('lb-send-state').innerHTML =
+      '<span class="pill warn">venue_loader was not running — starting it, then sending</span>';
+  }
+  if (waitedMs >= 10000) {
+    $('lb-send-state').innerHTML =
+      '<span class="err">venue_loader did not come up in 10 s — see the Stack panel; nothing was sent</span>';
+    raiseAlert('venue_load', 'warn', 'Send backend down',
+      'venue_loader did not start; check the orchestrator log');
+    return;
+  }
+  setTimeout(() => lbEnsureVenueLoader(onReady, waitedMs + 500), 500);
+}
 function lbSend() {
   if (!ros || !topicVenueLoad) { alert('not connected'); return; }
   if (!lbExps.length) { alert('place at least one experiment first (or Auto-plan)'); return; }
+  lbEnsureVenueLoader(lbSendNow);
+}
+function lbSendNow() {
   const payload = lbBuildPayload();
   const nLegs = (payload.plan_stages || []).reduce((s, st) => s + st.legs.length, 0)
     || payload.legs.length;

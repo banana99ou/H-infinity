@@ -14,6 +14,7 @@ import ast
 import math
 import os
 import sys
+import time
 
 _REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
 _PKG = os.path.join(_REPO, "scalecar-vfg-h-infinite", "ros2_bridge",
@@ -34,21 +35,33 @@ _METHODS = {
     "_all_leg_lists", "_stage_name", "_next_treatment_for", "_geometry_of",
     "_recipe_curve", "_cell_key_for", "_scored_geometries", "_runs_done",
     "_runs_target", "_build_transit",
+    # Preflight support-stack bring-up: the executor must start what it needs
+    # itself, so no bring-up step can be skipped by an operator (2026-09-16).
+    "_ensure_support_procs", "_is_alive", "_orch_start",
 }
+
+# Module-level names the extracted methods close over. Pulled from the SOURCE
+# (not copied) so editing the constant re-aims the test instead of silently
+# diverging from it.
+_CONSTS = {"SUPPORT_PROCS", "SUPPORT_RETRY_S"}
 
 
 def _extract():
     with open(SRC, encoding="utf-8") as f:
         tree = ast.parse(f.read())
     ns = {"math": math, "manifest": manifest, "venue_geom": venue_geom,
+          "time": time,
           "_notify_discord": lambda *_a, **_k: False}
     for node in tree.body:
+        if isinstance(node, ast.Assign) and any(
+                isinstance(t, ast.Name) and t.id in _CONSTS for t in node.targets):
+            exec(compile(ast.Module([node], []), SRC, "exec"), ns)
         if isinstance(node, ast.ClassDef) and node.name == "RunExecutor":
             for sub in node.body:
                 if isinstance(sub, ast.FunctionDef) and sub.name in _METHODS:
                     exec(compile(ast.Module([sub], []), SRC, "exec"), ns)
-    missing = _METHODS - set(ns)
-    assert not missing, f"methods not found in source: {missing}"
+    missing = (_METHODS | _CONSTS) - set(ns)
+    assert not missing, f"names not found in source: {missing}"
     return ns
 
 
@@ -319,6 +332,66 @@ def test_fresh_cells_still_round_robin_least_done():
     ex._completed_counts[_key("step", 1.0, "pid")] = 1
     t = ex._next_treatment_for(leg)
     assert t["controller"] == "pid" and t["rep"] == 1, t
+
+
+class _Support:
+    """Stand-in for the preflight support-stack bring-up only."""
+
+    def __init__(self, alive=()):
+        self._orch_status = {n: (n in alive) for n in NS["SUPPORT_PROCS"]}
+        self._support_start_t = {}
+        self._started = []
+        self.get_logger = lambda: _Log()
+
+    _is_alive = NS["_is_alive"]
+    _orch_start = staticmethod(lambda *_a: None)
+    _ensure_support_procs = NS["_ensure_support_procs"]
+
+
+def _mk(alive=()):
+    ex = _Support(alive)
+    ex._orch_start = lambda name: ex._started.append(name)
+    return ex
+
+
+def test_preflight_starts_every_missing_support_proc():
+    """Pressing Start must be sufficient: whatever the operator forgot to bring
+    up, the executor starts itself (field 2026-09-16 — eight PROC names by hand,
+    and forgetting 'heading' makes reposition HOLD silently)."""
+    ex = _mk(alive=())
+    pending = ex._ensure_support_procs()
+    assert set(ex._started) == set(NS["SUPPORT_PROCS"]), ex._started
+    assert set(pending) == set(NS["SUPPORT_PROCS"]), pending
+
+
+def test_preflight_starts_nothing_when_stack_is_already_up():
+    """Negative control: this test fails if _ensure_support_procs blindly starts
+    PROCs regardless of state (which would spam the orchestrator every tick)."""
+    ex = _mk(alive=NS["SUPPORT_PROCS"])
+    pending = ex._ensure_support_procs()
+    assert ex._started == [], ex._started
+    assert pending == [], pending
+
+
+def test_preflight_rate_limits_the_retry():
+    """A dead PROC is retried, but not on every 0.2 s tick."""
+    ex = _mk(alive=())
+    ex._ensure_support_procs()
+    n_first = len(ex._started)
+    ex._ensure_support_procs()          # immediately again: must not re-send
+    assert len(ex._started) == n_first, ex._started
+    for k in ex._support_start_t:       # age the stamps past the retry window
+        ex._support_start_t[k] -= (NS["SUPPORT_RETRY_S"] + 1.0)
+    ex._ensure_support_procs()
+    assert len(ex._started) == 2 * n_first, ex._started
+
+
+def test_support_list_covers_the_heading_and_rtk_dependencies():
+    """The two PROCs whose absence caused silent failures must stay in the list:
+    'heading' (reposition HOLDs without /heading/fused) and 'rtk_watchdog'
+    (the only thing that reports a dead RTK link)."""
+    assert "heading" in NS["SUPPORT_PROCS"]
+    assert "rtk_watchdog" in NS["SUPPORT_PROCS"]
 
 
 if __name__ == "__main__":

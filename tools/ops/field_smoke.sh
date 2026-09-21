@@ -45,7 +45,7 @@ abort(){ say "ABORT: $*"; safe_stop; exit 1; }
 
 # 1 ----- bring up sensors + safety chain (NOT geofence yet: it would stale-trip
 #         on a not-yet-FIXED fix and latch an estop before we even start) --------
-say "bring up: base (chassis), gnss (mavros+RTK), heading (EKF), estop, odom_zero, ops, odom_watchdog"
+say "bring up: base (chassis), gnss (mavros+RTK), heading (EKF), estop, odom_zero, ops, odom_watchdog, rtk_watchdog"
 # Split chassis (base) from mavros+RTK (gnss) so the odom_watchdog can respawn
 # the chassis driver on a base-serial dropout WITHOUT dropping RTK/compass.
 # 'heading' is the always-on heading EKF (heading_node): reposition consumes its
@@ -54,6 +54,9 @@ start base; start gnss; start heading; start estop; start odom_zero; start ops
 # odom_watchdog: auto-recovers the chassis serial if /wheel/odom goes silent
 # (only acts when 'base' is alive, so safe to arm now during bring-up).
 start odom_watchdog
+# rtk_watchdog: pages on RTK degradation and pauses the batch when the fix stops
+# being usable (field 2026-09-16: 69-73% fixed produced 0 arrivals, silently).
+start rtk_watchdog
 sleep 8
 
 # 2 ----- RTK gate: quality in {4 FIXED, 5 FLOAT} (TEMP field acceptance) --------

@@ -50,6 +50,9 @@ ORCH_NAMES = {
     # so NOT in the motion-capable refuse-set.
     "geofence",
     "odom_watchdog",
+    # RTK-health watchdog: pages on fix degradation and pauses/resumes the batch
+    # via /run/cmd. Publishes /rtk_watchdog/status only, never cmd_vel*.
+    "rtk_watchdog",
 }
 
 

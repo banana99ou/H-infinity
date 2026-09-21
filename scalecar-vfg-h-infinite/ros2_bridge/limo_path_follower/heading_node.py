@@ -99,6 +99,13 @@ EARTH_R = 6378137.0          # m, WGS84 equatorial radius (equirectangular dist)
 G = 9.80665                  # m/s^2
 HIGHRES_IMU_MSG_ID = 105     # MAVLINK_MSG_ID_HIGHRES_IMU (carries the raw mag)
 
+# Horizontal position sigma (m) per NMEA GGA fix quality, used ONLY to size the
+# calibration baseline (sigma_theta ~ sqrt(2)*sigma_pos/baseline). Deliberately
+# pessimistic: the cost of over-estimating is a longer cal drive, the cost of
+# under-estimating is a silently wrong offset that steers the robot.
+#   4 RTK FIXED ~2 cm | 5 RTK FLOAT ~dm | 2 DGPS | 1 standalone GPS | 0 no fix
+_POS_SIGMA_M = {4: 0.02, 5: 0.30, 2: 0.75, 1: 3.0, 0: float('inf')}
+
 
 def _wrap(a):
     """Wrap an angle to (-pi, pi]."""
@@ -175,6 +182,18 @@ class HeadingNode(Node):
         self.declare_parameter('compass_offset_rad', float('nan'))  # NaN -> cal file
         self.declare_parameter('compass_autocal', True)
         self.declare_parameter('compass_cal_min_samples', 5)
+        # Calibration quality gates (field 2026-09-16). A COG sample's bearing
+        # uncertainty is sigma_theta ~ sqrt(2)*sigma_pos / baseline, so what the
+        # cal actually needs is BASELINE, not a particular fix type: at 2 cm
+        # (RTK FIXED) 0.32 m buys 5 deg, but at 0.3 m (FLOAT) the same 5 deg
+        # needs 4.9 m and at 3 m (standalone GPS) it needs 49 m. The old code
+        # took whatever a 0.10 m hop gave it (>16 deg per sample even under
+        # perfect RTK) and committed the mean unconditionally -- six recals in
+        # one afternoon landed 143 deg apart and every one reported success.
+        self.declare_parameter('cal_target_sigma_deg', 5.0)
+        self.declare_parameter('cal_max_sample_sigma_deg', 10.0)
+        self.declare_parameter('cal_max_spread_deg', 15.0)
+        self.declare_parameter('cal_max_yaw_deg', 10.0)
         self.declare_parameter('compass_disagree_warn_deg', 30.0)
         # Persistent compass-vs-mag split above this -> src_conflict (deg).
         self.declare_parameter('src_conflict_deg', 45.0)
@@ -251,6 +270,12 @@ class HeadingNode(Node):
         self._fix_last = None                  # latest accepted (lat, lon)
         self._vx = 0.0
         self._cal_acc = []                     # forward (raw - cog) offset samples
+        self._cal_prev = None                  # (lat, lon, psi) cal-only anchor
+        self._cal_force = False                # operator override: any fix quality
+        self._cal_resets = 0                   # baselines discarded this cal
+        self._cal_block = None                 # why the counter is not moving
+        self._cal_last_sigma = None            # sigma of the last accepted sample
+        self._cal_refusal = None               # why the last arm was refused (UI)
         self._last_compass_z = None            # offset-corrected compass (rad)
         self._last_mag_z = None                # tilt-comp mag heading (rad)
         # Per-reference rate-referee state (see ref_rate_max_dps).
@@ -343,6 +368,12 @@ class HeadingNode(Node):
         self._cmd_topic = str(g('cmd_topic').value)
         self._autocal = bool(g('compass_autocal').value)
         self._cal_min = int(g('compass_cal_min_samples').value)
+        self._cal_target_sigma = math.radians(
+            float(g('cal_target_sigma_deg').value))
+        self._cal_max_sample_sigma = math.radians(
+            float(g('cal_max_sample_sigma_deg').value))
+        self._cal_max_spread = math.radians(float(g('cal_max_spread_deg').value))
+        self._cal_max_yaw = math.radians(float(g('cal_max_yaw_deg').value))
         self._disagree_warn = math.radians(
             float(g('compass_disagree_warn_deg').value))
         self._src_conflict = math.radians(float(g('src_conflict_deg').value))
@@ -379,6 +410,11 @@ class HeadingNode(Node):
         mag frame/hard-iron). Topic names + rates are set-once at construction."""
         for p in params:
             n = p.name
+            if n.startswith('enable_'):
+                # Unmissable in the log: a source being switched on at runtime
+                # is exactly the kind of change that has to be traceable later.
+                self.get_logger().warn(
+                    f'PARAMETER CHANGED AT RUNTIME: {n} -> {p.value!r}')
             try:
                 if n == 'gyro_limo_sign':
                     self._gyro_limo_sign = float(p.value)
@@ -519,18 +555,57 @@ class HeadingNode(Node):
             self.get_logger().warn(f'/heading/cmd: unparseable: {msg.data!r}')
             return
         if action == 'recalibrate':
-            self._cal_armed = True
-            self._cal_acc = []
+            force = bool(d.get('force'))
             old = (f'{math.degrees(self._compass_offset):.1f} deg'
                    if self._compass_offset_known else 'none')
+            # Refuse a cal that physically cannot complete, and say why. The
+            # operator watched "collecting 0/5" for nine minutes on 2026-09-16
+            # because every dropout silently reset the baseline; a refusal with
+            # a number is worth more than a counter that never moves.
+            if not self._en_compass:
+                self._cal_refusal = ('compass fusion is OFF — heading is gyro + '
+                                     'RTK course-over-ground; nothing to calibrate')
+                self.get_logger().error(
+                    'compass recalibration REFUSED: compass fusion is OFF '
+                    '(enable_compass:=false), so there is no compass reading to '
+                    'calibrate. Start heading_node with enable_compass:=true '
+                    'first if you really want the compass in the loop.')
+                return
+            q = self._rtk_quality
+            if q not in self._rtk_qualities and not force:
+                need = self._cal_baseline_m(q)
+                extra = ('no position fix at all' if need is None
+                         else f'each sample would need a {need:.0f} m straight run')
+                self._cal_refusal = (f'RTK quality={q} (want '
+                                     f'{list(self._rtk_qualities)}); {extra}')
+                self.get_logger().error(
+                    f'compass recalibration REFUSED: RTK quality={q} (want '
+                    f'{list(self._rtk_qualities)}); {extra}. Re-send with '
+                    '{"action":"recalibrate","force":true} to calibrate on this '
+                    'fix anyway — the baseline requirement scales automatically.')
+                return
+            self._cal_armed = True
+            self._cal_force = force
+            self._cal_acc = []
+            self._cal_prev = None
+            self._cal_resets = 0
+            self._cal_block = None
+            self._cal_refusal = None
+            need = self._cal_baseline_m(q)
+            howfar = ('unknown (no fix yet)' if need is None
+                      else f'{need:.2f} m per sample, {self._cal_min * need:.1f} m total')
             self.get_logger().warn(
                 f'compass recalibration ARMED by operator (current offset: '
-                f'{old}). Drive the robot FORWARD >= '
-                f'{self._cal_min * self._cog_min_travel:.1f} m under RTK; the '
-                'new offset persists when enough COG samples accumulate.')
+                f'{old}, RTK quality={q}{", FORCED" if force else ""}). Drive '
+                f'the robot FORWARD and STRAIGHT: {howfar}. Samples that are '
+                'too short, too curved or too noisy are rejected and reported, '
+                'and the cal FAILS rather than committing a disagreeing set.')
         elif action == 'cancel_cal':
             self._cal_armed = not self._compass_offset_known and self._autocal
             self._cal_acc = []
+            self._cal_prev = None
+            self._cal_force = False
+            self._cal_block = None
             self.get_logger().info('compass recalibration disarmed.')
         else:
             self.get_logger().warn(f'/heading/cmd: unknown action {action!r}.')
@@ -711,13 +786,19 @@ class HeadingNode(Node):
         self._vx = msg.twist.twist.linear.x
 
     def _fix_cb(self, msg: NavSatFix):
+        lat, lon = msg.latitude, msg.longitude
+        if lat != lat or lon != lon or (lat == 0.0 and lon == 0.0):
+            return
+        # Calibration runs FIRST, on its own anchor and its own quality policy,
+        # and never calls _update(). That separation is what lets the operator
+        # force a cal on a FLOAT/DGPS fix (with a correspondingly longer
+        # baseline) without ever admitting a low-quality COG into the EKF —
+        # the filter's admission rule below is unchanged.
+        self._cal_step(lat, lon)
         if not self._en_cog:
             return
         if self._rtk_quality not in self._rtk_qualities:
             self._fix_prev = None               # break COG continuity on bad fix
-            return
-        lat, lon = msg.latitude, msg.longitude
-        if lat != lat or lon != lon or (lat == 0.0 and lon == 0.0):
             return
         if self._fix_prev is None:
             self._fix_prev = (lat, lon)
@@ -747,40 +828,157 @@ class HeadingNode(Node):
                 R *= 4.0
             self._update(cog, R, h_idx=0)
             self._t_cog = self._now()
-        # Compass offset cal: forward motion + good fix, and EITHER bootstrap
-        # (no offset known anywhere) OR an explicit operator recalibration.
-        # Accumulation deliberately ignores the gate above — an operator arms a
-        # recal precisely BECAUSE the current state may be wrong, so the gate
-        # must not filter the truth out of the calibration. A known offset is
-        # never silently overwritten.
-        if (self._autocal and not reverse and self._cal_armed
-                and self._raw_compass_deg is not None):
-            self._accumulate_cal(cog)
-        elif (not gated and self._compass_offset_known and not reverse
+        # Cross-check only: the cal itself lives in _cal_step (above), which has
+        # its own anchor and its own quality/baseline gates.
+        if (not gated and self._compass_offset_known and not reverse
                 and self._raw_compass_deg is not None):
             self._crosscheck_compass(cog)
 
-    def _accumulate_cal(self, cog):
-        """offset s.t. true_bearing = raw - offset; with true ~ COG -> offset = raw - cog."""
+    def _cal_baseline_m(self, quality):
+        """Straight-run length one COG sample needs to reach cal_target_sigma
+        at this fix quality. None when there is no usable fix at all.
+
+        sigma_theta = atan2(sqrt(2) * sigma_pos, baseline), inverted. This is
+        the whole answer to "does the cal need RTK FIXED?" — it does not. It
+        needs BASELINE, and the baseline scales with the fix noise:
+        ~0.32 m on FIXED, ~4.9 m on FLOAT, ~12 m on DGPS, ~49 m on plain GPS.
+        """
+        sigma_p = _POS_SIGMA_M.get(quality, float('inf'))
+        if not math.isfinite(sigma_p):
+            return None
+        return math.sqrt(2.0) * sigma_p / math.tan(self._cal_target_sigma)
+
+    def _cal_note(self, reason):
+        """Record + log WHY the sample counter is not moving (throttled)."""
+        self._cal_block = reason
+        self.get_logger().warn(
+            f'compass cal waiting ({len(self._cal_acc)}/{self._cal_min} '
+            f'samples, {self._cal_resets} baselines discarded): {reason}',
+            throttle_duration_sec=5.0)
+
+    def _cal_step(self, lat, lon):
+        """One calibration sample attempt, on the cal's OWN anchor.
+
+        Every rejection path names itself (``_cal_block``) and is published in
+        ``/heading/fused_status``. The 2026-09-16 failure was invisible because
+        the only feedback was "collecting 0/5": RTK dropped out of {4,5} 88
+        times in a nine-minute window and each dropout silently discarded the
+        accumulated baseline.
+        """
+        if not (self._autocal and self._cal_armed):
+            self._cal_block = None
+            return
+        if self._raw_compass_deg is None:
+            self._cal_note('no compass reading (compass fusion is OFF)')
+            return
+        q = self._rtk_quality
+        need = self._cal_baseline_m(q)
+        if need is None:
+            self._cal_prev = None
+            self._cal_note(f'no position fix (quality={q})')
+            return
+        if q not in self._rtk_qualities and not self._cal_force:
+            if self._cal_prev is not None:
+                self._cal_resets += 1
+            self._cal_prev = None
+            self._cal_note(f'RTK quality={q} — baseline discarded '
+                           '(re-arm with force:true to calibrate on this fix)')
+            return
+        if self._cal_prev is None:
+            self._cal_prev = (lat, lon, float(self.x[0]))
+            return
+        plat, plon, ppsi = self._cal_prev
+        travel = _geo_dist(plat, plon, lat, lon)
+        if travel < need:
+            self._cal_block = (f'{travel:.2f}/{need:.2f} m of straight run for '
+                               f'sample {len(self._cal_acc) + 1}/{self._cal_min}')
+            return
+        # Straightness: the chord bearing is only the heading if the robot went
+        # straight. Judged on the GYRO-propagated psi, so it stays honest when
+        # the fix itself is the thing that is lying.
+        yaw_change = abs(_wrap(float(self.x[0]) - ppsi))
+        if yaw_change > self._cal_max_yaw:
+            self._cal_resets += 1
+            self._cal_prev = (lat, lon, float(self.x[0]))
+            self._cal_note(f'turned {math.degrees(yaw_change):.0f} deg during the '
+                           f'baseline (max {math.degrees(self._cal_max_yaw):.0f}) '
+                           '— drive STRAIGHT')
+            return
+        if self._vx < -self._rev_vx:
+            self._cal_resets += 1
+            self._cal_prev = (lat, lon, float(self.x[0]))
+            self._cal_note('driving in reverse — COG is the wrong way round')
+            return
+        sigma = math.atan2(math.sqrt(2.0) * _POS_SIGMA_M.get(q, float('inf')),
+                           travel)
+        if sigma > self._cal_max_sample_sigma:
+            self._cal_resets += 1
+            self._cal_prev = (lat, lon, float(self.x[0]))
+            self._cal_note(f'sample bearing sigma {math.degrees(sigma):.0f} deg '
+                           f'> {math.degrees(self._cal_max_sample_sigma):.0f} — '
+                           'drive further per sample')
+            return
+        cog = _geo_bearing(plat, plon, lat, lon)
         off = _wrap(math.radians(self._raw_compass_deg) - cog)
         self._cal_acc.append(off)
+        self._cal_last_sigma = sigma
+        self._cal_prev = (lat, lon, float(self.x[0]))
+        self._cal_block = None
+        self.get_logger().info(
+            f'compass cal sample {len(self._cal_acc)}/{self._cal_min}: '
+            f'offset={math.degrees(off):+.1f} deg over {travel:.2f} m '
+            f'(sigma {math.degrees(sigma):.1f} deg, quality={q}).')
         if len(self._cal_acc) >= self._cal_min:
-            old = (math.degrees(self._compass_offset)
-                   if self._compass_offset_known else None)
-            sx = sum(math.sin(o) for o in self._cal_acc)
-            sy = sum(math.cos(o) for o in self._cal_acc)
-            n = len(self._cal_acc)
-            self._compass_offset = math.atan2(sx, sy)
-            self._compass_offset_known = True
-            self._cal_source = 'cal_file'
-            self._cal_armed = False
-            self._cal_acc = []
-            self.get_logger().warn(
-                'compass calibrated: offset='
-                f'{math.degrees(self._compass_offset):.1f} deg'
-                + (f' (was {old:.1f} deg)' if old is not None else '')
-                + f', {n} forward-COG samples.')
-            self._persist_compass_offset(self._compass_offset, n_samples=n)
+            self._finish_cal()
+
+    def _finish_cal(self):
+        """Commit the offset ONLY if the samples agree; otherwise FAIL loudly.
+
+        offset s.t. true_bearing = raw - offset; with true ~ COG -> raw - cog.
+        The dispersion gate is the part that was missing: the old code took the
+        circular mean of 5 samples and persisted it unconditionally, so it
+        reported success every time — including the six mutually-contradictory
+        calibrations of 2026-09-16 (-129.1, -52.9, +13.7, -105.3, +3.8, -103.0).
+        A calibration that cannot fail is not evidence.
+        """
+        n = len(self._cal_acc)
+        sx = sum(math.sin(o) for o in self._cal_acc)
+        sy = sum(math.cos(o) for o in self._cal_acc)
+        mean = math.atan2(sx, sy)
+        R = math.hypot(sx, sy) / max(n, 1)             # circular concentration
+        spread = math.sqrt(-2.0 * math.log(R)) if R > 1e-9 else float('inf')
+        self._cal_acc = []
+        self._cal_prev = None
+        if spread > self._cal_max_spread:
+            self._cal_block = (f'samples disagree by '
+                               f'{math.degrees(spread):.0f} deg')
+            self.get_logger().error(
+                f'compass CALIBRATION FAILED: {n} samples disagree by '
+                f'{math.degrees(spread):.0f} deg (max '
+                f'{math.degrees(self._cal_max_spread):.0f}). The offset was NOT '
+                'changed. Either the magnetic environment is disturbed or the '
+                'fix is too noisy for this baseline — still armed, drive '
+                'another straight run to retry.')
+            return
+        old = (math.degrees(self._compass_offset)
+               if self._compass_offset_known else None)
+        self._compass_offset = mean
+        self._compass_offset_known = True
+        self._cal_source = 'cal_file'
+        self._cal_armed = False
+        self._cal_force = False
+        self._cal_block = None
+        sigma_mean = spread / math.sqrt(n)
+        self.get_logger().warn(
+            'compass calibrated: offset='
+            f'{math.degrees(self._compass_offset):.1f} deg'
+            + (f' (was {old:.1f} deg)' if old is not None else '')
+            + f', {n} forward-COG samples, spread {math.degrees(spread):.1f} deg '
+              f'-> sigma {math.degrees(sigma_mean):.1f} deg.')
+        self._persist_compass_offset(
+            self._compass_offset, n_samples=n,
+            note=(f'spread {math.degrees(spread):.1f} deg over {n} samples '
+                  f'(sigma {math.degrees(sigma_mean):.1f} deg)'))
 
     def _crosscheck_compass(self, cog):
         true_b = math.radians(self._raw_compass_deg) - self._compass_offset
@@ -881,7 +1079,11 @@ class HeadingNode(Node):
                     throttle_duration_sec=5.0)
 
         if self._cal_armed:
+            # Never a bare counter again: if it is not moving, say what is
+            # blocking it (field 2026-09-16 — "0/5 no matter what").
             cal_state = f'collecting {len(self._cal_acc)}/{self._cal_min}'
+            if self._cal_block:
+                cal_state += f' — {self._cal_block}'
         elif self._compass_offset_known:
             cal_state = 'calibrated'
         else:
@@ -905,6 +1107,18 @@ class HeadingNode(Node):
                                    if self._compass_offset_known else None),
             'cal_state': cal_state,
             'cal_source': self._cal_source,
+            'cal_block_reason': self._cal_block,
+            'cal_refusal': self._cal_refusal,
+            'compass_enabled': self._en_compass,
+            'mag_enabled': self._en_mag,
+            'cal_resets': self._cal_resets,
+            'cal_forced': self._cal_force,
+            'cal_need_travel_m': (
+                None if self._cal_baseline_m(self._rtk_quality) is None
+                else round(self._cal_baseline_m(self._rtk_quality), 2)),
+            'cal_last_sample_sigma_deg': (
+                None if self._cal_last_sigma is None
+                else round(math.degrees(self._cal_last_sigma), 1)),
             'src_conflict': src_conflict,
             'suspended_sources': sorted(
                 k for k, st in self._ref_rate.items() if st['suspended']),

@@ -194,6 +194,17 @@ PROCS = {
         'python3', '/home/agilex/H-infinity/tools/safety/odom_watchdog.py',
         '--base-proc', 'base',
     ],
+    # RTK-health watchdog (field 2026-09-16): every consumer of the fix degrades
+    # QUIETLY — heading_node drops its COG anchor on a bad fix and the EKF falls
+    # back to drifting gyro, then reposition aborts with a message that blames
+    # the path. A whole field day ran at 69-73% RTK FIXED (every session that
+    # ever produced data ran >=95%) and nothing said a word. This pages the
+    # operator on degradation and pauses the batch when the fix is unusable,
+    # resuming on its own when health returns. Publishes /rtk_watchdog/status
+    # only — never cmd_vel* (ADR-01).
+    'rtk_watchdog': [
+        'python3', '/home/agilex/H-infinity/tools/safety/rtk_watchdog.py',
+    ],
 }
 
 # Mutually exclusive PROC groups: starting a member kills any other alive

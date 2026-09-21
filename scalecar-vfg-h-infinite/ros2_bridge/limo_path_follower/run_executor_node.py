@@ -118,6 +118,21 @@ MOVERS = (PROC_REPOSITION, PROC_FOLLOWER)
 RTK_FIXED = 4
 RTK_OK = (4, 5)
 
+# Support PROCs the executor brings up ITSELF at preflight, so pressing Start is
+# sufficient and no bring-up step can be silently skipped (field 2026-09-16: the
+# operator had to remember eight orchestrator names by hand; forgetting 'heading'
+# makes reposition HOLD at zero output with no explanation, and forgetting a
+# watchdog removes the only thing that would have reported the dead RTK link).
+# Deliberately NOT here: base / gnss / estop (they open hardware and live in
+# exclusive groups) and the movers (handled C6-safely by _start_exclusive_mover).
+#   heading       -> reposition HOLDs without /heading/fused: a correctness dep.
+#   rtk_watchdog  -> the fix-health page + auto-pause.
+#   odom_watchdog -> base-serial dropout recovery.
+#   odom_zero     -> /wheel/odom_zeroed, re-anchored by us every leg; the
+#                    follower waits forever without it. Pure republisher.
+SUPPORT_PROCS = ("heading", "rtk_watchdog", "odom_watchdog", "odom_zero")
+SUPPORT_RETRY_S = 3.0
+
 DEFAULT_ACTIVE = os.path.join(_REPO_ROOT, "scenarios", "venues", "active.json")
 DEFAULT_BAG_ROOT = os.path.join(_REPO_ROOT, "Experiment Data")
 
@@ -287,6 +302,7 @@ class RunExecutor(Node):
         self._rtk_quality = None
         self._battery_v = None
         self._orch_status = {}
+        self._support_start_t = {}    # PROC -> last /orchestrator/start we sent
         self._repo_state = None
         self._repo_status = {}
         self._odom_zero_status = None
@@ -382,8 +398,18 @@ class RunExecutor(Node):
             return
         action = str(d.get("action", "")).lower().strip()
         if action == "pause":
-            self._pause("operator pause")
+            # Optional reason so an automated guard (rtk_watchdog) pages with
+            # WHY, instead of the batch reading "operator pause".
+            self._pause(str(d.get("reason") or "operator pause"))
         elif action == "resume":
+            # if_reason_prefix lets a guard resume ONLY the pause it caused: an
+            # operator pause, or another guard's, is never overridden.
+            want = d.get("if_reason_prefix")
+            if want and not str(self._pause_reason or "").startswith(str(want)):
+                self.get_logger().info(
+                    f"resume ignored: pause reason {self._pause_reason!r} does "
+                    f"not match {want!r}")
+                return
             if self.phase == Phase.PAUSED:
                 self._resume()
         elif action == "abort":
@@ -1172,8 +1198,34 @@ class RunExecutor(Node):
 
     # -- Per-phase handlers --------------------------------------------
 
+    def _ensure_support_procs(self):
+        """Start the support stack ourselves and report what is not up yet.
+
+        The orchestrator ignores a start for an already-running PROC, so the
+        retry is idempotent; we rate-limit it only to keep the log readable.
+        Returns the list of PROCs still not alive.
+        """
+        pending = []
+        now = time.monotonic()
+        for name in SUPPORT_PROCS:
+            if self._is_alive(name):
+                continue
+            # Before the first /orchestrator/status arrives every PROC looks
+            # dead; that is fine, the start is idempotent and status lands in
+            # well under the preflight timeout.
+            last = self._support_start_t.get(name, 0.0)
+            if now - last >= SUPPORT_RETRY_S:
+                self._support_start_t[name] = now
+                self._orch_start(name)
+                self.get_logger().info(f"preflight: starting support PROC '{name}'")
+            pending.append(name)
+        return pending
+
     def _tick_preflight(self):
         missing = []
+        pending = self._ensure_support_procs()
+        if pending:
+            missing.append("support PROCs not up: " + ", ".join(pending))
         if self._estop:
             missing.append("estop engaged")
         if self._last_odom_t is None or (time.monotonic() - self._last_odom_t) > 1.0:
@@ -1687,7 +1739,11 @@ class RunExecutor(Node):
         return str(st.get("reason") or "aborted")
 
     def _pause(self, reason):
-        if self.phase in (Phase.PAUSED, Phase.ABORTED, Phase.DONE):
+        # IDLE: nothing is running, so there is nothing to pause. Guards like
+        # rtk_watchdog send pause whenever the fix is unusable (correctly SEVERE
+        # on a bench indoors); paging "RUN PAUSED" for a run that never started
+        # would train the operator to ignore the page.
+        if self.phase in (Phase.IDLE, Phase.PAUSED, Phase.ABORTED, Phase.DONE):
             return
         self._pause_reason = reason
         self.get_logger().warn(f"PAUSE: {reason}")

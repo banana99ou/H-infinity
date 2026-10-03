@@ -1,0 +1,16 @@
+.git
+.DS_Store
+__pycache__
+*.pyc
+.specstory
+.vscode
+.claude
+.venv
+venv
+*.egg-info
+build
+install
+log
+.pytest_cache
+*.sync-conflict-*
+Experiment Data/

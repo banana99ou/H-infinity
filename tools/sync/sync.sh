@@ -1,9 +1,17 @@
 #!/usr/bin/env bash
 # Sync between the laptop (canonical source of truth for code/docs) and the NUC.
 #
-#   sync.sh push       laptop code/docs  -> NUC      (laptop is authoritative)
-#   sync.sh pull        NUC run artifacts -> laptop   (bags/sidecars flow back)
+#   sync.sh push         laptop code/docs -> relay -> NUC, built + stack restarted
+#   sync.sh push-direct  laptop code/docs -> NUC now (copy only: no build/restart)
+#   sync.sh pull         NUC run artifacts -> laptop   (bags/sidecars flow back)
 #   sync.sh push-dry / pull-dry            same, but rsync --dry-run (preview)
+#   sync.sh relay-install / relay-log      set up / inspect the relay deployer
+#
+# `push` is store-and-forward: it stages the laptop tree on the always-on relay
+# (work-fmcl, ~/hinf-relay/stage) and the relay's cron job (relay_deploy.sh)
+# delivers it the moment the robot is online and idle — copy (overwritten robot
+# files backed up), colcon build, restart of the limo-battle stack. So a push
+# made while the robot is off still lands, and the robot runs what was pushed.
 #
 # Transport is plain rsync over **Tailscale SSH**, which authenticates the
 # agilex@nuc connection passwordless — no `expect`/password needed (that was the
@@ -24,15 +32,12 @@ NUC="${LIMO_HOST:-agilex@agilex-nuc12wski7}"
 LAPTOP_ROOT="${LIMO_LAPTOP_ROOT:-/Users/hyeon-yongjeong/code/H-infinity}"
 NUC_ROOT="${LIMO_NUC_ROOT:-/home/agilex/H-infinity}"
 ARTIFACTS="Experiment Data"
+RELAY="${LIMO_RELAY:-work-fmcl}"
 SSH_E=(-e "ssh -o BatchMode=yes -o ConnectTimeout=20")
 
-CODE_EXCLUDES=(
-  --exclude=.git --exclude=.DS_Store --exclude=__pycache__ --exclude='*.pyc'
-  --exclude=.specstory --exclude=.vscode --exclude=.claude
-  --exclude=.venv --exclude=venv --exclude='*.egg-info'
-  --exclude=build --exclude=install --exclude=log --exclude=.pytest_cache
-  --exclude="$ARTIFACTS/"            # never push artifacts up
-)
+# One exclude list for every code push (laptop->NUC, laptop->relay, relay->NUC).
+# It also keeps "Experiment Data/" out: artifacts are never pushed up.
+CODE_EXCLUDES=(--exclude-from="$LAPTOP_ROOT/tools/sync/code_excludes.txt")
 
 ART_PATH="$LAPTOP_ROOT/$ARTIFACTS"
 
@@ -49,24 +54,56 @@ _artifacts_commit() {  # $1 = commit message; no-op unless the repo has changes
   fi
 }
 
-usage() { echo "usage: $0 {push|pull|push-dry|pull-dry|init-artifacts}"; exit 2; }
+usage() { echo "usage: $0 {push|push-direct|pull|push-dry|pull-dry|relay-install|relay-log|init-artifacts}"; exit 2; }
 
 DRY=""
 cmd="${1:-}"
 case "$cmd" in
   push-dry) cmd=push; DRY="--dry-run" ;;
   pull-dry) cmd=pull; DRY="--dry-run" ;;
-  push|pull|init-artifacts) ;;
+  push|push-direct|pull|relay-install|relay-log|init-artifacts) ;;
   *) usage ;;
 esac
 
 case "$cmd" in
   push)
-    echo "[sync] push  laptop -> $NUC   (code/docs; laptop canonical) $DRY"
-    rsync -avz $DRY "${SSH_E[@]}" "${CODE_EXCLUDES[@]}" \
+    echo "[sync] push  laptop -> $RELAY -> $NUC   (code/docs; laptop canonical) $DRY"
+    if [ -n "$DRY" ]; then
+      rsync -avz --delete --dry-run "${SSH_E[@]}" "${CODE_EXCLUDES[@]}" \
+        "$LAPTOP_ROOT/" "$RELAY:hinf-relay/stage/"
+    else
+      # Withdraw the old stamp under the relay's lock first: the relay never
+      # deploys without a stamp, so it cannot ship a half-copied stage.
+      ssh -o BatchMode=yes -o ConnectTimeout=20 "$RELAY" \
+        'mkdir -p ~/hinf-relay && flock -w 900 ~/hinf-relay/.lock rm -f ~/hinf-relay/stage.stamp'
+      # The stage mirrors the laptop exactly (--delete is safe: relay-only dir).
+      rsync -az --delete "${SSH_E[@]}" "${CODE_EXCLUDES[@]}" \
+        "$LAPTOP_ROOT/" "$RELAY:hinf-relay/stage/"
+      dirty=""; git -C "$LAPTOP_ROOT" diff --quiet HEAD -- 2>/dev/null || dirty="+dirty"
+      stamp="$(date -u +%FT%TZ) $(git -C "$LAPTOP_ROOT" rev-parse --short HEAD)$dirty"
+      printf '%s\n' "$stamp" | ssh -o BatchMode=yes "$RELAY" \
+        'cat > ~/hinf-relay/stage.stamp.tmp && mv ~/hinf-relay/stage.stamp.tmp ~/hinf-relay/stage.stamp'
+      # Kick a deploy attempt now instead of waiting for the next cron minute.
+      ssh -o BatchMode=yes "$RELAY" \
+        'nohup bash ~/hinf-relay/stage/tools/sync/relay_deploy.sh >/dev/null 2>&1 </dev/null &'
+      echo "[sync] staged '$stamp' on $RELAY; it deploys when the robot is online + idle."
+      echo "[sync] watch: tools/sync/sync.sh relay-log"
+    fi
+    ;;
+  push-direct)
+    echo "[sync] push-direct  laptop -> $NUC   (copy only: no build, no restart)"
+    rsync -avz "${SSH_E[@]}" "${CODE_EXCLUDES[@]}" \
       "$LAPTOP_ROOT/" "$NUC:$NUC_ROOT/"
-    # NB: no --delete (additive) so NUC-unique files survive; flip on once the
-    # laptop tree is trusted to be a complete mirror.
+    # NB: no --delete (additive) so NUC-unique files survive.
+    ;;
+  relay-install)
+    # cron (not a systemd user unit) so it runs without a login session and
+    # without `loginctl enable-linger` (sudo). Idempotent: replaces its own line.
+    echo "[sync] installing the relay deployer cron job on $RELAY"
+    ssh -o BatchMode=yes "$RELAY" 'mkdir -p ~/hinf-relay && { crontab -l 2>/dev/null | grep -v "# hinf-relay$"; echo "* * * * * bash \$HOME/hinf-relay/stage/tools/sync/relay_deploy.sh # hinf-relay"; } | crontab - && crontab -l | grep hinf-relay'
+    ;;
+  relay-log)
+    ssh -o BatchMode=yes "$RELAY" 'echo "stage: $(cat ~/hinf-relay/stage.stamp 2>/dev/null || echo none)"; echo "state: $(cat ~/hinf-relay/state 2>/dev/null)"; tail -n 25 ~/hinf-relay/relay.log 2>/dev/null'
     ;;
   pull)
     echo "[sync] pull  $NUC -> laptop   (run artifacts) $DRY"

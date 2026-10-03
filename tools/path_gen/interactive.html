@@ -74,10 +74,13 @@
   .estop-banner.latched { display: block; }
 
   /* Operator alert toasts: low battery, bad/stale RTK, sequencer pause,
-     disconnect. Fixed top-right so they're visible regardless of scroll. */
+     disconnect. Fixed at the map's top-right corner, just LEFT of the 380px
+     control panel, so a card can never cover E-STOP or any panel control
+     (they used to sit on top of the panel). Scrolls if many are up. */
   .alert-stack {
-    position: fixed; top: 10px; right: 10px; z-index: 9999;
+    position: fixed; top: 10px; right: 390px; z-index: 9999;
     width: 300px; display: flex; flex-direction: column; gap: 8px;
+    max-height: calc(100vh - 20px); overflow-y: auto;
     pointer-events: none;
   }
   .alert {
@@ -86,6 +89,7 @@
     font-size: 12px; color: #fff; border: 2px solid;
     box-shadow: 0 2px 12px rgba(0,0,0,0.5);
   }
+  .alert.info     { background: #123a5c; border-color: #4da3ff; }
   .alert.warn     { background: #7a5b00; border-color: #ffb300; }
   .alert.critical { background: #8a0d0d; border-color: #ff3b3b;
                     animation: alertpulse 1s ease-in-out infinite; }
@@ -106,6 +110,26 @@
     line-height: 1; opacity: 0.7; padding: 0;
   }
   .alert-x:hover { opacity: 1; }
+
+  /* "What's new" overlay: full-page, in-page (no popup permission). Shown once
+     per BATTLE_VERSION. Sits above the alert stack + errbar; closes on the
+     button, Esc, or a click on the backdrop — it covers E-STOP while open. */
+  #changelog-overlay {
+    position: fixed; inset: 0; z-index: 10001; display: none;
+    background: rgba(8, 8, 12, 0.88); padding: 24px 16px; box-sizing: border-box;
+    overflow-y: auto; color: #e8e8ea;
+  }
+  #changelog-overlay.shown { display: block; }
+  #changelog-card {
+    max-width: 640px; margin: 4vh auto; padding: 20px 24px; border-radius: 8px;
+    background: #1e1e22; border: 1px solid #456; box-shadow: 0 8px 32px rgba(0,0,0,0.6);
+  }
+  #changelog-card h2 { font-size: 20px; margin: 0 0 4px 0; }
+  #changelog-card h3 { font-size: 13px; margin: 16px 0 6px 0; }
+  #changelog-card ul { margin: 0; padding-left: 20px; }
+  #changelog-card li { font-size: 14px; line-height: 1.6; margin: 4px 0; }
+  #changelog-close { margin-top: 18px; width: 100%; font-size: 15px; padding: 10px; }
+  #changelog-link { font-size: 11px; font-weight: normal; color: #6cf; margin-left: 6px; cursor: pointer; }
 
   /* Compact map legend rows. */
   .legend-row { font-size: 11px; margin: 3px 0; display: flex; align-items: center; gap: 6px; }
@@ -168,6 +192,16 @@
      Populated by raiseAlert()/renderAlerts(); fixed-position overlay. -->
 <div id="alert-stack" class="alert-stack"></div>
 
+<!-- Korean changelog, shown once per BATTLE_VERSION (see showChangelog()). -->
+<div id="changelog-overlay" role="dialog" aria-modal="true" aria-labelledby="changelog-title">
+  <div id="changelog-card">
+    <h2 id="changelog-title">변경 내역</h2>
+    <div class="small" id="changelog-version"></div>
+    <div id="changelog-body"></div>
+    <button id="changelog-close" class="primary">확인</button>
+  </div>
+</div>
+
 <!-- Floating teleop panel — visible == engaged. Closing X disengages. -->
 <div id="teleop-panel" aria-hidden="true">
   <button id="teleop-close" title="close & stop teleop">&times;</button>
@@ -208,7 +242,7 @@
 <div id="app">
   <div id="map"></div>
   <div id="panel">
-    <h2>LIMO Battle Station</h2>
+    <h2>LIMO Battle Station<a id="changelog-link" title="이 버전의 변경 내역 보기">변경 내역</a></h2>
 
     <div id="estop-banner" class="estop-banner">&#9888; WHEELS DISABLED &mdash; E-STOP LATCHED</div>
     <button id="estop-btn" class="estop">E-STOP</button>
@@ -234,25 +268,105 @@
       <span class="dot" id="batt-dot"></span>battery: <span id="batt-state">--</span>
     </div>
 
-    <details id="stack-details" open style="margin-top:10px;">
-      <summary>Node control (boot stack)</summary>
-      <div class="small" style="margin:4px 0 8px 0;">
-        Per-boot stack control. Start/kill the base, GNSS, estop, odom-zero,
-        follower, reposition, sequencer and ops nodes via the orchestrator.
+    <!-- ============================================================
+         Leg batch (operator runs) — author venue + ordered legs (each a
+         reposition Bézier + a step recipe), Send to NUC, press Start. The
+         system runs the next incomplete leg onward. /venue/load + /run/*.
+         ============================================================ -->
+    <!-- Promoted out of its <details> (2026-10-02): this is the panel the
+         operator uses every session. Run controls first; the manual
+         geometry editor (steps 1-3) is folded below. -->
+    <div id="legbatch-details">
+    <h3>Leg batch (operator runs)</h3>
+      <h4 style="margin:8px 0 4px;">Auto-plan (system lays out the remaining matrix)</h4>
+      <div class="small">One press: the NUC reads experiment.yaml + the bag manifest,
+        picks the remaining (family, R) cells, and fits as many curves + glue as the
+        venue holds — in stages. Inspect every stage below, tweak if needed, then
+        Send + Start. The batch runs ALL stages unattended.</div>
+      <div class="row" style="margin-top:4px;">
+        <button id="lb-plan" class="primary">Auto-plan</button>
+        <button id="lb-plan-apply" style="display:none;">Apply latched plan</button>
+        <label style="margin:0;">stage <select id="lb-stage-sel" style="min-width:90px;"></select></label>
       </div>
-      <div class="stat" id="stack-panel">(connect first)</div>
-    </details>
+      <div class="stat" id="lb-plan-state">(no plan requested)</div>
+
+      <h4 style="margin:10px 0 4px;">Send + run</h4>
+      <button id="lb-send" class="primary">Send to NUC</button>
+      <div class="small" id="lb-send-state"></div>
+      <div class="row" style="margin-top:6px;">
+        <button id="lb-start" class="primary">Start</button>
+        <button id="lb-pause">Pause</button>
+        <button id="lb-abort" class="estop" style="font-size:14px;padding:8px;">ABORT</button>
+      </div>
+      <div class="stat" id="lb-run-status" style="margin-top:6px;">(waiting for /run/status)</div>
+      <!-- Experiment dataset dashboard: whole-matrix progress (X/320 usable
+           legs across all sessions, from the bag-root manifest) + failed /
+           redo-pending counters. Fed by /run/status `progress`. -->
+      <div class="stat" id="lb-progress" style="margin-top:4px; display:none;">
+        <div style="background:#223; border-radius:4px; height:12px; overflow:hidden;">
+          <div id="lb-progress-fill" style="height:100%; width:0%; background:#4caf50; transition:width .3s;"></div>
+        </div>
+        <div class="small" id="lb-progress-text" style="margin-top:2px;"></div>
+      </div>
+      <details id="lb-edit-details" style="margin-top:10px;">
+        <summary>Edit geometry (place curves, glue, legs)</summary>
+      <div class="small" style="color:#6cf;">
+        Place the experiment curves to fit the venue, then draw reposition glue
+        between them (endpoints snap to the experiment ends). Send, press Start.
+        The <b>system</b> picks the controller + speed + repetition for each curve
+        from experiment.yaml + the run manifest — you author geometry only. Curves
+        are fit-checked here with the SAME clearance the NUC enforces.
+      </div>
+
+      <h4 style="margin:8px 0 4px;">1 &middot; Experiment curves (scored, odom)</h4>
+      <div class="row">
+        <button id="lb-exp-add" class="primary">Place experiment (click map)</button>
+        <button id="lb-exp-del">Delete selected</button>
+      </div>
+      <div class="row" style="margin-top:4px;">
+        <label style="margin:0;">type
+          <select id="lb-rec-type"><option value="step">step</option><option value="slalom">slalom</option><option value="uturn">uturn</option><option value="wiggle_sine">wiggle sine</option><option value="wiggle_chirp">wiggle chirp</option><option value="wiggle_square">wiggle square</option></select>
+        </label>
+        <label style="margin:0;">R <input type="number" id="lb-rec-R" value="0.50" step="0.05" min="0.3" style="width:55px;"></label>
+        <label style="margin:0;">dir <select id="lb-rec-dir"><option value="1">left (+1)</option><option value="-1">right (-1)</option></select></label>
+      </div>
+      <div class="row" style="margin-top:4px;">
+        <label style="margin:0;">L1 <input type="number" id="lb-rec-L1" value="1.0" step="0.1" min="0" style="width:55px;"></label>
+        <label style="margin:0;">&theta; <input type="number" id="lb-rec-theta" value="90" step="1" style="width:55px;">&deg;</label>
+        <label style="margin:0;">L2 <input type="number" id="lb-rec-L2" value="1.0" step="0.1" min="0" style="width:55px;"></label>
+      </div>
+      <div class="row" style="margin-top:4px;">
+        <label style="margin:0;">heading <input type="number" id="lb-rec-heading" value="0" step="1" style="width:64px;">&deg;</label>
+        <span class="small">drag cyan = move &middot; green = rotate &middot; click cyan = select</span>
+      </div>
+      <div class="stat" id="lb-exp-state">(no experiment placed)</div>
+
+      <h4 style="margin:10px 0 4px;">2 &middot; Reposition glue (Bézier, between experiments)</h4>
+      <div class="small">Pick a gap, click the map to add midpoints (ends snap to the
+        experiment end &rarr; next start). A straight glue is used if you add none.</div>
+      <div class="row" style="margin-top:4px;">
+        <select id="lb-repo-gap"></select>
+        <button id="lb-repo-draw" class="primary">Draw glue (click map)</button>
+        <button id="lb-repo-clear">Clear midpoints</button>
+      </div>
+      <div class="row" style="margin-top:4px;">
+        <label style="margin:0;">v <input type="number" id="lb-repo-v" value="0.40" step="0.05" min="0.05" max="0.6" style="width:58px;"> m/s</label>
+        <label style="margin:0;">pos tol <input type="number" id="lb-repo-postol" value="0.15" step="0.01" min="0.05" max="0.5" style="width:58px;"> m</label>
+      </div>
+      <div class="stat" id="lb-repo-state">(no glue)</div>
+
+      <h4 style="margin:10px 0 4px;">3 &middot; Legs (auto: glue &rarr; experiment, cyclic)</h4>
+      <div class="row">
+        <button id="lb-clear-all">Clear all</button>
+      </div>
+      <div class="stat" id="lb-legs">legs: 0</div>
+
+      </details>
+    </div>
 
     <h3>RTK &amp; GPS</h3>
     <div class="stat">
       <span class="dot" id="rtk-dot"></span>RTK: <span id="rtk-state">--</span>
-    </div>
-    <div class="small">
-      Magenta dot = RTK FIXED truth; amber = FLOAT/other. Orange dot = Pixhawk
-      raw GPS. Divergence between the two reveals base-survey or correction
-      issues. Blue dot = controller's odom-zeroed belief; its dashed magenta
-      line is the fused heading (<code>/heading/fused</code>) so heading is
-      visible even when the RTK dot is absent.
     </div>
     <div style="margin-top:6px;">
       <button id="btn-recal-heading" disabled
@@ -266,31 +380,139 @@
     <div class="stat" id="telemetry">(waiting for /path_follower/status)</div>
     <div class="progress" style="margin-top:6px;"><div id="prog-bar" style="width:0%"></div></div>
 
+    <h3>Manual control</h3>
+    <div class="row">
+      <button id="btn-stop">Stop scenario</button>
+      <button id="btn-recenter">Recenter map on robot</button>
+    </div>
+    <div class="row" style="margin-top:6px;">
+      <button id="btn-teleop">Toggle keyboard teleop</button>
+      <button id="btn-reanchor-rtk" class="primary">Belief &rarr; RTK + reset odom</button>
+    </div>
+    <div class="small ok" id="reanchor-state"></div>
+    <div class="small">
+      Drag the blue belief dot to set its position by hand, or
+      <b>Belief &rarr; RTK</b> to snap it onto the RTK fix and re-zero odom to
+      (0,0,0). Both are motion-free (no driving). For autonomous runs use the
+      Experiment panel above. The big E-STOP latches motion immediately; Stop
+      scenario also clears the latched <code>/reference_path</code>.
+    </div>
+
+    <!-- ---- Less frequent: collapsed; open/closed state is remembered per browser ---- -->
+    <details id="stack-details" style="margin-top:10px;">
+      <summary>Node control (boot stack)</summary>
+      <div class="small" style="margin:4px 0 8px 0;">
+        Per-boot stack control. Start/kill the base, GNSS, estop, odom-zero,
+        follower, reposition, sequencer and ops nodes via the orchestrator.
+      </div>
+      <div class="stat" id="stack-panel">(connect first)</div>
+    </details>
+
+
+    <details id="venue-details" style="margin-top:10px;">
+      <summary><b>Venue / working area</b></summary>
     <!-- ============================================================
-         T10 — Experiment batch progress + pause/resume (M5, F5).
-         Sequencer is the canonical autonomous-run UI. Pause/Resume here
-         talk to /experiment/cmd, NOT /estop_trigger.
+         T5 — Venue / working-area editor (V1-V4).
          ============================================================ -->
-    <h3>Experiment (autonomous run)</h3>
-    <div class="stat" style="margin-bottom:4px;">
-      <span class="dot" id="exp-dot"></span>sequencer: <span id="exp-rate">--</span>
-    </div>
-    <div class="stat" id="exp-progress">(waiting for /experiment/status)</div>
-    <div class="progress" style="margin-top:6px;"><div id="exp-prog-bar" style="width:0%"></div></div>
-    <div class="stat" id="exp-detail" style="margin-top:6px;"></div>
-    <div class="small" id="exp-message"></div>
     <div class="row" style="margin-top:6px;">
-      <button id="exp-btn-pause">Pause</button>
-      <button id="exp-btn-resume" class="primary">Resume</button>
+      <button id="btn-venue-pin" class="primary">Add corner (click map)</button>
+      <button id="btn-venue-clear-corners">Clear corners</button>
     </div>
     <div class="row" style="margin-top:6px;">
-      <button id="exp-btn-skip">Skip cell</button>
-      <button id="exp-btn-abort" class="estop" style="font-size:14px;padding:8px;">ABORT</button>
+      <label style="margin:0;">nudge step (m)
+        <select id="venue-nudge-step">
+          <option value="0.05">0.05</option>
+          <option value="0.25" selected>0.25</option>
+          <option value="1.0">1.0</option>
+        </select>
+      </label>
+    </div>
+    <div class="small" id="venue-corner-state">corners: 0 / 4</div>
+    <div class="small" style="color:#6cf;">Click 2 corners to set one side, then a 3rd for depth — corner 4 auto-snaps to a rectangle. Click a corner/pin to select it, then arrow keys nudge; drag to move freely.</div>
+    <div class="small" id="venue-place-hint" style="color:#6cf;"></div>
+    <label style="margin-top:6px;">venue name (= run resume key — keep it the SAME
+      across field days; a fresh name restarts progress from 0)
+      <input type="text" id="venue-name" value="rooftop" maxlength="48"
+             pattern="[A-Za-z0-9_\-]+">
+    </label>
+    <label style="margin-top:6px;">safety margin (m)
+      <span class="pill" id="venue-margin-val">0.50</span>
+      <input type="range" id="venue-margin" min="0.0" max="2.0" step="0.05" value="0.50">
+    </label>
+    <div class="row" style="margin-top:6px;">
+      <button id="btn-venue-add-excl">Add exclusion (click map)</button>
+      <button id="btn-venue-clear-excl">Clear exclusions</button>
+    </div>
+    <label style="margin-top:4px;">exclusion radius (m)
+      <span class="pill" id="venue-excl-r-val">2.00</span>
+      <input type="range" id="venue-excl-r" min="0.2" max="8.0" step="0.1" value="2.0">
+    </label>
+    <div class="small" id="venue-excl-state">exclusions: 0</div>
+    <div class="row" style="margin-top:6px;">
+      <button id="btn-venue-add-start">Add start pin (click map)</button>
+      <button id="btn-venue-add-end">Add end pin (click map)</button>
+    </div>
+    <div class="row" style="margin-top:6px;">
+      <button id="btn-venue-clear-pins">Clear start/end pins</button>
+      <button id="btn-venue-validate">Validate current curve</button>
+    </div>
+    <div class="small" id="venue-pin-state">pins: 0 start / 0 end</div>
+    <div class="stat" id="venue-validate-state">(validate to check fit + clearance)</div>
+    <div class="row" style="margin-top:6px;">
+      <button id="btn-venue-load">Load rooftop.json</button>
+      <button id="btn-venue-export" class="primary">Save venue JSON</button>
     </div>
     <div class="small">
-      Pause/Resume/Skip publish to <code>/experiment/cmd</code>. <b>Abort</b> stops
-      the batch <i>and</i> latches the E-stop (<code>/estop_trigger</code>).
+      Pick a mode, then click anywhere on the map to drop a corner / exclusion /
+      pin. Drag start/end dots to move; drag the cyan tip to set heading. Inset
+      polygon = corners minus margin; curves must fit it and clear exclusions.
     </div>
+
+    </details>
+
+    <details id="map-details" style="margin-top:10px;">
+      <summary><b>Map (bearing, basemap, legend)</b></summary>
+    <label>belief heading / map bearing (deg E of N)
+      <span class="pill" id="bearing_val2">42.0</span>
+      <input type="range" id="bearing2" min="0" max="360" step="0.5" value="42">
+    </label>
+    <div class="small">
+      Rotation used to project the blue belief dot. No compass topic exists, so
+      after a re-anchor set this to the robot's true heading.
+    </div>
+    <label>basemap
+      <select id="basemap">
+        <option value="osm">OpenStreetMap</option>
+        <option value="google">Google Satellite</option>
+        <option value="google_hybrid" selected>Google Hybrid</option>
+        <option value="esri">Esri World Imagery</option>
+      </select>
+    </label>
+    <details style="margin-top:6px;">
+      <summary>Map legend</summary>
+      <div class="small">
+        Magenta dot = RTK FIXED truth; amber = FLOAT/other. Orange dot = Pixhawk
+        raw GPS. Divergence between the two reveals base-survey or correction
+        issues. Blue dot = controller's odom-zeroed belief; its dashed magenta
+        line is the fused heading (<code>/heading/fused</code>) so heading is
+        visible even when the RTK dot is absent.
+      </div>
+      <div class="legend-row"><span class="legend-swatch" style="background:#39f"></span>controller belief (<code>/wheel/odom_zeroed</code>)</div>
+      <div class="legend-row"><span class="legend-swatch" style="background:#e91e63"></span>RTK FIXED (magenta; line = fused heading <code>/heading/fused</code>)</div>
+      <div class="legend-row"><span class="legend-swatch" style="background:#ffc107"></span>RTK FLOAT / other (amber)</div>
+      <div class="legend-row"><span class="legend-swatch" style="background:#ff9800"></span>Pixhawk raw GPS (orange)</div>
+      <div class="legend-row"><span class="legend-swatch" style="background:#0ff"></span>ad-hoc path anchor (cyan + arrow)</div>
+      <div class="legend-row"><span class="legend-swatch" style="background:#0f0"></span>ad-hoc curve start (lime)</div>
+      <div class="legend-row"><span class="legend-swatch" style="background:#f00"></span>ad-hoc curve end (red)</div>
+      <div class="legend-row"><span class="legend-swatch poly" style="border-color:#ff0"></span>venue corners (yellow polygon)</div>
+      <div class="legend-row"><span class="legend-swatch dashed" style="border-color:#0f0"></span>venue inset = corners &minus; margin (green dashed)</div>
+      <div class="legend-row"><span class="legend-swatch" style="background:#0f8"></span>venue start pin (+arrow = heading)</div>
+      <div class="legend-row"><span class="legend-swatch" style="background:#f80"></span>venue end pin (+arrow = heading)</div>
+      <div class="legend-row"><span class="legend-swatch" style="background:#f33"></span>exclusion zone (red disc)</div>
+      <div class="legend-row"><span class="legend-swatch" style="background:#888"></span>stale (stream timed out)</div>
+    </details>
+
+    </details>
 
     <!-- ============================================================
          Manual run (per-phase) — drive ONE leg by hand entirely from the
@@ -359,7 +581,7 @@
 
       <div class="small" style="margin-top:8px;"><b>6 &middot; Reference path (recipe) &rarr; run</b></div>
       <div class="row" style="margin-top:4px;">
-        <select id="mr-family"><option value="step">step</option><option value="slalom">slalom</option><option value="uturn">uturn</option></select>
+        <select id="mr-family"><option value="step">step</option><option value="slalom">slalom</option><option value="uturn">uturn</option><option value="wiggle_sine">wiggle sine</option><option value="wiggle_chirp">wiggle chirp</option><option value="wiggle_square">wiggle square</option></select>
         <label style="margin:0;">R <input type="number" id="mr-radius" value="0.70" step="0.05" min="0.1" style="width:60px;"> m</label>
         <button id="mr-push-recipe" class="primary">Push</button>
       </div>
@@ -374,204 +596,33 @@
       </div>
     </details>
 
+    <details id="exp-details" style="margin-top:10px;">
+      <summary><b>Experiment sequencer (DEPRECATED — use Leg batch)</b></summary>
     <!-- ============================================================
-         T5 — Venue / working-area editor (V1-V4).
+         T10 — Experiment batch progress + pause/resume (M5, F5).
+         Sequencer is the canonical autonomous-run UI. Pause/Resume here
+         talk to /experiment/cmd, NOT /estop_trigger.
          ============================================================ -->
-    <h3>Venue / working area</h3>
+    <div class="stat" style="margin-bottom:4px;">
+      <span class="dot" id="exp-dot"></span>sequencer: <span id="exp-rate">--</span>
+    </div>
+    <div class="stat" id="exp-progress">(waiting for /experiment/status)</div>
+    <div class="progress" style="margin-top:6px;"><div id="exp-prog-bar" style="width:0%"></div></div>
+    <div class="stat" id="exp-detail" style="margin-top:6px;"></div>
+    <div class="small" id="exp-message"></div>
     <div class="row" style="margin-top:6px;">
-      <button id="btn-venue-pin" class="primary">Add corner (click map)</button>
-      <button id="btn-venue-clear-corners">Clear corners</button>
+      <button id="exp-btn-pause">Pause</button>
+      <button id="exp-btn-resume" class="primary">Resume</button>
     </div>
     <div class="row" style="margin-top:6px;">
-      <label style="margin:0;">nudge step (m)
-        <select id="venue-nudge-step">
-          <option value="0.05">0.05</option>
-          <option value="0.25" selected>0.25</option>
-          <option value="1.0">1.0</option>
-        </select>
-      </label>
-    </div>
-    <div class="small" id="venue-corner-state">corners: 0 / 4</div>
-    <div class="small" style="color:#6cf;">Click 2 corners to set one side, then a 3rd for depth — corner 4 auto-snaps to a rectangle. Click a corner/pin to select it, then arrow keys nudge; drag to move freely.</div>
-    <div class="small" id="venue-place-hint" style="color:#6cf;"></div>
-    <label style="margin-top:6px;">venue name (= run resume key — keep it the SAME
-      across field days; a fresh name restarts progress from 0)
-      <input type="text" id="venue-name" value="rooftop" maxlength="48"
-             pattern="[A-Za-z0-9_\-]+">
-    </label>
-    <label style="margin-top:6px;">safety margin (m)
-      <span class="pill" id="venue-margin-val">0.50</span>
-      <input type="range" id="venue-margin" min="0.0" max="2.0" step="0.05" value="0.50">
-    </label>
-    <div class="row" style="margin-top:6px;">
-      <button id="btn-venue-add-excl">Add exclusion (click map)</button>
-      <button id="btn-venue-clear-excl">Clear exclusions</button>
-    </div>
-    <label style="margin-top:4px;">exclusion radius (m)
-      <span class="pill" id="venue-excl-r-val">2.00</span>
-      <input type="range" id="venue-excl-r" min="0.2" max="8.0" step="0.1" value="2.0">
-    </label>
-    <div class="small" id="venue-excl-state">exclusions: 0</div>
-    <div class="row" style="margin-top:6px;">
-      <button id="btn-venue-add-start">Add start pin (click map)</button>
-      <button id="btn-venue-add-end">Add end pin (click map)</button>
-    </div>
-    <div class="row" style="margin-top:6px;">
-      <button id="btn-venue-clear-pins">Clear start/end pins</button>
-      <button id="btn-venue-validate">Validate current curve</button>
-    </div>
-    <div class="small" id="venue-pin-state">pins: 0 start / 0 end</div>
-    <div class="stat" id="venue-validate-state">(validate to check fit + clearance)</div>
-    <div class="row" style="margin-top:6px;">
-      <button id="btn-venue-load">Load rooftop.json</button>
-      <button id="btn-venue-export" class="primary">Save venue JSON</button>
+      <button id="exp-btn-skip">Skip cell</button>
+      <button id="exp-btn-abort" class="estop" style="font-size:14px;padding:8px;">ABORT</button>
     </div>
     <div class="small">
-      Pick a mode, then click anywhere on the map to drop a corner / exclusion /
-      pin. Drag start/end dots to move; drag the cyan tip to set heading. Inset
-      polygon = corners minus margin; curves must fit it and clear exclusions.
+      Pause/Resume/Skip publish to <code>/experiment/cmd</code>. <b>Abort</b> stops
+      the batch <i>and</i> latches the E-stop (<code>/estop_trigger</code>).
     </div>
 
-    <!-- ============================================================
-         Leg batch (operator runs) — author venue + ordered legs (each a
-         reposition Bézier + a step recipe), Send to NUC, press Start. The
-         system runs the next incomplete leg onward. /venue/load + /run/*.
-         ============================================================ -->
-    <details id="legbatch-details" style="margin-top:10px;">
-      <summary><b>Leg batch (operator authors geometry)</b></summary>
-      <div class="small" style="color:#6cf;">
-        Place the experiment curves to fit the venue, then draw reposition glue
-        between them (endpoints snap to the experiment ends). Send, press Start.
-        The <b>system</b> picks the controller + speed + repetition for each curve
-        from experiment.yaml + the run manifest — you author geometry only. Curves
-        are fit-checked here with the SAME clearance the NUC enforces.
-      </div>
-
-      <h4 style="margin:8px 0 4px;">0 &middot; Auto-plan (system lays out the remaining matrix)</h4>
-      <div class="small">One press: the NUC reads experiment.yaml + the bag manifest,
-        picks the remaining (family, R) cells, and fits as many curves + glue as the
-        venue holds — in stages. Inspect every stage below, tweak if needed, then
-        Send + Start. The batch runs ALL stages unattended.</div>
-      <div class="row" style="margin-top:4px;">
-        <button id="lb-plan" class="primary">Auto-plan</button>
-        <button id="lb-plan-apply" style="display:none;">Apply latched plan</button>
-        <label style="margin:0;">stage <select id="lb-stage-sel" style="min-width:90px;"></select></label>
-      </div>
-      <div class="stat" id="lb-plan-state">(no plan requested)</div>
-
-      <h4 style="margin:8px 0 4px;">1 &middot; Experiment curves (scored, odom)</h4>
-      <div class="row">
-        <button id="lb-exp-add" class="primary">Place experiment (click map)</button>
-        <button id="lb-exp-del">Delete selected</button>
-      </div>
-      <div class="row" style="margin-top:4px;">
-        <label style="margin:0;">type
-          <select id="lb-rec-type"><option value="step">step</option><option value="slalom">slalom</option><option value="uturn">uturn</option></select>
-        </label>
-        <label style="margin:0;">R <input type="number" id="lb-rec-R" value="0.50" step="0.05" min="0.3" style="width:55px;"></label>
-        <label style="margin:0;">dir <select id="lb-rec-dir"><option value="1">left (+1)</option><option value="-1">right (-1)</option></select></label>
-      </div>
-      <div class="row" style="margin-top:4px;">
-        <label style="margin:0;">L1 <input type="number" id="lb-rec-L1" value="1.0" step="0.1" min="0" style="width:55px;"></label>
-        <label style="margin:0;">&theta; <input type="number" id="lb-rec-theta" value="90" step="1" style="width:55px;">&deg;</label>
-        <label style="margin:0;">L2 <input type="number" id="lb-rec-L2" value="1.0" step="0.1" min="0" style="width:55px;"></label>
-      </div>
-      <div class="row" style="margin-top:4px;">
-        <label style="margin:0;">heading <input type="number" id="lb-rec-heading" value="0" step="1" style="width:64px;">&deg;</label>
-        <span class="small">drag cyan = move &middot; green = rotate &middot; click cyan = select</span>
-      </div>
-      <div class="stat" id="lb-exp-state">(no experiment placed)</div>
-
-      <h4 style="margin:10px 0 4px;">2 &middot; Reposition glue (Bézier, between experiments)</h4>
-      <div class="small">Pick a gap, click the map to add midpoints (ends snap to the
-        experiment end &rarr; next start). A straight glue is used if you add none.</div>
-      <div class="row" style="margin-top:4px;">
-        <select id="lb-repo-gap"></select>
-        <button id="lb-repo-draw" class="primary">Draw glue (click map)</button>
-        <button id="lb-repo-clear">Clear midpoints</button>
-      </div>
-      <div class="row" style="margin-top:4px;">
-        <label style="margin:0;">v <input type="number" id="lb-repo-v" value="0.40" step="0.05" min="0.05" max="0.6" style="width:58px;"> m/s</label>
-        <label style="margin:0;">pos tol <input type="number" id="lb-repo-postol" value="0.15" step="0.01" min="0.05" max="0.5" style="width:58px;"> m</label>
-      </div>
-      <div class="stat" id="lb-repo-state">(no glue)</div>
-
-      <h4 style="margin:10px 0 4px;">3 &middot; Legs (auto: glue &rarr; experiment, cyclic)</h4>
-      <div class="row">
-        <button id="lb-clear-all">Clear all</button>
-      </div>
-      <div class="stat" id="lb-legs">legs: 0</div>
-
-      <h4 style="margin:10px 0 4px;">4 &middot; Send + run</h4>
-      <button id="lb-send" class="primary">Send to NUC</button>
-      <div class="small" id="lb-send-state"></div>
-      <div class="row" style="margin-top:6px;">
-        <button id="lb-start" class="primary">Start</button>
-        <button id="lb-pause">Pause</button>
-        <button id="lb-abort" class="estop" style="font-size:14px;padding:8px;">ABORT</button>
-      </div>
-      <div class="stat" id="lb-run-status" style="margin-top:6px;">(waiting for /run/status)</div>
-      <!-- Experiment dataset dashboard: whole-matrix progress (X/320 usable
-           legs across all sessions, from the bag-root manifest) + failed /
-           redo-pending counters. Fed by /run/status `progress`. -->
-      <div class="stat" id="lb-progress" style="margin-top:4px; display:none;">
-        <div style="background:#223; border-radius:4px; height:12px; overflow:hidden;">
-          <div id="lb-progress-fill" style="height:100%; width:0%; background:#4caf50; transition:width .3s;"></div>
-        </div>
-        <div class="small" id="lb-progress-text" style="margin-top:2px;"></div>
-      </div>
-    </details>
-
-    <h3>Manual control</h3>
-    <div class="row">
-      <button id="btn-stop">Stop scenario</button>
-      <button id="btn-recenter">Recenter map on robot</button>
-    </div>
-    <div class="row" style="margin-top:6px;">
-      <button id="btn-teleop">Toggle keyboard teleop</button>
-      <button id="btn-reanchor-rtk" class="primary">Belief &rarr; RTK + reset odom</button>
-    </div>
-    <div class="small ok" id="reanchor-state"></div>
-    <div class="small">
-      Drag the blue belief dot to set its position by hand, or
-      <b>Belief &rarr; RTK</b> to snap it onto the RTK fix and re-zero odom to
-      (0,0,0). Both are motion-free (no driving). For autonomous runs use the
-      Experiment panel above. The big E-STOP latches motion immediately; Stop
-      scenario also clears the latched <code>/reference_path</code>.
-    </div>
-
-    <h3>Map</h3>
-    <label>belief heading / map bearing (deg E of N)
-      <span class="pill" id="bearing_val2">42.0</span>
-      <input type="range" id="bearing2" min="0" max="360" step="0.5" value="42">
-    </label>
-    <div class="small">
-      Rotation used to project the blue belief dot. No compass topic exists, so
-      after a re-anchor set this to the robot's true heading.
-    </div>
-    <label>basemap
-      <select id="basemap">
-        <option value="osm" selected>OpenStreetMap</option>
-        <option value="google">Google Satellite</option>
-        <option value="google_hybrid">Google Hybrid</option>
-        <option value="esri">Esri World Imagery</option>
-      </select>
-    </label>
-    <details style="margin-top:6px;">
-      <summary>Map legend</summary>
-      <div class="legend-row"><span class="legend-swatch" style="background:#39f"></span>controller belief (<code>/wheel/odom_zeroed</code>)</div>
-      <div class="legend-row"><span class="legend-swatch" style="background:#e91e63"></span>RTK FIXED (magenta; line = fused heading <code>/heading/fused</code>)</div>
-      <div class="legend-row"><span class="legend-swatch" style="background:#ffc107"></span>RTK FLOAT / other (amber)</div>
-      <div class="legend-row"><span class="legend-swatch" style="background:#ff9800"></span>Pixhawk raw GPS (orange)</div>
-      <div class="legend-row"><span class="legend-swatch" style="background:#0ff"></span>ad-hoc path anchor (cyan + arrow)</div>
-      <div class="legend-row"><span class="legend-swatch" style="background:#0f0"></span>ad-hoc curve start (lime)</div>
-      <div class="legend-row"><span class="legend-swatch" style="background:#f00"></span>ad-hoc curve end (red)</div>
-      <div class="legend-row"><span class="legend-swatch poly" style="border-color:#ff0"></span>venue corners (yellow polygon)</div>
-      <div class="legend-row"><span class="legend-swatch dashed" style="border-color:#0f0"></span>venue inset = corners &minus; margin (green dashed)</div>
-      <div class="legend-row"><span class="legend-swatch" style="background:#0f8"></span>venue start pin (+arrow = heading)</div>
-      <div class="legend-row"><span class="legend-swatch" style="background:#f80"></span>venue end pin (+arrow = heading)</div>
-      <div class="legend-row"><span class="legend-swatch" style="background:#f33"></span>exclusion zone (red disc)</div>
-      <div class="legend-row"><span class="legend-swatch" style="background:#888"></span>stale (stream timed out)</div>
     </details>
 
     <details id="adhoc-details" style="margin-top:10px; display:none;">
@@ -916,7 +967,9 @@ const tileLayers = {
 
 const map = L.map('map', { zoomControl: true, preferCanvas: false, maxZoom: MAP_MAX_ZOOM })
               .setView([37.61190, 126.99437], 19);
-let activeBase = tileLayers.osm.addTo(map);
+// Default = Google Hybrid (imagery + labels); keep in sync with the
+// `selected` <option> of #basemap.
+let activeBase = tileLayers.google_hybrid.addTo(map);
 setTimeout(() => map.invalidateSize(true), 50);
 setTimeout(() => map.invalidateSize(true), 300);
 window.addEventListener('resize', () => map.invalidateSize(true));
@@ -1235,6 +1288,7 @@ let topicExpStatus = null, topicExpCmd = null;   // T10 — /experiment/{status,
 let topicVenueLoad = null, topicVenueLoadStatus = null, topicVenueLoaded = null;
 let topicRunGo = null, topicRunCmd = null, topicRunStatus = null;
 let topicPlanRequest = null, topicPlanResult = null;
+let topicOperatorAlert = null;
 let setParamsService = null;
 let lastOdomTime = 0, lastStatusTime = 0, odomCount = 0, statusCount = 0;
 let lastExpTime = 0, expCount = 0;                // T10 — sequencer freshness
@@ -1375,7 +1429,9 @@ function _osNotify(level, title, detail, tag) {
   } catch (e) {}
 }
 
-function _anyUnacked() { return Object.values(_alerts).some((a) => !a.acked); }
+// 'info' cards (stage advance, etc.) are a quiet log: no beep, no OS
+// notification, no title flash — only warn/critical demand attention.
+function _anyUnacked() { return Object.values(_alerts).some((a) => !a.acked && a.level !== 'info'); }
 
 function _titleFlash() {
   if (_anyUnacked()) {
@@ -1395,17 +1451,18 @@ function renderAlerts() {
   stack.innerHTML = Object.keys(_alerts).map((id) => {
     const a = _alerts[id];
     const age = Math.max(0, Math.round((Date.now() - a.since) / 1000));
-    const icon = a.level === 'critical' ? '\u{1F6A8}' : '⚠️';
+    const ageTxt = age < 120 ? `${age}s ago` : `${Math.round(age / 60)}m ago`;
+    const icon = a.level === 'critical' ? '\u{1F6A8}' : a.level === 'info' ? 'ℹ️' : '⚠️';
     return `<div class="alert ${a.level}${a.acked ? ' acked' : ''}">` +
       `<button class="alert-x" onclick="ackAlert('${id}')" title="acknowledge">&times;</button>` +
       `<div class="alert-title">${icon} ${a.title}</div>` +
       `<div class="alert-detail">${a.detail || ''}</div>` +
-      `<div class="alert-age">${age}s ago</div></div>`;
+      `<div class="alert-age">${ageTxt}</div></div>`;
   }).join('');
   _titleFlash();
 }
 
-function raiseAlert(id, level, title, detail) {
+function raiseAlert(id, level, title, detail, sinceMs) {
   const ex = _alerts[id];
   // (Re)fire the beep/notification only on a NEW alert, an escalation, or
   // changed text — not on every repeat of a steady condition. A change re-arms
@@ -1413,11 +1470,36 @@ function raiseAlert(id, level, title, detail) {
   const changed = !ex || ex.level !== level || ex.detail !== detail;
   _alerts[id] = {
     level, title, detail,
-    since: ex ? ex.since : Date.now(),
+    since: ex ? ex.since : (sinceMs || Date.now()),
     acked: changed ? false : ex.acked,
   };
-  if (changed && !_alerts[id].acked) { _beep(level); _osNotify(level, title, detail, id); }
+  if (changed && !_alerts[id].acked && level !== 'info') {
+    _beep(level); _osNotify(level, title, detail, id);
+  }
   renderAlerts();
+}
+
+function _escHtml(s) {
+  return String(s).replace(/[&<>"']/g, (c) =>
+    ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+
+// /operator/alert (std_msgs/String JSON) — the NUC-side operator pages that
+// used to go to Discord only (run_executor stage advance / anchor warning,
+// odom_watchdog + rtk_watchdog page / all-clear). Payload:
+//   {id, level: 'info'|'warn'|'critical'|'clear', title, detail, stamp}
+// `stamp` is unix seconds on the NUC. The publishers are transient_local, so a
+// fresh connect replays recent events in order; a later 'clear' for the same
+// id removes the card, leaving only conditions that are still open.
+function onOperatorAlert(msg) {
+  let d;
+  try { d = JSON.parse(msg.data); } catch (e) { return; }
+  if (!d || !d.id) return;
+  const id = 'op_' + String(d.id).replace(/[^A-Za-z0-9_-]/g, '_');
+  if (d.level === 'clear') { clearAlert(id); return; }
+  const level = ['info', 'warn', 'critical'].includes(d.level) ? d.level : 'warn';
+  const since = Number(d.stamp) > 0 ? Number(d.stamp) * 1000 : null;
+  raiseAlert(id, level, _escHtml(d.title || d.id), _escHtml(d.detail || ''), since);
 }
 
 function ackAlert(id) { if (_alerts[id]) { _alerts[id].acked = true; renderAlerts(); } }
@@ -1655,6 +1737,9 @@ function subscribeAll() {
   topicPlanResult = new ROSLIB.Topic({
     ros, name: '/plan/result', messageType: 'std_msgs/msg/String' });
   topicPlanResult.subscribe(onPlanResult);
+  topicOperatorAlert = new ROSLIB.Topic({
+    ros, name: '/operator/alert', messageType: 'std_msgs/msg/String' });
+  topicOperatorAlert.subscribe(onOperatorAlert);
 
   refreshManualPins();
 
@@ -3569,7 +3654,52 @@ function lbSlalomRecipeLocal(recipe) {
   }
   return pts;
 }
+// ---- WigglePath reimplemented (mirror ros2_bridge/.../wiggle_path.py) ----
+// Curvature-defined: lead-in L1, then kappa(s) per kind with peak 1/R, then
+// lead-out L_end; integrated on the same 5 mm grid (rectangle rule on kappa,
+// midpoint heading for position) so the preview is the driven curve.
+function lbWiggleRecipeLocal(recipe) {
+  const p = recipe.params || {};
+  const kind = String(recipe.type).split('_')[1];
+  const R = Number(p.R) || 1.2, k = 1 / R, ds = 0.005;
+  const L1 = p.L1 != null ? Number(p.L1) : 0.5;
+  const Lend = p.L_end != null ? Number(p.L_end) : 0.5;
+  const n = Math.max(1, Math.round(Number(p.n_periods) || 2));
+  const kap = [];
+  const run = (len, kk) => {
+    const m = Math.max(1, Math.round(len / ds));
+    for (let i = 0; i < m; i++) kap.push(kk);
+  };
+  run(L1, 0);
+  if (kind === 'square') {
+    const half = (Number(p.wavelength) || 3.0) / 2;     // one full arc
+    const lens = [half / 2].concat(Array(2 * n - 1).fill(half), [half / 2]);
+    lens.forEach((len, i) => run(len, (i % 2 === 0) ? k : -k));
+  } else {
+    const lam0 = Number(p.wavelength) || 3.0;
+    const lam1 = kind === 'chirp' ? (Number(p.wavelength_end) || 1.5) : lam0;
+    const flat = Math.abs(lam1 - lam0) < 1e-9;
+    const S = flat ? n * lam0 : n * (lam1 - lam0) / Math.log(lam1 / lam0);
+    const m = Math.max(2, Math.round(S / ds));
+    for (let i = 0; i < m; i++) {
+      const s = i * ds;
+      const ph = flat ? 2 * Math.PI * s / lam0
+        : 2 * Math.PI * S / (lam1 - lam0) * Math.log((lam0 + (lam1 - lam0) * s / S) / lam0);
+      kap.push(k * Math.cos(ph));
+    }
+  }
+  run(Lend, 0);
+  const out = [[0, 0]];
+  let x = 0, y = 0, psi = 0;
+  for (let i = 0; i < kap.length; i++) {
+    const hm = psi + kap[i] * ds / 2;
+    x += Math.cos(hm) * ds; y += Math.sin(hm) * ds; psi += kap[i] * ds;
+    if ((i + 1) % 20 === 0 || i === kap.length - 1) out.push([x, y]);
+  }
+  return out;
+}
 function lbRecipeLocal(recipe) {
+  if (String(recipe.type).startsWith('wiggle_')) return lbWiggleRecipeLocal(recipe);
   return recipe.type === 'slalom' ? lbSlalomRecipeLocal(recipe)
                                   : lbStepRecipeLocal(recipe);
 }
@@ -3620,6 +3750,22 @@ function lbBindDrag(marker, onMove) {
 // ---- experiment recipe inputs <-> the selected experiment ----
 function lbReadRecipeInputs() {
   const type = $('lb-rec-type').value;
+  if (type.startsWith('wiggle_')) {
+    // R / L1 / L2 (= L_end) come from the inputs; the wavelength shape rides
+    // along from the selected experiment (the auto-planner sets it) or the
+    // planner defaults.
+    const cur = (lbSelExp >= 0 && lbExps[lbSelExp]
+                 && lbExps[lbSelExp].recipe.type === type)
+                ? lbExps[lbSelExp].recipe.params : {};
+    return { type, params: {
+      R: parseFloat($('lb-rec-R').value) || 1.2,
+      L1: parseFloat($('lb-rec-L1').value) || 0,
+      L_end: parseFloat($('lb-rec-L2').value) || 0,
+      wavelength: cur.wavelength != null ? cur.wavelength : 3.0,
+      wavelength_end: cur.wavelength_end != null ? cur.wavelength_end : 1.5,
+      n_periods: cur.n_periods != null ? cur.n_periods : 2,
+    } };
+  }
   if (type === 'slalom') {
     // The L2 input doubles as L_end; L_mid/n_arcs ride along from the
     // selected experiment (the auto-planner sets them) or planner defaults.
@@ -3645,7 +3791,8 @@ function lbWriteRecipeInputs(e) {
   $('lb-rec-type').value = e.recipe.type;
   $('lb-rec-R').value = e.recipe.params.R;
   $('lb-rec-L1').value = e.recipe.params.L1;
-  $('lb-rec-L2').value = e.recipe.type === 'slalom'
+  $('lb-rec-L2').value = (e.recipe.type === 'slalom'
+                         || String(e.recipe.type).startsWith('wiggle_'))
     ? e.recipe.params.L_end : e.recipe.params.L2;
   $('lb-rec-dir').value = String((e.recipe.params.direction || 1) >= 0 ? 1 : -1);
   if (e.recipe.params.theta_arc != null) $('lb-rec-theta').value = Math.round(e.recipe.params.theta_arc * 180/Math.PI);
@@ -4250,6 +4397,84 @@ lbRebuildGapSelect();
 if (lbStages) lbRebuildStageSelect();
 if ($('lb-repo-gap') && lbRepoGap < lbExps.length) $('lb-repo-gap').value = String(lbRepoGap);
 lbRedrawAll();           // draws restored paths; no-op when nothing was saved
+
+// ============================================================
+// Panel sections: remember which <details> the operator keeps open (per
+// browser). The legacy ad-hoc block is excluded — its visibility is managed
+// by the legacy-curve flow, not by the operator.
+// ============================================================
+document.querySelectorAll('#panel details[id]').forEach((d) => {
+  if (d.id === 'adhoc-details') return;
+  const k = 'hinf.details.' + d.id;
+  try { const v = localStorage.getItem(k); if (v !== null) d.open = (v === '1'); } catch (e) {}
+  d.addEventListener('toggle', () => {
+    try { localStorage.setItem(k, d.open ? '1' : '0'); } catch (e) {}
+  });
+});
+
+// ============================================================
+// Changelog (Korean). Bump BATTLE_VERSION and prepend an entry whenever the
+// battle station changes in a way the operator should know about; the overlay
+// then shows once per browser. Versions compare as strings: YYYY.MM.DD[-n].
+// ============================================================
+const BATTLE_VERSION = '2026.10.02-2';
+const CHANGELOG = [
+  {
+    version: '2026.10.02-2',
+    items: [
+      '자동 배치가 실험 곡선을 장소의 벽과 나란하게 놓는다. 장소 방향과 관계없이 남북으로만 놓던 문제를 고쳤고, 좁은 장소에도 A/B 쌍이 더 잘 들어간다.',
+      '자동 배치 계산 시간이 장소당 수 분에서 15~50초로 줄었다.',
+      'glue 곡선의 최소 반경을 조향 한계보다 넉넉한 1.2 m로 올리고, 출발 핀 앞에 곧은 진입 구간을 길게 두도록 했다. 고리 모양으로 돌아가는 glue는 고르지 않는다. 장소가 좁아 1.2 m가 들어가지 않을 때만 0.85 m를 쓰고 알림 목록에 표시한다.',
+      '새 경로군 wiggle_sine, wiggle_chirp, wiggle_square를 추가했다. 반경 2.0, 1.5, 1.2 m에서 곡률이 자주 바뀌는 경로로, 조향 한계 안에서 실험할 수 있다. Leg batch의 type 목록에서 고를 수 있다.',
+    ],
+  },
+  {
+    version: '2026.10.02',
+    items: [
+      '기본 지도를 위성 사진에 지명이 겹쳐 보이는 Google Hybrid로 바꿨다.',
+      '경고 카드를 지도 오른쪽 위로 옮겼다. 이제 카드가 E-STOP과 제어 패널 버튼을 가리지 않는다. 카드가 많으면 카드 영역 안에서 스크롤된다.',
+      'Discord 알림을 껐다. 휴대폰으로는 더 이상 알림이 가지 않는다. Discord로만 받던 단계 전환, 앵커 경고, odom 감시와 RTK 감시의 경보와 해제는 이제 이 화면에 경고 카드로 뜬다.',
+      '단계 전환처럼 조치가 필요 없는 알림은 파란 카드로 뜨고 경고음을 내지 않는다.',
+      '제어 패널을 사용 빈도 순으로 다시 배치했다. 매번 쓰는 Leg batch를 펼친 채로 Connection 바로 아래에 두고, Auto-plan과 Send, Start를 그 맨 위에 모았다. 곡선 배치와 glue 편집은 Leg batch 안의 Edit geometry에 접어 두었다.',
+      'Node control, Venue, Map, Manual run, 더 이상 쓰지 않는 Experiment 시퀀서 패널은 아래쪽에 접어 두었다. 펼치거나 접은 상태는 브라우저가 기억한다.',
+      '새 버전을 처음 열면 이 변경 내역이 한 번 뜬다. 다시 보려면 패널 제목 옆의 변경 내역을 누른다.',
+    ],
+  },
+];
+const LS_CHANGELOG_KEY = 'hinf.changelog.seen';
+
+function showChangelog(entries) {
+  $('changelog-version').textContent = `현재 버전 ${BATTLE_VERSION}`;
+  $('changelog-body').innerHTML = entries.map((e) =>
+    `<h3>${_escHtml(e.version)}</h3><ul>` +
+    e.items.map((t) => `<li>${_escHtml(t)}</li>`).join('') + '</ul>').join('');
+  $('changelog-overlay').classList.add('shown');
+  $('changelog-close').focus();
+}
+
+function closeChangelog() {
+  $('changelog-overlay').classList.remove('shown');
+  try { localStorage.setItem(LS_CHANGELOG_KEY, BATTLE_VERSION); } catch (e) {}
+}
+
+$('changelog-close').onclick = closeChangelog;
+$('changelog-overlay').addEventListener('click', (e) => {
+  if (e.target === $('changelog-overlay')) closeChangelog();   // backdrop only
+});
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape' && $('changelog-overlay').classList.contains('shown')) closeChangelog();
+});
+$('changelog-link').onclick = (e) => { e.preventDefault(); showChangelog(CHANGELOG); };
+
+(function changelogOnLoad() {
+  let seen = null;
+  try { seen = localStorage.getItem(LS_CHANGELOG_KEY); } catch (e) {}
+  if (seen === BATTLE_VERSION) return;
+  // Everything newer than the last version this browser saw; on a first-ever
+  // visit the latest few entries.
+  const unseen = seen ? CHANGELOG.filter((e) => e.version > seen) : CHANGELOG.slice(0, 3);
+  if (unseen.length) showChangelog(unseen);
+})();
 </script>
 </body>
 </html>

@@ -134,10 +134,20 @@ def _discord_webhook():
     return None
 
 
+# Discord paging is OFF (operator decision 2026-10-02): every page now lands as
+# a card in the battle-station browser via /operator/alert (see run_executor /
+# odom_watchdog / rtk_watchdog). Set True, or export HINF_DISCORD=1 in the
+# node's environment, to turn the Discord channel back on.
+DISCORD_ENABLED = False
+
+
 def notify_discord(message, *, title=None, timeout=5):
     """POST ``message`` to the Discord webhook from discord.env. Returns True on a
-    2xx response, False otherwise (incl. no webhook configured). Never raises, so
-    the sequencer is never interrupted by a notification failure."""
+    2xx response, False otherwise (incl. disabled / no webhook configured). Never
+    raises, so the sequencer is never interrupted by a notification failure."""
+    if not (DISCORD_ENABLED or os.environ.get("HINF_DISCORD") == "1"):
+        log.info("discord switched off (ntfy.DISCORD_ENABLED) — not sent: %r", message)
+        return False
     url = _discord_webhook()
     if not url:
         log.info("discord disabled (no webhook) — message not sent: %r", message)

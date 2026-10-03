@@ -60,6 +60,8 @@ from rclpy.node import Node
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import NavSatFix
 from std_msgs.msg import String
+from rclpy.qos import (
+    QoSProfile, QoSDurabilityPolicy, QoSReliabilityPolicy, QoSHistoryPolicy)
 
 # Operator paging (Discord webhook from discord.env / ntfy), imported defensively
 # so a missing module just disables paging (logs only). Same idiom as
@@ -70,6 +72,20 @@ try:
 except Exception:
     def _notify_discord(*_a, **_k):
         return False
+
+# /operator/alert: the battle-station browser's card channel (std_msgs/String
+# JSON {id, level, title, detail, stamp}). Latched with a short history so a
+# reconnecting browser replays page -> all-clear in order and shows only what
+# is still open. Replaces the Discord page (ntfy.DISCORD_ENABLED is off).
+ALERT_QOS = QoSProfile(depth=10, history=QoSHistoryPolicy.KEEP_LAST,
+                       reliability=QoSReliabilityPolicy.RELIABLE,
+                       durability=QoSDurabilityPolicy.TRANSIENT_LOCAL)
+
+
+def alert_json(alert_id, level, title, detail=""):
+    """level: 'info' | 'warn' | 'critical' | 'clear'."""
+    return json.dumps({"id": alert_id, "level": level, "title": title,
+                       "detail": detail, "stamp": time.time()})
 
 # The driver publishes one human-readable line on gps/rtk_status, e.g.
 #   FIX: RTK FIXED (quality=4, sats=12, HDOP=0.64, rate=8.0Hz) | Lat=..., Lon=...
@@ -121,6 +137,7 @@ class RtkWatchdog(Node):
 
         self.pub_status = self.create_publisher(String, "/rtk_watchdog/status", 10)
         self.pub_cmd = self.create_publisher(String, "/run/cmd", 10)
+        self.pub_alert = self.create_publisher(String, "/operator/alert", ALERT_QOS)
         self.create_subscription(String, args.status_topic, self._on_status, 10)
         self.create_subscription(NavSatFix, args.fix_topic, self._on_fix, 10)
         self.create_subscription(Odometry, args.odom_topic, self._on_odom, 10)
@@ -261,6 +278,10 @@ class RtkWatchdog(Node):
             bits.append(f"HDOP {m['hdop']:.1f}")
         body = f"RTK {state}: {detail}. [{', '.join(bits)}]"
         try:
+            level = "critical" if state == "SEVERE" else "warn"
+            self.pub_alert.publish(String(data=alert_json(
+                "rtk_watchdog", level, f"RTK WATCHDOG — {state}",
+                f"{detail}. [{', '.join(bits)}]")))
             ok = _notify_discord(body, title="H-inf RTK watchdog")
             self.get_logger().error(f"PAGED operator (discord ok={ok}): {body}")
         except Exception as exc:
@@ -268,6 +289,7 @@ class RtkWatchdog(Node):
 
     def _clear_page(self):
         try:
+            self.pub_alert.publish(String(data=alert_json("rtk_watchdog", "clear", "")))
             _notify_discord("RTK health recovered — watchdog all-clear.",
                             title="H-inf RTK watchdog")
         except Exception:

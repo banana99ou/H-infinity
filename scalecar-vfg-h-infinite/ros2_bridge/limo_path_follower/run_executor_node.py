@@ -145,7 +145,10 @@ NEUTRAL_RECIPE = json.dumps({"type": "none"})
 # Imported defensively like odom_watchdog: a missing module/webhook only
 # disables paging, it can never interrupt a batch. Field rule 2026-06-10:
 # every operator-actionable warning goes to BOTH channels — the browser card
-# (WebUI, from /run/status) and Discord (this).
+# and Discord (this). Browser cards come from /run/status (pause / abort /
+# done), /limo_status (battery) and, for events with no status field of their
+# own (stage advance, anchor warning), /operator/alert via _operator_alert().
+# Discord itself is switched off in ntfy.py (DISCORD_ENABLED, 2026-10-02).
 try:
     sys.path.insert(0, os.path.join(_REPO_ROOT, "tools", "notify"))
     from ntfy import notify_discord as _notify_discord  # type: ignore
@@ -329,6 +332,14 @@ class RunExecutor(Node):
         self.pub_recipe = self.create_publisher(
             String, "/reference_path_recipe", latched)
         self.pub_plan = self.create_publisher(String, "/plan/result", latched)
+        # Operator cards in the battle-station browser (/operator/alert JSON).
+        # Latched with a short history so a reconnecting browser replays the
+        # recent events (a later "clear" for the same id cancels its card).
+        self.pub_alert = self.create_publisher(
+            String, "/operator/alert",
+            QoSProfile(depth=10, history=QoSHistoryPolicy.KEEP_LAST,
+                       reliability=QoSReliabilityPolicy.RELIABLE,
+                       durability=QoSDurabilityPolicy.TRANSIENT_LOCAL))
 
         self.create_subscription(String, "/run/go", self._on_go, 10)
         self.create_subscription(String, "/run/cmd", self._on_cmd, 10)
@@ -932,10 +943,10 @@ class RunExecutor(Node):
             self.get_logger().info(
                 f"stage advance -> '{st['name']}' "
                 f"({i + 1}/{len(self._stages)}).")
-            _notify_discord(
-                f"STAGE ADVANCE: '{st['name']}' ({i + 1}/{len(self._stages)}) "
-                f"— sweep {self._runs_done()}/{self._runs_target()}.",
-                title="H-inf run_executor")
+            self._operator_alert(
+                "stage_advance", "info", "STAGE ADVANCE",
+                f"'{st['name']}' ({i + 1}/{len(self._stages)}) "
+                f"— sweep {self._runs_done()}/{self._runs_target()}.")
             self._publish_status(message=f"stage advance: {st['name']}")
             return "advanced"
         # Nothing ahead; restore the current stage's legs.
@@ -1433,8 +1444,8 @@ class RunExecutor(Node):
                    + " — RTK-truth scoring for this leg falls back to the "
                      "post-hoc odom->RTK track fit.")
             self.get_logger().error(msg)
-            _notify_discord(f"ANCHOR WARNING ({self._leg_cell_id}): {msg}",
-                            title="H-inf run_executor")
+            self._operator_alert("anchor_warning", "warn",
+                                 f"ANCHOR WARNING ({self._leg_cell_id})", msg)
         else:
             self.get_logger().info(
                 f"achieved anchor: lat={self._achieved_anchor['lat']:.7f} "
@@ -1791,6 +1802,18 @@ class RunExecutor(Node):
     # ==================================================================
     # Status
     # ==================================================================
+
+    def _operator_alert(self, alert_id, level, title, detail):
+        """Page the operator: a browser card (/operator/alert) + Discord (off
+        by default, see ntfy.DISCORD_ENABLED). level: 'info' | 'warn' |
+        'critical' | 'clear'. Never raises — a page must not break a batch."""
+        try:
+            self.pub_alert.publish(String(data=json.dumps({
+                "id": alert_id, "level": level, "title": title,
+                "detail": detail, "stamp": time.time()})))
+        except Exception as exc:  # noqa: BLE001
+            self.get_logger().warn(f"operator alert publish failed: {exc}")
+        _notify_discord(f"{title}: {detail}", title="H-inf run_executor")
 
     def _publish_status(self, message=""):
         cmd_owner = None

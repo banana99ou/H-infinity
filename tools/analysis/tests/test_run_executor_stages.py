@@ -119,12 +119,16 @@ class Exec:
         self._last_completed_leg_idx = None
         self.paused = None
         self.status_msgs = []
+        self.alerts = []
 
     def get_logger(self):
         return _Log()
 
     def _pause(self, reason):
         self.paused = reason
+
+    def _operator_alert(self, alert_id, level, title, detail):
+        self.alerts.append((alert_id, level, title, detail))
 
     def _publish_status(self, message=""):
         self.status_msgs.append(message)
@@ -181,6 +185,8 @@ def test_advance_stage_moves_on_and_gates_containment():
     ex._legs = ex._stages[0]["legs"]
     assert ex._advance_stage() == "advanced"
     assert ex._stage_idx == 1 and ex._leg_idx == 0 and ex.paused is None
+    # The operator sees the advance as a browser card (was Discord-only).
+    assert [(a[0], a[1]) for a in ex.alerts] == [("stage_advance", "info")]
 
 
 def test_advance_stage_pauses_on_violating_stage():

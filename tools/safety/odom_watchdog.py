@@ -32,6 +32,8 @@ import rclpy
 from rclpy.node import Node
 from nav_msgs.msg import Odometry
 from std_msgs.msg import String
+from rclpy.qos import (
+    QoSProfile, QoSDurabilityPolicy, QoSReliabilityPolicy, QoSHistoryPolicy)
 
 _DEFAULT_REBIND = "/home/agilex/H-infinity/tools/safety/usb_rebind_limo_base.sh"
 
@@ -44,6 +46,20 @@ try:
 except Exception:
     def _notify_discord(*_a, **_k):
         return False
+
+# /operator/alert: the battle-station browser's card channel (std_msgs/String
+# JSON {id, level, title, detail, stamp}). Latched with a short history so a
+# reconnecting browser replays page -> all-clear in order and shows only what
+# is still open. Replaces the Discord page (ntfy.DISCORD_ENABLED is off).
+ALERT_QOS = QoSProfile(depth=10, history=QoSHistoryPolicy.KEEP_LAST,
+                       reliability=QoSReliabilityPolicy.RELIABLE,
+                       durability=QoSDurabilityPolicy.TRANSIENT_LOCAL)
+
+
+def alert_json(alert_id, level, title, detail=""):
+    """level: 'info' | 'warn' | 'critical' | 'clear'."""
+    return json.dumps({"id": alert_id, "level": level, "title": title,
+                       "detail": detail, "stamp": time.time()})
 
 
 class OdomWatchdog(Node):
@@ -70,6 +86,7 @@ class OdomWatchdog(Node):
         self.pub_kill = self.create_publisher(String, "/orchestrator/kill", 10)
         self.pub_start = self.create_publisher(String, "/orchestrator/start", 10)
         self.pub_status = self.create_publisher(String, "/odom_watchdog/status", 10)
+        self.pub_alert = self.create_publisher(String, "/operator/alert", ALERT_QOS)
         self.create_subscription(Odometry, "/wheel/odom", self._on_odom, 10)
         self.create_subscription(String, "/orchestrator/status", self._on_orch, 10)
         self.create_timer(0.5, self._tick)
@@ -119,11 +136,13 @@ class OdomWatchdog(Node):
         self.pub_status.publish(String(data=json.dumps({"state": state, "detail": detail})))
 
     def _page(self, message):
-        """Page the operator ONCE per outage (Discord webhook / ntfy). Never raises."""
+        """Page the operator ONCE per outage (browser card + Discord). Never raises."""
         if self._paged:
             return
         self._paged = True
         try:
+            self.pub_alert.publish(String(data=alert_json(
+                "odom_watchdog", "critical", "ODOM WATCHDOG", message)))
             ok = _notify_discord(message, title="H-inf odom watchdog")
             self.get_logger().error(f"PAGED operator (discord ok={ok}): {message}")
         except Exception as exc:
@@ -135,6 +154,7 @@ class OdomWatchdog(Node):
             return
         self._paged = False
         try:
+            self.pub_alert.publish(String(data=alert_json("odom_watchdog", "clear", "")))
             _notify_discord("LIMO /wheel/odom recovered — watchdog all-clear.",
                             title="H-inf odom watchdog")
         except Exception:

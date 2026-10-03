@@ -34,6 +34,10 @@ import Data_Logger as dl  # build_sidecar / write_sidecar (T7)
 
 
 def build_recipe(args):
+    if args.type.startswith("wiggle_"):
+        # Shape params not given here fall back to wiggle_path's defaults.
+        return {"type": args.type,
+                "params": {"R": args.R, "L1": args.L1, "L_end": args.L_end}}
     if args.type == "slalom":
         return {"type": "slalom",
                 "params": {"R": args.R, "theta_arc": math.radians(args.theta_deg),
@@ -52,7 +56,9 @@ def build_recipe(args):
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Write a sidecar for a manual bag.")
     ap.add_argument("bag_dir")
-    ap.add_argument("--type", choices=["step", "slalom", "uturn"], default="step")
+    ap.add_argument("--type", choices=["step", "slalom", "uturn", "wiggle_sine",
+                                       "wiggle_chirp", "wiggle_square"],
+                    default="step")
     ap.add_argument("--R", type=float, required=True)
     ap.add_argument("--v", type=float, required=True, dest="v")
     ap.add_argument("--controller", default="lpv-hinf")

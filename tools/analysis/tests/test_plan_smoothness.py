@@ -264,6 +264,21 @@ def _all_glue_pts(st, venue, lat0, lon0):
     return out
 
 
+def test_collinear_straight_is_not_a_crossing():
+    # A straight sampled into many collinear segments (a Dubins tail) has
+    # cross products of ~1e-17; reading their sign as a crossing rejected
+    # valid glues at random (2026-10-02). A real figure-8 must still cross.
+    import math as _m
+    for ang in (0.0, 0.3, 1.1, 2.7, -2.2):
+        line = [(i * 0.25 * _m.cos(ang) + 3.1, i * 0.25 * _m.sin(ang) - 7.3)
+                for i in range(40)]
+        assert not ep._self_intersects(line), ang
+    # (phase-shifted so the crossing falls mid-segment, not on a sample)
+    eight = [(_m.sin(2 * t), _m.sin(t)) for t in
+             [k * 2 * _m.pi / 60 + 0.013 for k in range(61)]]
+    assert ep._self_intersects(eight)
+
+
 def test_self_intersects_helper():
     # interior crossing (seg (2,0)-(2,2) vs seg (1,1)-(3,1) at (2,1)); NOT the
     # first/last pair, which the helper skips by design (glue ends meet pins)

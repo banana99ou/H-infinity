@@ -39,6 +39,10 @@ from vfg_pathfollowing import (
     LPVHinfController,
     PIDFeedforward,
 )
+try:
+    from limo_path_follower.wiggle_path import WIGGLE_TYPES, wiggle_from_recipe
+except ImportError:  # pragma: no cover - in-source runs
+    from wiggle_path import WIGGLE_TYPES, wiggle_from_recipe
 
 
 def _yaw_from_quaternion(q):
@@ -309,12 +313,14 @@ class PathFollowerNode(Node):
 
         Schema::
 
-            {"type": "step"|"slalom"|"uturn", "params": { ... }}
+            {"type": "step"|"slalom"|"uturn"|"wiggle_<kind>", "params": { ... }}
 
         - type "step"   -> StepCurvaturePath(L1, R, theta_arc, L2, direction)
         - type "slalom" -> SlalomPath(R, theta_arc, L1, L_mid, n_arcs, L_end)
         - type "uturn"  -> StepCurvaturePath(theta_arc=pi, R=R_min, ...):
               a semicircle (P3 U-turn). R defaults to the node's R_min param.
+        - type "wiggle_sine" | "wiggle_chirp" | "wiggle_square" -> WigglePath
+              (wiggle_path.py; peak curvature 1/R, see its docstring).
 
         All params are optional; the path classes supply defaults. Unknown
         params are ignored by the constructors' explicit signatures, so we pass
@@ -364,10 +370,12 @@ class PathFollowerNode(Node):
                 L2=_f('L2', 1.0),
                 direction=_i('direction', 1),
             )
+        elif ptype in WIGGLE_TYPES:
+            return wiggle_from_recipe(ptype, params)
         else:
             raise ValueError(
                 f"unknown recipe type '{ptype}'; "
-                "expected 'step', 'slalom', or 'uturn'")
+                f"expected 'step', 'slalom', 'uturn' or one of {WIGGLE_TYPES}")
 
     def _recipe_cb(self, msg: String):
         """Load an exact analytic curve from a JSON recipe (P1-P4)."""

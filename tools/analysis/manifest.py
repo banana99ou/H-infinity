@@ -265,7 +265,9 @@ def load_experiment(path):
     """Load experiment.yaml → (expected_cells set, repetitions, raw dict).
 
     expected_cells is a set of cell_key tuples from the cartesian product of the
-    matrix axes (controller × v_const × path_family × radius_m).
+    matrix axes (controller × v_const × path_family × radius_m). A family listed
+    in the optional ``radius_m_by_family`` map sweeps its own radii instead of
+    ``radius_m`` (the wiggle families live above the measured steering ceiling).
     """
     with open(path, "r", encoding="utf-8") as f:
         doc = yaml.safe_load(f)
@@ -274,11 +276,12 @@ def load_experiment(path):
     speeds = matrix.get("v_const", [])
     families = matrix.get("path_family", [])
     radii = matrix.get("radius_m", [])
+    by_fam = matrix.get("radius_m_by_family") or {}
     expected = set()
     for c in controllers:
         for v in speeds:
             for fam in families:
-                for R in radii:
+                for R in by_fam.get(fam, radii):
                     expected.add((str(c), _num(v), str(fam), _num(R)))
     reps = int(doc.get("repetitions", 0) or 0)
     return expected, reps, doc

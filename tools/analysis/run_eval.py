@@ -64,7 +64,12 @@ _PATHGEN = os.path.join(_REPO_ROOT, "tools", "path_gen")
 if _PATHGEN not in sys.path:
     sys.path.insert(0, _PATHGEN)
 
+_PKG = os.path.join(_VFG_ROOT, "ros2_bridge", "limo_path_follower")
+if _PKG not in sys.path:
+    sys.path.insert(0, _PKG)
+
 try:
+    from wiggle_path import WIGGLE_TYPES, wiggle_from_recipe
     from vfg_pathfollowing.paths.step_curvature import StepCurvaturePath
     from vfg_pathfollowing.paths.slalom import SlalomPath
     from vfg_pathfollowing.guidance.vfg import VectorFieldGuidance
@@ -148,7 +153,7 @@ def build_path_from_recipe(recipe, r_min_default=0.5):
     if present, else from ``r_min_default`` (which the caller can override from
     the sidecar's controller_tuning if it carries an R_min).
 
-    Schema::  {"type": "step"|"slalom"|"uturn", "params": {...}}
+    Schema::  {"type": "step"|"slalom"|"uturn"|"wiggle_<kind>", "params": {...}}
     """
     if not isinstance(recipe, dict):
         raise ValueError(
@@ -190,9 +195,12 @@ def build_path_from_recipe(recipe, r_min_default=0.5):
             L2=_f("L2", 1.0),
             direction=_i("direction", 1),
         )
+    elif ptype in WIGGLE_TYPES:
+        return wiggle_from_recipe(ptype, params)
     else:
         raise ValueError(
-            f"unknown recipe type '{ptype}'; expected 'step', 'slalom', or 'uturn'")
+            f"unknown recipe type '{ptype}'; expected 'step', 'slalom', 'uturn' "
+            f"or one of {WIGGLE_TYPES}")
 
 
 # =============================================================================

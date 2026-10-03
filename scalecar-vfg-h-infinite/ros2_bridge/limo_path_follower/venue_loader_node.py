@@ -56,7 +56,8 @@ _REPO_ROOT = next(
 
 VALID_KINDS = ("reposition", "recipe")
 VALID_CONTROLLERS = ("lpv-hinf", "lpv_hinf", "lpv", "hinf", "pid-ff", "pid_ff", "pid")
-VALID_RECIPE_TYPES = ("step", "slalom", "uturn")
+VALID_RECIPE_TYPES = ("step", "slalom", "uturn",
+                      "wiggle_sine", "wiggle_chirp", "wiggle_square")
 
 
 class VenueLoaderNode(Node):

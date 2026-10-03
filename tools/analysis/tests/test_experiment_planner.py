@@ -256,6 +256,66 @@ def test_best_effort_keeps_every_geometry_in_the_editor():
         "a 6x6 venue should force at least one best-effort stage"
 
 
+def _rotated_venue(long_m, short_m, bearing_deg, margin=0.5):
+    """Rectangle venue whose long side points along bearing_deg."""
+    f = (math.sin(math.radians(bearing_deg)), math.cos(math.radians(bearing_deg)))
+    s = (f[1], -f[0])
+    return {"name": "rotated", "safety_margin_m": margin, "exclusions": [],
+            "corners_wgs84": [_ll(u * f[0] + v * s[0], u * f[1] + v * s[1])
+                              for (u, v) in ((0, 0), (long_m, 0),
+                                             (long_m, short_m), (0, short_m))]}
+
+
+def test_venue_rect_recovers_a_rotated_rectangle():
+    v = _rotated_venue(14.0, 8.0, 42.0)
+    lat0, lon0 = v["corners_wgs84"][0]["lat"], v["corners_wgs84"][0]["lon"]
+    beta, _c, long_m, short_m = ep._venue_rect(
+        venue_geom.poly_en(v["corners_wgs84"], lat0, lon0))
+    assert min(abs(beta - 42.0), abs(beta - 222.0)) < 0.2, beta
+    assert abs(long_m - 14.0) < 0.05 and abs(short_m - 8.0) < 0.05
+
+
+def test_pairs_run_along_the_walls_of_a_rotated_venue():
+    # Field 2026-10-02: the grid search laid curves north/south (score ties
+    # fall back to scan order from heading 0) whatever the venue's rotation.
+    # Every A/B pair must now be a full pair pointing along a wall, and pass
+    # the loader gate. (The legacy search fails this: 12-42 deg off the walls
+    # on this venue, three single-curve fallbacks and one best-effort stage.)
+    venue = _rotated_venue(14.0, 8.0, 42.0)
+    plan = ep.plan_stages(venue, _doc(), {}, FOOT, TRACK)
+    assert plan["ok"], plan["notes"]
+    for st in plan["stages"]:
+        hs = [e["start"]["heading_deg"] for e in st["experiments"]]
+        assert len(hs) == 2, f"{st['name']}: not an A/B pair ({hs})"
+        for h in hs:
+            off = (h - 42.0) % 90.0
+            assert min(off, 90.0 - off) < 0.5, f"{st['name']}: {h} deg off the walls"
+        ok, report = venue_geom.check_legs_containment(
+            _legs_from_stage(st, venue), venue, FOOT, TRACK)
+        assert ok, f"{st['name']} rejected by the loader gate:\n{report}"
+
+
+def test_plan_is_noise_proof():
+    # Field 2026-10-02: mirror-image placements tie exactly in a rectangle and
+    # the last floating-point ulp picked one — a different summation order
+    # flipped a stage to a placement whose transit glue failed. Nudging every
+    # corner by a nanometre must not change the plan.
+    venue = _rotated_venue(17.5, 9.0, 37.6, margin=0.7)
+    doc = _doc()
+    doc["matrix"]["radius_m"] = [1.0, 0.5]
+    p1 = ep.plan_stages(venue, doc, {}, FOOT, TRACK)
+    nudged = json.loads(json.dumps(venue))
+    for i, c in enumerate(nudged["corners_wgs84"]):
+        c["lat"] += (1e-9 if i % 2 else -1e-9) * _M
+        c["lon"] += (-1e-9 if i % 2 else 1e-9) * _M
+    p2 = ep.plan_stages(nudged, doc, {}, FOOT, TRACK)
+    h1 = [(e["start"]["heading_deg"], round(e["start"]["lat"], 8),
+           round(e["start"]["lon"], 8)) for st in p1["stages"] for e in st["experiments"]]
+    h2 = [(e["start"]["heading_deg"], round(e["start"]["lat"], 8),
+           round(e["start"]["lon"], 8)) for st in p2["stages"] for e in st["experiments"]]
+    assert h1 == h2
+
+
 def test_dubins_endpoint_verification():
     cases = [((0, 0, 0), (3, 0, 0)), ((0, 0, 0), (-3.4, 1.5, 0)),
              ((0, 0, 0), (0, 3, math.pi)), ((0, 0, 0), (0.5, 0.2, 0.3))]

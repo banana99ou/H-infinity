@@ -29,6 +29,8 @@ recipes — bad family / vfg import — still land in ``unfittable``.)
 """
 import math
 
+import numpy as np
+
 try:
     from limo_path_follower import venue_geom
 except Exception:  # pragma: no cover - in-source / odd layout fallback
@@ -53,10 +55,18 @@ PLAN_DEFAULTS = {
     "step": {"L1": 1.0, "L2": 1.0, "theta_deg": 90.0},
     "slalom": {"n_arcs": 2, "theta_deg": 90.0, "L_mid": 0.5,
                "L1": 1.0, "L_end": 1.0},
+    # wiggle_sine / wiggle_chirp / wiggle_square (wiggle_path.py): ~7 m each
+    # whatever R, so an A/B pair seats in a ~14 m venue. wavelength_end only
+    # shapes chirp.
+    "wiggle": {"wavelength": 3.0, "wavelength_end": 1.5, "n_periods": 2,
+               "L1": 0.5, "L_end": 0.5},
     "glue": {"v_const": 0.2, "pos_tol_m": 0.15,
              "tail_m": 2.2,          # straight, heading-aligned approach tail
              "lead_m": 1.0,          # straight exit along the curve's end heading
-             "min_radius_m": 0.5,    # soft: preferred glue turn radius
+             # soft: preferred glue turn radius. Glues tighter than this pay a
+             # smoothness penalty (was 0.5 m, which never bit: every glue then
+             # sat at the trackable floor; 2026-10-02 -> 2.0 m).
+             "min_radius_m": 2.0,
              # HARD floor: the chassis cannot steer tighter than ~0.37 m, so a
              # drawn glue below this would not be tracked (pure pursuit clamps
              # and leaves the checked corridor). Reject, don't warn.
@@ -71,6 +81,11 @@ PLAN_DEFAULTS = {
              # ~opposite, and the run failed. 1.0 m floor forces the closed-form
              # B candidates to w>=2.0 (R>=1.0), clearing the observed undershoot.
              "track_radius_m": 1.0,
+             # Tiered floor (2026-10-02): a geometry or transit that cannot be
+             # seated at track_radius_m retries at this floor (the old 0.85 m,
+             # ~the measured steering limit) and is flagged in the notes, so a
+             # tight venue never regresses to a best-effort stage.
+             "track_radius_fallback_m": 0.85,
              # Straight-tail arrival condition: the final tail_check_m of every
              # glue must lie within tail_align_deg of the start-pin heading —
              # reposition converges heading through the tail, so this is what
@@ -100,6 +115,37 @@ def _clear(pt, poly, excl):
     cl = venue_geom.clearance(pt, poly)
     for (ce, cn, r) in excl:
         cl = min(cl, math.hypot(pt[0] - ce, pt[1] - cn) - r)
+    return cl
+
+
+def _clear_many(pts, poly, excl):
+    """_clear for many points at once (ndarray). Same formulas as
+    venue_geom.clearance / pt_in_poly / dist_to_seg, vectorized: the glue
+    search evaluates ~10^7 points per plan, and the per-point Python loop was
+    ~40% of planning time (profiled 2026-10-02)."""
+    P = np.asarray(pts, dtype=float).reshape(-1, 2)
+    px, py = P[:, 0], P[:, 1]
+    d = np.full(len(P), np.inf)
+    inside = np.zeros(len(P), dtype=bool)
+    n = len(poly)
+    for i in range(n):
+        ax, ay = poly[i]
+        bx, by = poly[(i + 1) % n]
+        dx, dy = bx - ax, by - ay
+        L2 = dx * dx + dy * dy
+        if L2 == 0.0:
+            dd = np.hypot(px - ax, py - ay)
+        else:
+            t = np.clip(((px - ax) * dx + (py - ay) * dy) / L2, 0.0, 1.0)
+            dd = np.hypot(px - (ax + t * dx), py - (ay + t * dy))
+        d = np.minimum(d, dd)
+        crosses = (ay > py) != (by > py)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            xint = (bx - ax) * (py - ay) / (by - ay) + ax
+        inside ^= crosses & (px < xint)
+    cl = np.where(inside, d, -d)
+    for (ce, cn, r) in excl:
+        cl = np.minimum(cl, np.hypot(px - ce, py - cn) - r)
     return cl
 
 
@@ -153,12 +199,13 @@ def remaining_geometries(doc, counts, key_fn=None):
     matrix = (doc or {}).get("matrix") or {}
     fams = [str(f) for f in (matrix.get("path_family") or [])]
     radii = [float(r) for r in (matrix.get("radius_m") or [])]
+    by_fam = matrix.get("radius_m_by_family") or {}
     ctrls = [str(c) for c in (matrix.get("controller") or [])]
     speeds = [float(v) for v in (matrix.get("v_const") or [])]
     n = int((doc or {}).get("repetitions") or 0)
     out = []
     for fam in fams:
-        for R in radii:
+        for R in [float(r) for r in by_fam.get(fam, radii)]:
             rem = 0
             for c in ctrls:
                 for v in speeds:
@@ -169,7 +216,8 @@ def remaining_geometries(doc, counts, key_fn=None):
                 out.append((fam, R, rem))
     cfg = _plan_cfg(doc)
     if cfg.get("geometry_order") == "finish-nearest":
-        out.sort(key=lambda t: (t[2], fams.index(t[0]), radii.index(t[1])))
+        # Stable sort: ties keep matrix order (family, then its radius list).
+        out.sort(key=lambda t: t[2])
     return out
 
 
@@ -189,6 +237,14 @@ def _recipe_for(fam, R, cfg, direction=1):
                            "L1": float(s["L1"]), "L_mid": float(s["L_mid"]),
                            "n_arcs": int(s["n_arcs"]),
                            "L_end": float(s["L_end"])}}
+    if fam in ("wiggle_sine", "wiggle_chirp", "wiggle_square"):
+        s = cfg["wiggle"]
+        return {"type": fam,
+                "params": {"R": float(R),
+                           "wavelength": float(s["wavelength"]),
+                           "wavelength_end": float(s["wavelength_end"]),
+                           "n_periods": int(s["n_periods"]),
+                           "L1": float(s["L1"]), "L_end": float(s["L_end"])}}
     return None
 
 
@@ -226,18 +282,16 @@ def _place(pts_local, x, y, h_deg):
 
 
 def _min_clear_placed(pts_local, x, y, h_deg, poly, excl, stop_below):
-    """Min clearance of the placed curve; early-exits below stop_below."""
+    """Min clearance of the placed curve. (stop_below is kept for callers;
+    every caller only compares the result against it, and the vectorized
+    full minimum answers that comparison identically.)"""
     h = math.radians(h_deg)
     fE, fN = math.sin(h), math.cos(h)
     lE, lN = -math.cos(h), math.sin(h)
-    mn = float("inf")
-    for (px, py) in pts_local:
-        cl = _clear((x + px * fE + py * lE, y + px * fN + py * lN), poly, excl)
-        if cl < mn:
-            mn = cl
-            if mn < stop_below:
-                return mn
-    return mn
+    L = np.asarray(pts_local, dtype=float)
+    E = x + L[:, 0] * fE + L[:, 1] * lE
+    N = y + L[:, 0] * fN + L[:, 1] * lN
+    return float(_clear_many(np.column_stack((E, N)), poly, excl).min())
 
 
 # ----------------------------------------------------------------------
@@ -255,23 +309,34 @@ def _bezier(ctrl, t):
 def _bezier_samples(ctrl, spacing_m=0.3):
     length = sum(math.hypot(b[0] - a[0], b[1] - a[1])
                  for a, b in zip(ctrl[:-1], ctrl[1:]))
-    n = max(12, min(300, int(length / max(0.05, spacing_m))))
-    return [_bezier(ctrl, i / n) for i in range(n + 1)]
+    n = max(12, min(300, int(length / max(0.05, spacing_m) + 1e-6)))
+    # Bernstein form, all n+1 parameters in one matrix product (the per-point
+    # de Casteljau loop was ~50% of planning time, profiled 2026-10-02; equal
+    # to _bezier within 1e-12 m).
+    m = len(ctrl) - 1
+    t = np.arange(n + 1) / n
+    j = np.arange(m + 1)
+    coef = np.array([math.comb(m, k) for k in j], dtype=float)
+    basis = coef * t[:, None] ** j * (1.0 - t[:, None]) ** (m - j)
+    return [tuple(q) for q in (basis @ np.asarray(ctrl, dtype=float)).tolist()]
 
 
 def _max_curvature(pts):
     """Max discrete (Menger) curvature over the sampled polyline."""
-    k = 0.0
-    for a, b, c in zip(pts[:-2], pts[1:-1], pts[2:]):
-        ab = math.hypot(b[0] - a[0], b[1] - a[1])
-        bc = math.hypot(c[0] - b[0], c[1] - b[1])
-        ca = math.hypot(c[0] - a[0], c[1] - a[1])
-        if ab * bc * ca < 1e-9:
-            continue
-        area2 = abs((b[0] - a[0]) * (c[1] - a[1])
-                    - (b[1] - a[1]) * (c[0] - a[0]))
-        k = max(k, 2.0 * area2 / (ab * bc * ca))
-    return k
+    if len(pts) < 3:
+        return 0.0
+    P = np.asarray(pts, dtype=float)
+    a, b, c = P[:-2], P[1:-1], P[2:]
+    ab = np.hypot(b[:, 0] - a[:, 0], b[:, 1] - a[:, 1])
+    bc = np.hypot(c[:, 0] - b[:, 0], c[:, 1] - b[:, 1])
+    ca = np.hypot(c[:, 0] - a[:, 0], c[:, 1] - a[:, 1])
+    den = ab * bc * ca
+    ok = den >= 1e-9
+    if not ok.any():
+        return 0.0
+    area2 = np.abs((b[:, 0] - a[:, 0]) * (c[:, 1] - a[:, 1])
+                   - (b[:, 1] - a[:, 1]) * (c[:, 0] - a[:, 0]))
+    return float(max(0.0, (2.0 * area2[ok] / den[ok]).max()))
 
 
 def _ang_diff_deg(a, b):
@@ -286,22 +351,29 @@ def _self_intersects(pts):
     sub-R_min turn (field 2026-06-12: the stage-1 turnaround aborted exactly
     this way). Adjacent segments share an endpoint and are skipped; the
     first/last pair is skipped too (they may meet a shared pin by design)."""
-    n = len(pts)
-    for i in range(n - 1):
-        ax, ay = pts[i]
-        bx, by = pts[i + 1]
-        for j in range(i + 2, n - 1):
-            if i == 0 and j == n - 2:
-                continue
-            cx, cy = pts[j]
-            dx, dy = pts[j + 1]
-            d1 = (dx - cx) * (ay - cy) - (dy - cy) * (ax - cx)
-            d2 = (dx - cx) * (by - cy) - (dy - cy) * (bx - cx)
-            d3 = (bx - ax) * (cy - ay) - (by - ay) * (cx - ax)
-            d4 = (bx - ax) * (dy - ay) - (by - ay) * (dx - ax)
-            if ((d1 > 0) != (d2 > 0)) and ((d3 > 0) != (d4 > 0)):
-                return True
-    return False
+    P = np.asarray(pts, dtype=float)
+    n = len(P)
+    if n < 4:
+        return False
+    A, B = P[:-1], P[1:]                         # segment i = A[i] -> B[i]
+    i, j = np.triu_indices(n - 1, k=2)           # j >= i + 2: non-adjacent
+    keep = ~((i == 0) & (j == n - 2))
+    i, j = i[keep], j[keep]
+    ax, ay, bx, by = A[i, 0], A[i, 1], B[i, 0], B[i, 1]
+    cx, cy, dx, dy = A[j, 0], A[j, 1], B[j, 0], B[j, 1]
+    d1 = (dx - cx) * (ay - cy) - (dy - cy) * (ax - cx)
+    d2 = (dx - cx) * (by - cy) - (dy - cy) * (bx - cx)
+    d3 = (bx - ax) * (cy - ay) - (by - ay) * (cx - ax)
+    d4 = (bx - ax) * (dy - ay) - (by - ay) * (dx - ax)
+    # Proper crossing only: each pair of cross products clearly on opposite
+    # sides. Collinear pieces of one straight have d ~ 0 +- 1e-17, and a bare
+    # sign test read that rounding noise as a crossing (2026-10-02: valid
+    # straight glues were rejected at random, pushing the planner onto loops).
+    eps = 1e-9
+
+    def opposite(u, v):
+        return ((u > eps) & (v < -eps)) | ((u < -eps) & (v > eps))
+    return bool(np.any(opposite(d1, d2) & opposite(d3, d4)))
 
 
 def check_glue_tracking(pts, start_b, g):
@@ -371,34 +443,37 @@ def _dubins_paths(a_pose, b_pose, R):
     words = []
 
     def _m(x):
-        return x % two_pi
+        # An arc of -1e-16 rad must stay ~0, not wrap to a full 2*pi lap
+        # (rounding noise was turning "no arc" into a 360-deg loop).
+        r = x % two_pi
+        return 0.0 if r > two_pi - 1e-9 else r
 
     p_sq = 2 + d * d - 2 * c_ab + 2 * d * (sa - sb)
-    if p_sq >= 0:
+    if p_sq >= -1e-9:   # tangency (p = 0) must not hinge on rounding
         tmp = math.atan2(cb - ca, d + sa - sb)
-        words.append((_m(tmp - alpha), math.sqrt(p_sq), _m(beta - tmp), "LSL"))
+        words.append((_m(tmp - alpha), math.sqrt(max(p_sq, 0.0)), _m(beta - tmp), "LSL"))
     p_sq = 2 + d * d - 2 * c_ab + 2 * d * (sb - sa)
-    if p_sq >= 0:
+    if p_sq >= -1e-9:   # tangency (p = 0) must not hinge on rounding
         tmp = math.atan2(ca - cb, d - sa + sb)
-        words.append((_m(alpha - tmp), math.sqrt(p_sq), _m(tmp - beta), "RSR"))
+        words.append((_m(alpha - tmp), math.sqrt(max(p_sq, 0.0)), _m(tmp - beta), "RSR"))
     p_sq = -2 + d * d + 2 * c_ab + 2 * d * (sa + sb)
-    if p_sq >= 0:
-        p = math.sqrt(p_sq)
+    if p_sq >= -1e-9:   # tangency (p = 0) must not hinge on rounding
+        p = math.sqrt(max(p_sq, 0.0))
         tmp = math.atan2(-ca - cb, d + sa + sb) - math.atan2(-2.0, p)
         words.append((_m(tmp - alpha), p, _m(tmp - beta), "LSR"))
     p_sq = -2 + d * d + 2 * c_ab - 2 * d * (sa + sb)
-    if p_sq >= 0:
-        p = math.sqrt(p_sq)
+    if p_sq >= -1e-9:   # tangency (p = 0) must not hinge on rounding
+        p = math.sqrt(max(p_sq, 0.0))
         tmp = math.atan2(ca + cb, d - sa - sb) - math.atan2(2.0, p)
         words.append((_m(alpha - tmp), p, _m(beta - tmp), "RSL"))
     tmp = (6.0 - d * d + 2 * c_ab + 2 * d * (sa - sb)) / 8.0
-    if abs(tmp) <= 1.0:
-        p = _m(two_pi - math.acos(tmp))
+    if abs(tmp) <= 1.0 + 1e-9:
+        p = _m(two_pi - math.acos(max(-1.0, min(1.0, tmp))))
         t = _m(alpha - math.atan2(ca - cb, d - sa + sb) + p / 2.0)
         words.append((t, p, _m(alpha - beta - t + p), "RLR"))
     tmp = (6.0 - d * d + 2 * c_ab + 2 * d * (sb - sa)) / 8.0
-    if abs(tmp) <= 1.0:
-        p = _m(two_pi - math.acos(tmp))
+    if abs(tmp) <= 1.0 + 1e-9:
+        p = _m(two_pi - math.acos(max(-1.0, min(1.0, tmp))))
         t = _m(-alpha + math.atan2(-ca + cb, d + sa - sb) + p / 2.0)
         words.append((t, p, _m(beta - alpha - t + p), "LRL"))
 
@@ -412,7 +487,9 @@ def _dubins_paths(a_pose, b_pose, R):
             if length < -1e-9 or length > 4 * two_pi * R + D:
                 ok = False
                 break
-            n = max(1, int(length / 0.25))
+            # ceil with slack: an exact 1.0 m straight must not sample as
+            # 3 or 4 pieces depending on the last bit
+            n = max(1, math.ceil(length / 0.25 - 1e-6))
             if m == "S":
                 for i in range(1, n + 1):
                     pts.append((x + length * i / n * math.cos(th),
@@ -454,16 +531,95 @@ def _glue_ctrl(end, exit_bearing_deg, start, start_bearing_deg, cfg,
     return ctrl
 
 
-def _plan_glue(end, exit_b, start, start_b, poly, excl, req, cfg):
-    """Plan one glue gap. Tries operator-editable Bezier mids first
-    (lead/tail/dodge variants); when no Bezier is both clear and chassis-
-    trackable (e.g. a full lap back onto the same curve), falls back to an
-    exact bounded-curvature Dubins path emitted as explicit waypoints.
+def _tail_straight(pts, start_b, align_deg):
+    """Length of the final stretch of a sampled glue whose heading stays within
+    align_deg of the start-pin heading: the straight the tracker gets to settle
+    its heading on before the pin."""
+    acc = 0.0
+    for a, b in zip(reversed(pts[:-1]), reversed(pts[1:])):
+        de, dn = b[0] - a[0], b[1] - a[1]
+        seg = math.hypot(de, dn)
+        if seg < 1e-9:
+            continue
+        if _ang_diff_deg(math.degrees(math.atan2(de, dn)) % 360.0,
+                         start_b) > align_deg:
+            break
+        acc += seg
+    return acc
+
+
+def _total_turn(pts):
+    """Total absolute heading change along a sampled polyline [rad]."""
+    P = np.asarray(pts, dtype=float)
+    d = np.diff(P, axis=0)
+    d = d[np.hypot(d[:, 0], d[:, 1]) > 1e-9]
+    if len(d) < 2:
+        return 0.0
+    h = np.arctan2(d[:, 1], d[:, 0])
+    return float(np.abs((np.diff(h) + np.pi) % (2 * np.pi) - np.pi).sum())
+
+
+def _beats(a, b, tol):
+    """Lexicographic 'a is better than b' (higher is better), where a component
+    only decides when it differs by more than its tolerance. Used instead of
+    rounding: rounding flips on its .x5 boundaries — where quarter-metre-sampled
+    lengths land exactly — so a nanometre of noise could change the plan."""
+    for x, y, t in zip(a, b, tol):
+        if x > y + t:
+            return True
+        if x < y - t:
+            return False
+    return False
+
+
+def _tol_sorted(items, key, tol):
+    """Stable sort, best first, under _beats (near-ties keep input order)."""
+    import functools
+
+    def cmp(i, j):
+        a, b = key(i), key(j)
+        return -1 if _beats(a, b, tol) else (1 if _beats(b, a, tol) else 0)
+    return sorted(items, key=functools.cmp_to_key(cmp))
+
+
+def _glue_quality(pts, start_b, g):
+    """(turn radius, settled straight tail) of a sampled glue, each capped
+    where more stops helping. Smoothness objective shared by the glue choice
+    and the pair-layout ranking."""
+    k = _max_curvature(pts)
+    radius = min(1.0 / k if k > 1e-9 else math.inf,
+                 float(g.get("quality_radius_cap_m", 2.5)))
+    tail = min(_tail_straight(pts, start_b,
+                              float(g.get("settle_align_deg", 5.0))),
+               float(g.get("quality_tail_cap_m", 2.5)))
+    return radius, tail
+
+
+def _plan_glue(end, exit_b, start, start_b, poly, excl, req, cfg,
+               objective="smooth"):
+    """Plan one glue gap: the SMOOTHEST valid glue, not the most compact.
+
+    Candidates are the operator-editable Bezier variants (lead/tail/dodge
+    shapes) and exact bounded-curvature Dubins paths (gentle radii first, with
+    a long straight approach before the pin). Every candidate must clear the
+    venue, stay at or above the trackable radius and pass the tail gate; the
+    survivors are ranked by one penalty that rewards a gentle turn (radius up
+    to min_radius_m), a long settled straight tail before the pin and a short
+    path. Field 2026-10-02: ranking by compactness alone put every glue right
+    at the trackable floor with a 0.8-1.0 m tail, and the robot arrived a
+    median 7 deg (p90 12 deg, RTK-measured) off the pin heading.
+
+    poly=None plans in free space (no clearance terms): the result is then
+    rotation-equivariant, which the pair packer uses to plan once per layout.
+    objective="compact" ranks by shortness instead — the packer sizes a pair's
+    block with the most compact valid glue (can ANY glue fit?) and leaves the
+    smooth choice to the real-venue plan, where clearance bounds its size.
 
     Returns (glue_en, note) or (None, reason). glue_en is
     {"kind": "mids"|"waypoints", "pts": [(E, N), ...]} — mids exclude the
     snapped endpoints (WebUI lbRepos schema); waypoints include them."""
     g = cfg["glue"]
+    free = poly is None
     track_r = max(float(g.get("track_radius_m", 0.7)),
                   float(g["hard_radius_m"]))
     track_k = 1.0 / track_r            # B+ gate: trackable, not just possible
@@ -508,7 +664,25 @@ def _plan_glue(end, exit_b, start, start_b, poly, excl, req, cfg):
                 a = a0 - sgn * k * (2.0 * math.pi / 6.0)
                 arc.append((cx + r * math.cos(a), cy + r * math.sin(a)))
             laps.append(tuple(arc))
-    best = None     # (penalty, mids, kmax)
+
+    def _score(pts, spread):
+        """Penalty of a cleared, trackable candidate (lower is better)."""
+        length = sum(math.hypot(b[0] - a[0], b[1] - a[1])
+                     for a, b in zip(pts[:-1], pts[1:]))
+        if objective == "compact":
+            return 0.3 * spread + length
+        radius, tail = _glue_quality(pts, start_b, g)
+        # Turning beyond what the gap needs (the exit -> pin heading change) is
+        # a loop or detour: time, drift, another chance to miss the pin. The
+        # tail/radius rewards alone preferred a 360-deg lap ending on a long
+        # straight over a short direct turn (plots 2026-10-02).
+        excess = max(0.0, _total_turn(pts)
+                     - math.radians(_ang_diff_deg(exit_b, start_b)) - 0.35)
+        mn = 0.0 if free else min(float(_clear_many(pts, poly, excl).min()), 2.0)
+        return (0.3 * spread + max(0.0, 1.0 / radius - soft_k) * 3.0
+                - 0.6 * tail + 0.1 * length - 0.2 * mn + 1.5 * excess)
+
+    best = None     # (penalty, glue_en, kind, radius, length)
     tried = 0
     for lead in (float(g["lead_m"]), 0.5, 1.8):
         for tail in (float(g["tail_m"]), 1.2, 3.0):
@@ -517,65 +691,63 @@ def _plan_glue(end, exit_b, start, start_b, poly, excl, req, cfg):
                 ctrl = _glue_ctrl(end, exit_b, start, start_b, cfg,
                                   lead, tail, dodges)
                 pts = _bezier_samples(ctrl)
-                mn = min(_clear(p, poly, excl) for p in pts)
-                if mn < req:
+                if not free and float(_clear_many(pts, poly, excl).min()) < req:
                     continue
-                kmax = _max_curvature(pts)
-                if kmax > track_k:
+                if _max_curvature(pts) > track_k:
                     continue        # not trackable with margin — reject (B+)
                 ok_track, _why = check_glue_tracking(pts, start_b, g)
                 if not ok_track:
                     continue        # bent tail / gate failure — reject (B+)
                 spread = sum(math.hypot(d[0] - chord_mid[0],
                                         d[1] - chord_mid[1]) for d in dodges)
-                penalty = 0.3 * spread \
-                    + max(0.0, kmax - soft_k) * 3.0 - mn * 0.2
-                if best is None or penalty < best[0]:
-                    best = (penalty, ctrl[1:-1], kmax)
+                pen = _score(pts, spread)
+                if best is None or pen < best[0] - 1e-6:   # ties: first wins
+                    best = (pen, {"kind": "mids", "pts": ctrl[1:-1]}, "bezier")
                     # NOTE: no good-enough early exit here — measured
                     # 2026-06-11: returning the first acceptable variant
                     # (instead of the penalty-best) degrades later
                     # placements enough that full-matrix planning got
                     # SLOWER overall (77-80 s vs 58 s). The polish pays
                     # for itself.
-    if best is not None:
-        note = None
-        if best[2] > soft_k:
-            note = (f"glue turn radius {1.0 / best[2]:.2f}m tighter than "
-                    f"preferred {g['min_radius_m']:.2f}m (drivable, but "
-                    "watch tracking)")
-        return {"kind": "mids", "pts": best[1]}, note
 
-    # Dubins fallback: exact start/end poses, curvature bounded by R_turn.
-    # Target a pose one straight tail-length BEFORE the start pin so the
-    # tracker arrives on a straight, heading-aligned segment (reposition
-    # achieves heading by geometry).
-    tail = max(1.0, float(g.get("tail_check_m", 0.8)) + 0.2)
+    # Dubins candidates: exact start/end poses, curvature bounded by R, each
+    # ending in an explicit straight tail before the pin (the tracker settles
+    # heading on it). Gentle radii and long tails are offered first-class, not
+    # only as a last resort — a Bezier cannot shape a tight U-turn, so for A/B
+    # turnarounds this is usually the smoothest drivable glue.
     a_yaw = math.radians(90.0 - exit_b)
     b_yaw = math.radians(90.0 - start_b)
-    bx = start[0] - sx * tail
-    by = start[1] - sy * tail
     # B+ gate: never sweep below the TRACKABLE radius — a chassis-legal 0.45 m
     # Dubins loop breaks reposition's pure-pursuit cone mid-arc (field
     # 2026-06-11: "do a 180 at the E1 start").
-    radii = sorted({r for r in (1.2, 1.0, 0.8, track_r) if r >= track_r},
-                   reverse=True)
+    radii = sorted({r for r in (2.0, 1.5, 1.2, 1.0, 0.8, track_r)
+                    if r >= track_r}, reverse=True)
     for R in radii:
-        for (_length, pts) in _dubins_paths((end[0], end[1], a_yaw),
-                                            (bx, by, b_yaw), R)[:3]:
-            full = pts + [(bx + sx * tail * i / 4.0,
-                           by + sy * tail * i / 4.0) for i in range(1, 5)]
-            if min(_clear(p, poly, excl) for p in full) < req:
-                continue
-            ok_track, _why = check_glue_tracking(full, start_b, g)
-            if not ok_track:
-                continue
-            note = (f"glue is a Dubins path (R={R:.2f}m, "
-                    f"{_length + tail:.1f}m) — regenerate the plan "
+        for tail in (2.0, 1.5, max(1.0, float(g.get("tail_check_m", 0.8)) + 0.2)):
+            bx, by = start[0] - sx * tail, start[1] - sy * tail
+            for (_length, pts) in _dubins_paths((end[0], end[1], a_yaw),
+                                                (bx, by, b_yaw), R)[:3]:
+                tried += 1
+                full = pts + [(bx + sx * tail * i / 4.0,
+                               by + sy * tail * i / 4.0) for i in range(1, 5)]
+                if not free and float(_clear_many(full, poly, excl).min()) < req:
+                    continue
+                ok_track, _why = check_glue_tracking(full, start_b, g)
+                if not ok_track:
+                    continue
+                pen = _score(full, 0.0)
+                if best is None or pen < best[0] - 1e-6:   # ties: first wins
+                    best = (pen, {"kind": "waypoints", "pts": full}, "dubins",
+                            R, _length + tail)
+    if best is not None:
+        note = None
+        if best[2] == "dubins":
+            note = (f"glue is a Dubins path (R={best[3]:.2f}m, "
+                    f"{best[4]:.1f}m) — regenerate the plan "
                     "rather than hand-editing it")
-            return {"kind": "waypoints", "pts": full}, note
-    return None, (f"no trackable glue ({tried} Bezier variants + Dubins "
-                  f"R {radii[0]:.1f}..{radii[-1]:.2f} all violate clearance "
+        return best[1], note
+    return None, (f"no trackable glue ({tried} Bezier + Dubins candidates, "
+                  f"R {radii[0]:.1f}..{radii[-1]:.2f}, all violate clearance "
                   f"of {req:.2f}m or the {track_r:.2f}m trackable radius)")
 
 
@@ -694,6 +866,213 @@ def _poly_major_bearing(poly):
     return math.degrees(math.atan2(ve, vn)) % 360.0
 
 
+# ----------------------------------------------------------------------
+# Venue-aligned packing (2026-10-02). The grid search above scores placements
+# by clearance capped at req + 0.5, so in a roomy spot many candidates tie and
+# the stable sort keeps scan order — headings scanned from 0 deg, i.e. curves
+# pointing north/south regardless of how the venue is rotated, and an EN grid
+# that does not line up with the walls. Here the A/B pair is instead built in
+# the venue's own frame: curve A may only point along a wall direction, the
+# whole pair (+ its glue) is treated as one rigid block, and the block is slid
+# to where it clears the walls best.
+# ----------------------------------------------------------------------
+
+def _hull(points):
+    """Convex hull (monotone chain), CCW."""
+    pts = sorted(set((float(p[0]), float(p[1])) for p in points))
+    if len(pts) <= 2:
+        return pts
+
+    def cross(o, a, b):
+        return (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
+    lower, upper = [], []
+    for p in pts:
+        while len(lower) >= 2 and cross(lower[-2], lower[-1], p) <= 0:
+            lower.pop()
+        lower.append(p)
+    for p in reversed(pts):
+        while len(upper) >= 2 and cross(upper[-2], upper[-1], p) <= 0:
+            upper.pop()
+        upper.append(p)
+    return lower[:-1] + upper[:-1]
+
+
+def _venue_rect(poly):
+    """Minimum-area rectangle around the venue (one side lies on a hull edge).
+    The WebUI snaps corner 4 to a rectangle, so for a captured venue this IS
+    the venue. Returns (bearing of the long side, centre (E, N), long, short)."""
+    hull = _hull(poly)
+    best = None
+    for i in range(len(hull)):
+        (x0, y0), (x1, y1) = hull[i], hull[(i + 1) % len(hull)]
+        d = math.hypot(x1 - x0, y1 - y0)
+        if d < 1e-9:
+            continue
+        ux, uy = (x1 - x0) / d, (y1 - y0) / d
+        a = [p[0] * ux + p[1] * uy for p in hull]
+        b = [-p[0] * uy + p[1] * ux for p in hull]
+        area = (max(a) - min(a)) * (max(b) - min(b))
+        if best is None or area < best[0]:
+            best = (area, ux, uy, min(a), max(a), min(b), max(b))
+    _, ux, uy, a0, a1, b0, b1 = best
+    ca, cb = (a0 + a1) / 2.0, (b0 + b1) / 2.0
+    centre = (ca * ux - cb * uy, ca * uy + cb * ux)
+    if a1 - a0 >= b1 - b0:
+        lv, long_, short = (ux, uy), a1 - a0, b1 - b0
+    else:
+        lv, long_, short = (-uy, ux), b1 - b0, a1 - a0
+    return math.degrees(math.atan2(lv[0], lv[1])) % 360.0, centre, long_, short
+
+
+def _glue_samples(g, a, b):
+    """EN samples of a planned glue from a to b (mids are Bezier controls)."""
+    if g["kind"] == "mids":
+        return _bezier_samples([a] + list(g["pts"]) + [b])
+    return list(g["pts"])
+
+
+def _rot90(pts, k):
+    """Rotate EN points about the origin by k x 90 deg of compass bearing
+    (clockwise): bearing h -> h + 90 maps (E, N) -> (N, -E)."""
+    out = list(pts)
+    for _ in range(k % 4):
+        out = [(n, -e) for (e, n) in out]
+    return out
+
+
+def _aligned_pairs(variants, entry, poly, excl, req, cfg, keep=4):
+    """Wall-aligned A/B pair placements, best first (at most ``keep``).
+
+    Each entry is (placed, glues_en, quality) where quality = (glue radius,
+    settled tail, clearance) of the pair's worse glue/curve. Candidates are
+    compared with tolerances (_beats), never on exact floats, and near-ties
+    keep a fixed enumeration order (field 2026-10-02: an exact tie broken by
+    the last ulp flipped a stage to a placement whose transit glue could not
+    be planned) — so the plan is deterministic and robust to tiny noise."""
+    g = cfg["glue"]
+    beta, centre, long_, short = _venue_rect(poly)
+    target = req + float(cfg["fit_buffer_m"])
+    fu = _bearing_vec(beta)                 # long-axis unit vector (EN)
+    fv = (fu[1], -fu[0])                    # short axis
+
+    def uv(p):
+        return (p[0] * fu[0] + p[1] * fu[1], p[0] * fv[0] + p[1] * fv[1])
+    cu0, cv0 = uv(centre)
+
+    # Phase 1 (cheap): every layout = (variant, k, side, w, s). The free-space
+    # glue is planned ONCE per (variant, side, w, s) at k = 0 and turned for
+    # the other three wall directions — free-space planning is rotation-
+    # equivariant, so this is exact and 4x cheaper. Keep each layout's best
+    # shift (centred first) by curve clearance; the compact glue must clear
+    # too, so phase 2 always has at least that glue in the real venue.
+    layouts = []
+    for vi, (recipe, pts, end_yaw) in enumerate(variants):
+        A0 = entry(recipe, pts, end_yaw, 0.0, 0.0, beta, 1)
+        ex, ey = _bearing_vec(A0["exit_b"])
+        for sgn in (1.0, -1.0):
+            nx, ny = ey * sgn, -ex * sgn
+            for w in (1.8, 2.0, 2.2, 2.4, 2.8, 3.2, 3.6):
+                for s_ in (0.0, 1.0, 2.0):
+                    b_start = (A0["end_en"][0] + nx * w + ex * s_,
+                               A0["end_en"][1] + ny * w + ey * s_)
+                    B0 = entry(recipe, pts, end_yaw, *b_start,
+                               (beta + 180.0) % 360.0, 2)
+                    g1, _n = _plan_glue(A0["end_en"], A0["exit_b"],
+                                        B0["start_en"], B0["h"],
+                                        None, [], req, cfg, objective="compact")
+                    if g1 is None:
+                        continue
+                    # B is A turned 180 deg about P, so the return glue is g1
+                    # turned the same way.
+                    P = (B0["start_en"][0] / 2.0, B0["start_en"][1] / 2.0)
+                    g2pts = [(2 * P[0] - q[0], 2 * P[1] - q[1]) for q in g1["pts"]]
+                    curves0 = (_place(pts, 0.0, 0.0, beta)
+                               + _place(pts, *B0["start_en"], B0["h"]))
+                    glue0 = (_glue_samples(g1, A0["end_en"], B0["start_en"])
+                             + _glue_samples({"kind": g1["kind"], "pts": g2pts},
+                                             B0["end_en"], (0.0, 0.0)))
+                    for k in range(4):
+                        crv = np.asarray(_rot90(curves0, k))
+                        glu = np.asarray(_rot90(glue0, k))
+                        bu = [uv(q) for q in np.vstack((crv, glu)).tolist()]
+                        u0, u1 = min(q[0] for q in bu), max(q[0] for q in bu)
+                        v0, v1 = min(q[1] for q in bu), max(q[1] for q in bu)
+                        su = long_ - 2.0 * target - (u1 - u0)
+                        sv = short - 2.0 * target - (v1 - v0)
+                        if su < 0.0 or sv < 0.0:
+                            continue        # the block cannot fit this way round
+                        hA = (beta + 90.0 * k) % 360.0
+                        bs = _rot90([B0["start_en"]], k)[0]
+                        du0, dv0 = cu0 - (u0 + u1) / 2.0, cv0 - (v0 + v1) / 2.0
+                        shifts = [(du0, dv0)] + [
+                            (du0 + su * i / 4.0, dv0 + sv * j / 4.0)
+                            for i in (-2, -1, 0, 1, 2) for j in (-2, -1, 0, 1, 2)
+                            if (i, j) != (0, 0)]
+                        best_shift = None
+                        for (du, dv) in shifts:
+                            ox = du * fu[0] + dv * fv[0]
+                            oy = du * fu[1] + dv * fv[1]
+                            off = np.array([ox, oy])
+                            cl = float(_clear_many(crv + off, poly, excl).min())
+                            if cl < target:
+                                continue
+                            # The compact glue must clear too: then phase 2 has
+                            # at least this glue available in the real venue.
+                            if float(_clear_many(glu + off, poly, excl).min()) < req:
+                                continue
+                            if best_shift is None or cl > best_shift[0] + 0.005:
+                                best_shift = (cl, ox, oy)
+                        if best_shift is None:
+                            continue
+                        # Spare room around the compact block is where the
+                        # real-venue glue can grow gentler: rank by it.
+                        layouts.append(((min(su, sv), best_shift[0]),
+                                        vi, hA, bs, best_shift))
+
+    # Phase 2: validate the most promising layouts against the real walls
+    # (both glues re-planned with clearance + trackable radius + tail gate).
+    layouts = _tol_sorted(layouts, key=lambda t: t[0], tol=(0.05, 0.005))
+    out = []
+    for (_key, vi, hA, bs, (cl, ox, oy)) in layouts[:24]:
+        recipe, pts, end_yaw = variants[vi]
+        A = entry(recipe, pts, end_yaw, ox, oy, hA, 1)
+        B = entry(recipe, pts, end_yaw, bs[0] + ox, bs[1] + oy,
+                  (hA + 180.0) % 360.0, 2)
+        r1 = _plan_glue(A["end_en"], A["exit_b"], B["start_en"], B["h"],
+                        poly, excl, req, cfg)
+        if r1[0] is None:
+            continue
+        r2 = _plan_glue(B["end_en"], B["exit_b"], A["start_en"], A["h"],
+                        poly, excl, req, cfg)
+        if r2[0] is None:
+            continue
+        q1 = _glue_quality(_glue_samples(r1[0], A["end_en"], B["start_en"]),
+                           B["h"], g)
+        q2 = _glue_quality(_glue_samples(r2[0], B["end_en"], A["start_en"]),
+                           A["h"], g)
+        quality = (min(q1[0], q2[0]), min(q1[1], q2[1]), cl)
+        out.append((quality, len(out), ([A, B], [r1, r2], quality)))
+        if len(out) >= 2 * keep:
+            break       # roomiest layouts first; keep the smoothest of these
+    out = _tol_sorted(out, key=lambda t: t[0], tol=(0.05, 0.05, 0.005))
+    return [c for (_q, _i, c) in out[:keep]]
+
+
+def _glue_floor(cfg):
+    g = cfg["glue"]
+    return max(float(g.get("track_radius_m", 0.7)), float(g["hard_radius_m"]))
+
+
+def _floor_cfgs(cfg):
+    """[cfg] plus, if the fallback floor is lower, a copy planned at it."""
+    fb = float(cfg["glue"].get("track_radius_fallback_m", 0.0) or 0.0)
+    if not fb or fb >= _glue_floor(cfg):
+        return [cfg]
+    lo = dict(cfg)
+    lo["glue"] = dict(cfg["glue"], track_radius_m=fb)
+    return [cfg, lo]
+
+
 def _naive_glue(end, exit_b, start, start_b, cfg):
     """A simple un-validated hook end -> start, emitted so a best-effort stage
     always carries an editable glue (the operator reshapes it in the WebUI)."""
@@ -721,6 +1100,7 @@ def plan_stages(venue, doc, counts, footprint_r=0.30, track_margin=0.30,
         return {"ok": False, "stages": [], "unfittable": [],
                 "notes": ["venue has no polygon (need >= 3 corners_wgs84)"]}
     cfg = _plan_cfg(doc)
+    floor_cfgs = _floor_cfgs(cfg)
     lat0, lon0 = corners[0]["lat"], corners[0]["lon"]
     poly = venue_geom.poly_en(corners, lat0, lon0)
     excl = []
@@ -808,7 +1188,53 @@ def plan_stages(venue, doc, counts, footprint_r=0.30, track_margin=0.30,
                     return None
                 return B, [(g1, n1), (g2, n2)]
 
-            for (recipe, pts, end_yaw) in variants:
+            # Wall-aligned rigid-block packing first (plan.packing, default
+            # "aligned"); the free-heading grid search below is the fallback
+            # for venues where no aligned block fits (odd shape, exclusions).
+            if cfg.get("packing", "aligned") == "aligned":
+                def _transit_tier(pp):
+                    """Floor tier at which the inter-stage glue from the
+                    previous stage's exit reaches pp's entry (None: neither)."""
+                    if not stage_geo:
+                        return 0
+                    prev = stage_geo[-1]
+                    for ti, tc in enumerate(floor_cfgs):
+                        if _plan_glue(prev["exit_en"], prev["exit_b"],
+                                      pp[0]["start_en"], pp[0]["h"],
+                                      poly, excl, req, tc)[0] is not None:
+                            return ti
+                    return None
+                for tier, tcfg in enumerate(floor_cfgs):
+                    cands = _aligned_pairs(variants, _entry, poly, excl, req,
+                                           tcfg)
+                    if not cands:
+                        continue
+                    # Transit-aware pick: the smoothest candidate (either curve
+                    # as the stage entry) whose transit from the previous stage
+                    # plans, preferring a transit at the preferred floor. Without
+                    # this a good pair could leave the transit best-effort.
+                    opts = []
+                    for ci, (pl, gl, _q) in enumerate(cands):
+                        for oi, (pp, gg) in enumerate(
+                                [(pl, gl), ([pl[1], pl[0]], [gl[1], gl[0]])]):
+                            tt = _transit_tier(pp)
+                            opts.append(((9 if tt is None else tt, ci, oi), pp, gg))
+                            if tt == 0:
+                                break
+                        if opts[-1][0][0] == 0:
+                            break
+                    _k, placed, glues_en = min(opts, key=lambda o: o[0])
+                    # ids follow the stage order (exp1 = entry curve)
+                    placed = [dict(p, id=f"exp{i + 1}") for i, p in enumerate(placed)]
+                    if tier > 0:
+                        notes.append(
+                            f"{fam} R{R}: venue too tight for the "
+                            f"{_glue_floor(cfg):.2f}m glue floor — its turnarounds "
+                            f"use {_glue_floor(tcfg):.2f}m, ~the steering limit "
+                            "(expect larger arrival heading error)")
+                    break
+
+            for (recipe, pts, end_yaw) in (variants if placed is None else []):
                 # align_major: try with major-axis heading bias first; if no
                 # A/B pair fits from those positions, retry without the bias
                 # so the venue constraint never fully blocks pairing.
@@ -984,6 +1410,14 @@ def plan_stages(venue, doc, counts, footprint_r=0.30, track_margin=0.30,
         glue_en, note = _plan_glue(a["exit_en"], a["exit_b"],
                                    b["entry_en"], b["entry_b"],
                                    poly, excl, req, cfg)
+        if glue_en is None and len(floor_cfgs) > 1:
+            glue_en, note = _plan_glue(a["exit_en"], a["exit_b"],
+                                       b["entry_en"], b["entry_b"],
+                                       poly, excl, req, floor_cfgs[1])
+            if glue_en is not None:
+                note = (f"transit uses the {_glue_floor(floor_cfgs[1]):.2f}m "
+                        "fallback glue floor (~the steering limit)"
+                        + (f"; {note}" if note else ""))
         pair = f"{stages[i]['name']} -> {stages[i + 1]['name']}"
         eg_fix = False
         if glue_en is None:

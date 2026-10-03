@@ -23,13 +23,22 @@ venue: scenarios/venues/rooftop.json
 
 # The headline curvature sweep at fixed speed (DOC/experiment.md matrix).
 # Full paper matrix is 2 controllers x 2 speeds x 2 families x 4 radii x N=10
-# = 320 runs. Start SMALL on the robot (one controller, one radius, N=1) and
-# widen once a full cell verifies end-to-end.
+# = 320 runs, plus the wiggle families below (3 x 3 radii x 2 x 2 x 10 = 360).
+# Start SMALL on the robot (one controller, one radius, N=1) and widen once a
+# full cell verifies end-to-end.
 matrix:
   radius_m: [1.0, 0.7, 0.5, 0.4]
   controller: [lpv-hinf, pid]
   v_const: [1.0, 0.5]
-  path_family: [step, slalom]
+  path_family: [step, slalom, wiggle_sine, wiggle_chirp, wiggle_square]
+  # Wiggle families (2026-10-02, advisor: "try more wiggly paths"): curvature
+  # changes often but stays ABOVE the measured steering ceiling — the LIMO never
+  # turned tighter than ~0.85-1.2 m (SPEC.md), so they sweep their own radii.
+  # 1.2 sits at the ceiling measured at v=1.0; 1.5 / 2.0 stay clear of it.
+  radius_m_by_family:
+    wiggle_sine: [2.0, 1.5, 1.2]
+    wiggle_chirp: [2.0, 1.5, 1.2]
+    wiggle_square: [2.0, 1.5, 1.2]
 
 repetitions: 10
 
@@ -43,7 +52,12 @@ plan:
     # 320-cell coverage. The earlier 0.8 left step stages single-curve; 0.85
     # is non-monotonically better here because the search finds the clean
     # U-turn slot. The hard chassis floor (hard_radius_m 0.37) is unchanged.
-    track_radius_m: 0.85
+    # 2026-10-02: 0.85 -> 1.2. SPEC.md measured the LIMO never turning tighter
+    # than ~0.85-0.98 m at crawl, so 0.85 planned glue right AT saturation; the
+    # robot then arrived a median 7 deg (p90 12 deg, RTK) off the pin heading.
+    # 1.2 keeps ~20% steering margin; the planner now also prefers gentler
+    # turns (min_radius_m 2.0) and long settled tails where the venue allows.
+    track_radius_m: 1.2
 
 gating:
   # Battery is VOLTS on /limo_status.battery_voltage (hw-confirmed ~12.0 V).

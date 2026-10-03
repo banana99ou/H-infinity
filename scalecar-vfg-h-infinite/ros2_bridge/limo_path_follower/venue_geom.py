@@ -7,7 +7,7 @@ trivially unit-testable off the robot.
 
 Every move in a leg batch is an EXPLICIT curve, so it can be checked against the
 venue polygon BEFORE the robot moves:
-  - a ``recipe`` curve is the follower's analytic path (step/slalom/uturn),
+  - a ``recipe`` curve is the follower's analytic path (step/slalom/uturn/wiggle_*),
     sampled and placed at its ``start_pose`` exactly as the follower lays it
     down;
   - a ``reposition`` curve is the operator-drawn waypoint polyline.
@@ -108,6 +108,12 @@ def recipe_path(recipe):
                               theta_arc=_f("theta_arc", math.pi / 2),
                               L1=_f("L1", 5.0), L_mid=_f("L_mid", 2.0),
                               n_arcs=_i("n_arcs", 6), L_end=_f("L_end", 25.0))
+        if ptype.startswith("wiggle_"):
+            try:
+                from limo_path_follower.wiggle_path import wiggle_from_recipe
+            except ImportError:
+                from wiggle_path import wiggle_from_recipe
+            return wiggle_from_recipe(ptype, params)
     except Exception:
         return None
     return None  # unknown type: not geometry-checkable

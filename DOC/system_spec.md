@@ -35,10 +35,11 @@ The locked capability list. Each is testable; acceptance is in §5.
 - **P3** Generate **turnaround** references: U-turn (semicircle @ R_min) and 3-point turn (incl. reverse).
 - **P4** Deliver the reference to the controller **without geometry-distorting transforms** — the controller tracks the exact analytic curve, matching the sim.
 - **P5** Retain **ad-hoc hand-drawn** (waypoint/Bezier) paths for non-matrix testing.
+- **P6** Generate **curvature-defined wiggle** references (`wiggle_sine` / `wiggle_chirp` / `wiggle_square`) from {R, wavelength, wavelength_end (chirp), n_periods, L1, L_end}; peak |κ| = 1/R. *(Added 2026-10-02 with the wiggle families — `DOC/experiment.md` matrix.)*
 
 ### 3.2 Control & safety
 - **C1** Select **LPV-H∞ or PID-FF** per run; expose controller tuning params.
-- **C2** Constant-speed runs at configured v (**≤ 1.0 m/s** firmware cap).
+- **C2** Constant-speed runs at configured v (**≤ 1.0 m/s** firmware cap). *2026-10-04: the cap is not in the ROS protocol (the driver's motion frame carries speed as int16 ×1000), so it is firmware or motor limits — unverified; wheels-off stand test pending (`SPEC.md` §5-M2).*
 - **C3** All actuation flows **controller → `cmd_vel_raw` → `estop_cli` → `/cmd_vel`**; no node writes `/cmd_vel` directly (ADR-01; contract in §4).
 - **C4** E-stop: **latched**, remotely triggerable, zeros output; conservative on exit.
 - **C5** **Odom-timeout failsafe**: zero velocity on > 0.5 s odom silence.
@@ -95,7 +96,7 @@ a hole). Usable space is the periphery around the island; curves and turnarounds
   `/limo_status.battery_voltage`; nominal 11.1 V LiPo). *Code/UI are not yet synced to
   this pair — see the `ToDo.md` follow-ups.*
 - **M3** **Wallclock heartbeat** ping at a configured interval.
-- **M4** **Failure / batch-complete** alerts. Channel: **ntfy.sh**.
+- **M4** **Failure / batch-complete** alerts. Channel: **ntfy.sh**. *As built (2026-10-02): the channel is browser cards in the battle station — node-side pages arrive on `/operator/alert` (§4); ntfy.sh is optional and off by default (`ntfy.topic: ""`); Discord paging is switched off (`HINF_DISCORD=1` re-enables).*
 - **M5** **Live progress** (current cell, ETA, pass/fail tally) visible in the battle station.
 
 ### 3.9 Analysis
@@ -117,7 +118,7 @@ a hole). Usable space is the periphery around the island; curves and turnarounds
 
 | Interface | Type | Direction | Purpose |
 |---|---|---|---|
-| `/reference_path_recipe` | `std_msgs/String` (JSON, latched) | sequencer → follower | analytic curve type + params (P1–P4) |
+| `/reference_path_recipe` | `std_msgs/String` (JSON, latched) | sequencer → follower | analytic curve type + params (P1–P4, P6) |
 | `/reference_path` | `nav_msgs/Path` (latched) | follower → viz / ad-hoc → follower | sampled analytic curve for viz + bag; ad-hoc Bezier input (P5) |
 | `/path_follower/status` | `std_msgs/Float32MultiArray` | follower → * | telemetry incl. per-cycle timing (A3) |
 | `/path_follower/done` | `std_msgs/Bool` (latched) | follower → sequencer | crisp completion edge (O3) |
@@ -131,6 +132,7 @@ a hole). Usable space is the periphery around the island; curves and turnarounds
 | `/pixhawk/global_position/raw/{fix,satellites}`, `/pixhawk/gpsstatus/gps1/raw` | MAVROS GPS | GNSS → bag | regular GPS, recorded for the prof's separate dataset (L5); no role here |
 | `/reposition/{goto,status}` | JSON / status | sequencer ↔ reposition | go-to-pose (R1,R2) |
 | `/orchestrator/{start,kill,status}` | `std_msgs/String` | sequencer ↔ supervisor | process control (O5) |
+| `/operator/alert` | `std_msgs/String` (JSON, latched: transient-local, depth 10) | run_executor, odom_watchdog, rtk_watchdog → battle station | operator page card `{id, level: info\|warn\|critical\|clear, title, detail, stamp}`; `clear` removes that id's card; `info` is silent (M4) |
 | battery / `motion_mode` source | TBD (`/limo_status`?) | base → preflight/sequencer | gating (M1,M2) — **verify on robot** |
 
 > **"sequencer" in this table = the experiment-driver role**, not a specific node.
@@ -168,6 +170,10 @@ compute-cost figure from a bag directory in one command.
 ## 6. Constraints & invariants (non-negotiable)
 
 - Firmware **1.0 m/s** total wheel-speed cap; geometric **R_min ≈ 0.37 m**.
+  *2026-10-04:* the achieved ~0.85–1.2 m steering ceiling recorded in `SPEC.md`
+  was the stock `limo_base` driver's steering scale (~0.4×, full lock 0.198 rad →
+  R ≈ 1.0 m), not the linkage — the physical limit is unmeasured (sweep pending).
+  Speed-cap provenance per C2. See `SPEC.md` §7.8.
 - **Ackermann** mode (`motion_mode == 1`) required and checked before wheels-on-floor.
 - **ADR-01**: RTK never fused into the control loop.
 - Safety chain (C3) and E-stop semantics (C4) are inviolable.

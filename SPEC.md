@@ -58,6 +58,12 @@ headline candidate accordingly shifts from "lower error" to **"more repeatable
 / lower-variance tracking under real disturbance"**, pending the steering-limit
 root cause (§7.8) and a noise-structure-faithful regeneration (§6).
 
+**UPDATE 2026-10-04 (root cause found — §7.8):** fact (1) above is the **stock
+`limo_base` driver**, not the machine. The driver scales every steering command
+to ~0.4× before the chassis sees it (full lock 0.198 rad → R ≈ 1.0 m) — a
+software error, fixable. The physical steering limit is still unmeasured. Every
+bag-mined number in §5 was recorded through that driver.
+
 **Known fragility of the working headline (must be resolved by §5-M4):** the sim
 noise is **additive white Gaussian** on the heading measurement
 (`noise_gen.py:29`, σ_ψ = 0.03 rad at the control rate). PID's D-term is an
@@ -74,7 +80,10 @@ comment (`path_follower_node.py:86`) is contradicted by the manufacturer and is
 presumed wrong. Recovery of the sim paper's speed-invariance claim is therefore
 **unlikely**; the disturbance-rejection reframe stands as the paper. §5-M2
 remains as a cheap empirical confirm. The professor must still sign off on the
-reframe of his own headline.
+reframe of his own headline. *2026-10-04:* the cap is **not in the ROS
+protocol** — the driver's motion frame carries speed as int16 ×1000 — so it
+lives in chassis firmware or the motor limits; a wheels-off-ground stand test is
+pending (§5-M2).
 
 ---
 
@@ -102,6 +111,9 @@ reframe of his own headline.
 - **The ±0.5 rad clip (`path_follower_node.py:534`) applies to BOTH
   controllers** and is upstream of the vendor driver. This is the binding
   steering limit in software; the *physical* limit is measured in §5-M1.
+  **2026-10-04: not binding under the stock driver** — `limo_base` rescales
+  steering downstream of this clip (inner-wheel angle, 28° clamp, ÷2.47; §7.8),
+  so full lock reached the wheels at 0.198 rad.
 
 ---
 
@@ -174,7 +186,7 @@ bandwidth" knob, in **rad/s** — a temporal-frequency quantity, see §6 caveat)
 | `delta_meas` source | plant lagged state (`engine.py`) | previous **command** (`:528/535`) | Decide + match |
 | Noise | off by default | real sensors | Predict **noise on** at measured σ (§5-M4) |
 | Noise structure | AWGN on ψ, δ *measurements only*; **no position noise**; guidance sees the **true** pose (`engine.py:144-163`) | odom yaw drifts (low-freq), odom **position** drifts too, guidance runs on the belief | M4 measures structure; §6 injects it |
-| Command interface | controller's δ applied to the plant directly | node converts δ→Twist (`ω = v·tanδ/L`, `:539`); **vendor firmware re-derives steering from (v, ω)** and may scale v in turns (wheel-speed cap) | M2-B measures the realized (v, κ) in a max-steer turn |
+| Command interface | controller's δ applied to the plant directly | node converts δ→Twist (`ω = v·tanδ/L`, `:539`); **vendor firmware re-derives steering from (v, ω)** and may scale v in turns (wheel-speed cap). **2026-10-04: the stock ROS driver, not firmware, rescales it — realized δ ≈ 0.4× commanded, ≤ 0.198 rad (§7.8)** | M2-B measures the realized (v, κ) in a max-steer turn; patched driver (§7.8) |
 | End-of-path | runs fixed n_steps | stops within 0.3 m of end (`:505`) | Terminate predictions at path end |
 
 ---
@@ -260,9 +272,9 @@ operator holds the e-stop during every driving measurement.
 | Quantity | Manufacturer (official) | Repo/sim assumption | Measured |
 |---|---|---|---|
 | Wheelbase L | **0.200 m** (user manual) | 0.2 m ✓ | M1 (tape) |
-| Min turn radius (Ackermann) | **0.4 m** (user manual) | 0.37 m | M1 |
-| Max speed (no-load) | **1 m/s** (user manual) | 1.0 (docs) / "~3" (code comment — presumed wrong) | M2 |
-| Max steering angle | not specified | 0.5 rad | M1; manufacturer geometry implies arctan(0.2/0.4) ≈ **0.46 rad** |
+| Min turn radius (Ackermann) | **0.4 m** (user manual) | 0.37 m | M1. Stock driver: ≈ 1.0 m at full lock (2026-10-04, §7.8) |
+| Max speed (no-load) | **1 m/s** (user manual) | 1.0 (docs) / "~3" (code comment — presumed wrong) | M2. Not in the ROS protocol (speed = int16 ×1000) → firmware/motor; stand test pending |
+| Max steering angle | not specified | 0.5 rad | M1; manufacturer geometry implies arctan(0.2/0.4) ≈ **0.46 rad**. Stock driver delivers ≤ **0.198 rad** (28° inner ÷ 2.47, §7.8); physical limit: sweep pending |
 
 Source: AgileX `limo-doc` user manual (EN), github.com/agilexrobotics/limo-doc.
 Two consequences: (a) the sim/clip assumption δ_max = 0.5 rad slightly
@@ -280,6 +292,7 @@ Methods: RTK circle fit on the NMEA GGA track (7 Hz, quality 4, fit residual
 (R = v_VTG / gyro_z). The two agree within ~5% on every bag.
 
 1. **Effective curvature ceiling — BLOCKING FINDING (full 71-bag sweep).**
+   **[ROOT-CAUSED 2026-10-04: stock-driver steering scale, software — §7.8.]**
    Commanded steering saturates at the ±0.5 rad clip (52–55% duty on R=0.5
    runs) while the vehicle delivers far less, with a mild speed dependence:
    sustained achieved κ ≈ **0.82–0.95 at v=1.0 (R ≈ 1.05–1.22 m)**,
@@ -291,7 +304,8 @@ Methods: RTK circle fit on the NMEA GGA track (7 Hz, quality 4, fit residual
    teleop — **the platform has never delivered better than ~0.85 m radius**,
    ~2× short of the manufacturer's 0.4 m. The v→0 extrapolation implies a true
    steering angle ≈ 0.24–0.27 rad (~half the datasheet-implied 0.46; a driver
-   scale/calibration factor ≈ 0.5 is a plausible, checkable cause); the
+   scale/calibration factor ≈ 0.5 is a plausible, checkable cause — *confirmed
+   2026-10-04: ÷2.47, gain ≈ 0.4, §7.8*); the
    speed trend on top of it looks like understeer/tire slip. The commanded
    R=0.5 runs actually drove ~1.1 m arcs; even R=1.0 (needs δ=0.197) is
    beyond the ceiling at v=1.0, which **root-causes the June-11 review's
@@ -320,6 +334,8 @@ Methods: RTK circle fit on the NMEA GGA track (7 Hz, quality 4, fit residual
    PID's run-to-run SD is **3–8× larger** than LPV's in every condition.
    **The mean-error headline does not survive the measured noise floor;
    the repeatability/variance advantage does.** See §0 update and §7.8.
+   *Caveat (2026-10-04):* this sim modeled a clip only; the hardware also
+   applied a ~0.4× gain to every steering command (§7.8), which it did not.
 
 Reuse existing entry points where they exist: `tools/diagnostics/sweep_steering.py`
 already drives the steering to ±0.5 rad at v=0.2 (constants `V_LIN=0.2`,
@@ -331,7 +347,9 @@ lives in `~/agilex_ws/`). Run on the robot and record here:
 grep -rEn 'max_steering|steering.*limit|<limit' ~/agilex_ws/src/limo_* 2>/dev/null
 ```
 The ±0.5 rad software clip (`:534`) is binding only if the vendor servo can
-reach ≥0.5 rad; M1 is the physical truth.
+reach ≥0.5 rad; M1 is the physical truth. **Done 2026-10-04** — the driver
+clamps the inner-wheel angle at 28° and sends it ÷2.47; that conversion is the
+ceiling (§7.8).
 
 ### M1 — Maximum steering angle δ_max (and wheelbase L, R_min)
 
@@ -362,6 +380,10 @@ reach ≥0.5 rad; M1 is the physical truth.
   Expect R_axle ≈ 0.4 m if the manufacturer figure holds.
 - **Acceptance:** residual < 0.03 m and left/right δ_max within 10%.
 - **Feeds:** §3 LPV `delta_max`, the ±0.5 clip validity, R_min in the matrix.
+- **2026-10-04:** through the stock driver no `angular.z` reaches more than
+  0.198 rad at the wheels (§7.8), so M1 runs through the **patched driver**:
+  sweep the raw chassis steering value **0.20 → 0.45 rad at crawl** until R stops
+  shrinking — that is the servo's real limit. Pending.
 
 ### M2 — Speed cap and speed-in-turn
 
@@ -378,6 +400,9 @@ reach ≥0.5 rad; M1 is the physical truth.
   cap); odom-vs-RTK speed bias; v_achieved_in_turn; ρ_max,real.
 - **Decision impact:** if the knee is > 1.0 m/s, escalate the §0 speed-axis
   decision to the professor before locking the matrix.
+- **2026-10-04:** the 1.0 m/s cap is not in the ROS protocol (the motion frame
+  carries speed as int16 ×1000), so it sits in chassis firmware or the motor
+  limits. A wheels-off-ground stand test comes first. Pending.
 
 ### M3 — Steering feedback noise (and existence)
 
@@ -452,7 +477,8 @@ exercised; vertices 3–5 stay dormant. Report the achieved ρ(t) range honestly
 ## 7. Open decisions
 
 1. **Speed axis (§0):** pending M2. Recover the original speed-invariance claim
-   if the platform exceeds 1.0 m/s? Needs professor sign-off.
+   if the platform exceeds 1.0 m/s? Needs professor sign-off. (2026-10-04: cap
+   not in the ROS protocol; stand test pending.)
 2. **Headline metric — now quantified (2026-07-06 noise-on sweeps):** neither
    metric is clean, and the trade is now numeric. **e_d:** LPV wins RMS at every
    R (100% paired win-rate at R ≥ 0.5) but the margin is **~3–4 mm RMS — below
@@ -484,7 +510,8 @@ exercised; vertices 3–5 stay dormant. Report the achieved ρ(t) range honestly
    zero margin. Decide: keep it as the "at the physical limit" data point
    (ugliness is data), or replace with R = 0.45 as the tightest *controlled*
    cell. Interacts with `DOC/experiment.md` open question 6. **[Superseded in
-   practice by §7.8 — currently NO cell in the matrix is trackable.]**
+   practice by §7.8 — currently NO cell in the matrix is trackable.]** (2026-10-04:
+   true of the stock driver; reopen once the patched driver's limit is measured.)
 8. **Steering-limit root cause — TOP BLOCKER (2026-07-06).** The achieved
    steering limit is ~0.17 rad vs 0.5 commanded and vs the manufacturer's
    implied 0.46 (§5 bag-mined finding 1). Find where the authority is lost:
@@ -497,3 +524,29 @@ exercised; vertices 3–5 stay dormant. Report the achieved ρ(t) range honestly
    **not fixable** (firmware/hardware) → redesign matrix around R ≥ 1.2 m,
    accept ρ ≤ 0.9, and re-frame per §0 update. Every other §7 decision is
    downstream of this one.
+
+   **ROOT CAUSE FOUND (2026-10-04) via (a) — outcome *fixable*: a software
+   scale error in the stock driver, not mechanical.** The stock AgileX ROS2
+   `limo_base` driver converts the commanded bicycle steering to an
+   **inner-wheel angle, clamps it at 28°, and sends inner/2.47** to the chassis.
+   The chassis steers to a central angle ≈ the raw value sent (fit **0.98×** over
+   8894 bag samples, **1.00×** at full lock). So every steering command reached
+   the wheels ~2.5× too small (**effective gain ~0.4**) and full lock was
+   **0.198 rad → R ≈ 1.0 m** (L = 0.2) — the "never better than ~0.85 m" ceiling
+   of §5 finding 1. (Not reconciled here: the crawl-speed bags' 0.85–0.98 m sits
+   up to ~15% tighter than that 1.0 m kinematic figure.)
+   - **Patched driver** in progress: a `steering_mode` parameter, default = stock
+     behavior.
+   - **Physical limit still unknown** → M1 steering sweep through the patched
+     driver, raw 0.20 → 0.45 rad at crawl (wheels on floor: operator confirms).
+   - **Existing data — OPEN, advisor decision.** Every scored run so far
+     (including the 107 counted toward the 680-run matrix as of 2026-10-03) was
+     driven at ~40% of commanded steering. They are **not** declared invalid;
+     whether they count for the paper is the advisor's call (`ToDo.md`).
+   - **Sim fidelity:** hardware applied ~0.4× to every command up to the
+     0.198 rad clamp, and the LPV's `delta_meas` (previous command, §2.2 note 2)
+     overstated the delivered steering ~2.5×. Both belong in the §2.3 fidelity
+     match before predictions are trusted; §5 finding 5 modeled a clip only.
+   - Choices sized to the stock ceiling — glue `track_radius_m` 1.2, wiggle
+     radii 2.0/1.5/1.2 (`DOC/experiment.md`), §3 δ_max — revisit once the real
+     limit is measured.

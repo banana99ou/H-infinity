@@ -82,8 +82,8 @@ it.
 
 | Constraint | Source | Consequence |
 |---|---|---|
-| Total wheel speed capped at **1.0 m/s** (strict, firmware-level, not configurable from ROS) | LIMO chassis motor controller | Speed sweep impossible above 1.0 m/s. Turning at v_des = 1.0 reduces forward speed. |
-| Geometric **R_min ≈ 0.37 m** | LIMO Ackermann linkage | Practical curvature floor for non-saturated runs ≈ R = 0.4 m. U-turn at R_min is the tightest planned maneuver. |
+| Total wheel speed capped at **1.0 m/s** (strict, firmware-level, not configurable from ROS) | LIMO chassis motor controller *(2026-10-04: confirmed absent from the ROS protocol — speed travels as int16 ×1000 — so firmware or motor limit; wheels-off stand test pending)* | Speed sweep impossible above 1.0 m/s. Turning at v_des = 1.0 reduces forward speed. |
+| Geometric **R_min ≈ 0.37 m** | LIMO Ackermann linkage | Practical curvature floor for non-saturated runs ≈ R = 0.4 m. U-turn at R_min is the tightest planned maneuver. *2026-10-04: never reached under the stock `limo_base` driver, which delivered ~0.4× the commanded steering (full lock 0.198 rad → R ≈ 1.0 m); physical limit unmeasured — `SPEC.md` §7.8.* |
 | **Ackermann mode required** (`motion_mode: 1` on `/limo_status`) | Controller assumes bicycle model | Confirm before every wheels-on-floor run. |
 | **No `/cmd_vel` direct publishing from controller** | ADR-01, system_spec C3 | All commands go controller → `cmd_vel_raw` → `estop_cli.py` → `/cmd_vel`. |
 | **RTK only, no fusion (for the controller)** | ADR-01 | Wheel odom feeds the controller during a recorded run; RTK is post-hoc ground truth. RTK *may* drive the robot **between** recorded runs (reposition). |
@@ -150,14 +150,36 @@ Calibration procedure (one-time per venue, redo after any layout change):
 |---|---|
 | **controller** | `lpv-hinf`, `pid-ff` |
 | **v_const** | **1.0 m/s** (primary); **0.5 m/s** (sim-comparable sanity point) |
-| **path family** | **step-curvature** (paper primary), **slalom** (paper §5) |
-| **R** | {1.0, 0.7, 0.5, 0.4} m — spans PID-favored → crossover → LPV-favored regime |
+| **path family** | **step-curvature** (paper primary), **slalom** (paper §5), **wiggle_sine / wiggle_chirp / wiggle_square** (added 2026-10-02, advisor: "more wiggly paths") |
+| **R** | step, slalom: {1.0, 0.7, 0.5, 0.4} m — spans PID-favored → crossover → LPV-favored regime. wiggle_*: {2.0, 1.5, 1.2} m (`matrix.radius_m_by_family`) |
 | **N** | **10** repetitions per cell |
 
-Total: 2 × 2 × 2 × 4 × 10 = **320 recorded headline runs** (turnarounds
-are bagged separately and not counted in the matrix). At ≈ 90–120 s wall
-time per recorded run (motion + reposition + turnaround + bag archive),
-~8–10 hours pure run time, split across 5–6 battery-limited sessions.
+Total: step/slalom 2 × 4 R × 2 controllers × 2 v = 32 cells; wiggle 3 × 3 R ×
+2 × 2 = 36 cells → **68 cells × N = 10 = 680 recorded headline runs** (was 320
+before the wiggle families; turnarounds/glue are not counted). At the measured
+~72 s wall time per leg (2026-10-03) that is ~13.6 robot-hours. Live progress
+is in `ToDo.md`.
+
+**Wiggle families** (`ros2_bridge/limo_path_follower/wiggle_path.py`): defined
+by curvature κ(s) with peak |κ| = 1/R, so R keeps one meaning across families;
+length does not grow with R — 2 periods (6 m at λ = 3 m; chirp ~4.3 m) + 0.5 m
+lead-in/out (`plan.wiggle`). `sine`: κ = (1/R)·cos(2πs/λ). `chirp`: same peak, λ shrinks
+3 → 1.5 m (sweeps curvature *rate* — bandwidth). `square`: back-to-back ±1/R
+arcs (curvature steps of 2/R). Radii were sized to the measured steering
+ceiling (1.2 = at it for v = 1.0; 1.5 / 2.0 clear of it) — a ceiling that
+turned out to be the stock driver's scale error (`SPEC.md` §7.8).
+
+**Pilot first:** `plan.priority` in `experiment.yaml` runs these cells before
+matrix order — wiggle_sine 2.0, wiggle_sine 1.2, wiggle_square 1.2,
+wiggle_chirp 1.5 (does the LIMO follow wiggles at all, below vs at the
+ceiling, step response, bandwidth). The executor cycles treatments least-done
+first, so a pilot stopped early stays balanced across controller × speed.
+Delete the key to return to matrix order.
+
+**Steering caveat (2026-10-04):** every scored run so far drove at ~0.4× the
+commanded steering (stock driver; full lock ≈ R 1.0 m), so the step / slalom
+cells (R ≤ 1.0) ran at or past the steering limit. Whether those runs count is
+an open advisor decision — `SPEC.md` §7.8, `ToDo.md`.
 
 **Headline plot for the paper:** max heading error vs R at v = 1.0 m/s,
 both controllers overlaid, error bars across N = 10. The crossover point
@@ -317,14 +339,17 @@ The system is **done** when all of these are true:
 
 1. Operator places the LIMO somewhere on the rooftop, hits one button in
    the battle station, and walks away.
-2. The orchestrator runs the full 320-cell matrix unattended, with
-   RTK-direct reposition between cells, tracked-path turnarounds, and
-   auto-retry on fail.
+2. The orchestrator runs the full matrix (68 cells × N = 10 = 680 runs)
+   unattended, with RTK-direct reposition between cells, tracked-path
+   turnarounds, and auto-retry on fail.
 3. Operator is alerted on low battery, RTK loss / not-FIXED, and any sequencer
    pause or halt, via two channels:
    - **Web-UI browser alerts** (primary, local): the battle station raises a
      toast + beep + flashing tab title (+ an OS desktop notification when the
      browser permits) on each event — no internet required, works on the LIMO AP.
+     Node-side pages (stage advance, anchor warning, odom / RTK watchdog page +
+     all-clear) arrive as cards on `/operator/alert`. Discord paging is switched
+     off (2026-10-02).
    - **ntfy.sh push** (optional, remote): phone push for the same events plus the
      wallclock heartbeat, when `ntfy.topic` is set in `experiment.yaml`.
 4. Every passing run yields a bag + sidecar JSON in a deterministic

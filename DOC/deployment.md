@@ -49,8 +49,9 @@ Each of these has cost real hours. They look like bugs in your code; they are no
 
 ### G1 · `git pull` on the NUC aborts: "untracked working tree files would be overwritten"
 
-**Cause.** Two sync mechanisms overlap. `tools/sync/sync.sh push` rsyncs files
-laptop→NUC, where they land **untracked**. When those same paths later arrive as
+**Cause.** Two sync mechanisms overlap. `tools/sync/sync.sh push` (via the relay
+since 2026-10-03) and `push-direct` rsync files laptop→NUC, where they land
+**untracked**. When those same paths later arrive as
 *tracked* files in a commit, `git pull --ff-only` refuses rather than clobber them.
 `git reset` does **not** help — reset does not touch untracked files.
 
@@ -192,8 +193,12 @@ lands the same bag + sidecar) — that path is for when the autonomous loop is
 blocked.
 
 ### 0 · Prerequisites (once per session)
-- **Code synced + built on the NUC**, not just rsync'd: `tools/sync/sync.sh push`,
-  then `cd ~/agilex_ws && colcon build --packages-select limo_path_follower` and
+- **Code synced + built on the NUC**, not just rsync'd. Since 2026-10-03
+  `tools/sync/sync.sh push` does both: the relay copies, `colcon build`s and
+  restarts `limo-battle` once the robot is online and idle (see *Code sync &
+  deploy* below). Confirm with `sync.sh relay-log` → `in sync: <stamp>`. After
+  `push-direct` (copy only), build by hand:
+  `cd ~/agilex_ws && colcon build --packages-select limo_path_follower` and
   source `install/setup.bash`. New nodes/controller edits only reach the graph
   after a rebuild.
 - **Chassis in Ackermann mode** on the physical switch (`motion_mode == 1`).
@@ -326,15 +331,37 @@ bags into a dataset + metrics.
   and passes the spaced `Experiment Data` path raw (macOS rsync 2.6.9 rejects
   `-s`). Targets come from `scenarios/experiment.yaml` `artifact_sync`.
   *Verified end-to-end NUC→Mac+NAS 2026-05-26.*
-- `tools/sync/sync.sh` — interim repo sync: `push` (laptop→NUC code, additive),
-  `pull` (NUC→laptop artifacts), `init-artifacts` (make `Experiment Data/` a
-  local-only repo). Direction of truth: code only laptop→NUC; artifacts only
-  NUC→laptop.
+- `tools/sync/sync.sh` — interim repo sync. Direction of truth: code only
+  laptop→NUC; artifacts only NUC→laptop. **Code sync & deploy (2026-10-03):**
+  - `push` — store-and-forward through the always-on relay **work-fmcl**: stages
+    the laptop tree in `~/hinf-relay/stage` + a stamp (`<UTC> <sha>[+dirty]`).
+    `tools/sync/relay_deploy.sh` (relay cron, every minute) deploys when the
+    robot is reachable **and idle** (no `ros2 bag record` / follower /
+    reposition alive; `run_executor` phase idle/done/aborted — `robot_side.sh
+    busy`): rsync with every overwritten robot file kept under
+    `~/H-infinity-deploy-backups/<UTC>/` (no `--delete`: venue JSONs,
+    `discord.env`, artifacts survive), `colcon build` (pip-reinstalls
+    `vfg_pathfollowing` only if it changed), restart `limo-battle`, then write
+    and read back `~/.hinf_deploy_stamp`. Docs / HTML / tests / `tools/sync/`
+    changes never trigger a build or restart. At most one deploy per stamp; a
+    failed build holds until the next push.
+  - **A deploy restarts the whole `limo-battle` stack** (same state as after a
+    boot) — bring the stack back up before the next run.
+  - `push-direct` — the old copy-only push (no build, no restart).
+  - `relay-install` (cron line) / `relay-log` (staged stamp, state, log tail).
+  - Tailscale ACL: an ssh `accept` rule `tag:relay → tag:share` for user
+    `agilex`; without it Tailscale SSH wants a browser check and `relay-log`
+    shows `blocked: …`.
+  - One exclude list for every hop: `tools/sync/code_excludes.txt`.
+  - `pull` (NUC→laptop artifacts), `init-artifacts` (make `Experiment Data/` a
+    local-only repo).
 - `tools/analysis/` — offline bag→dataset pipeline: `manifest.py` (index legs),
   `qc.py` (quality gates), `run_eval.py` (per-run metrics), `aggregate.py`
   (cross-run rollup), `build_dataset.py` + `export.py` (dataset emit),
-  `make_sidecar.py` (sidecar for manual/indoor bags). Tests + fixtures under
-  `tools/analysis/tests/`.
+  `make_sidecar.py` (sidecar for manual/indoor bags). `plan_report.py` audits
+  the auto-planner on saved venues (`tests/venue_fixtures/`) through the same
+  containment gate the loader/executor enforce; exits 1 on any failure. Tests +
+  fixtures under `tools/analysis/tests/`.
 
 Backup vs. code paths are deliberately separate: **code** flows laptop→GitHub
 (+ Syncthing to the NAS at `/mnt/raid0/main/code`); **artifacts** flow only via
@@ -384,6 +411,23 @@ need a secure context (served from `localhost`/https), but the in-page toast +
 beep + title flash always fire. The optional **remote** channel is an ntfy.sh
 push — set `ntfy.topic` in `experiment.yaml`. Behaviour spec: `gap_analysis.md`
 §3.8; operational model: `experiment.md`.
+
+**Node-side pages (2026-10-02).** `run_executor` (stage advance, anchor
+warning), `odom_watchdog` and `rtk_watchdog` (page + all-clear) publish
+`/operator/alert` (contract: `system_spec.md` §4) and render as cards at the
+map's top-right, clear of E-STOP and the control panel. `info` cards are blue
+and silent; a `clear` removes that id's card; the topic is latched, so a
+reconnecting browser replays what is still open. **Discord paging is off**
+(`tools/notify/ntfy.py` `DISCORD_ENABLED = False`; export `HINF_DISCORD=1` in
+the node's environment to re-enable) — nothing reaches a phone unless ntfy is
+set.
+
+**Panel layout (2026-10-02).** Leg batch sits open under Connection, with
+Auto-plan / Send / Start at its top and curve/glue editing folded into *Edit
+geometry*. Node control, Venue, Map, Manual run and the deprecated Experiment
+panel are collapsed (open state remembered per browser). Default basemap:
+Google Hybrid. A Korean changelog overlay shows once per `BATTLE_VERSION`;
+reopen it with 변경 내역 beside the panel title.
 
 ### Post-run: automatic analysis + backup
 

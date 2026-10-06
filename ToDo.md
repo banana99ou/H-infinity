@@ -5,6 +5,26 @@ Working checklist for getting the professor-provided H-infinity stack from
 
 ## Status
 
+**2026-10-04 — CRITICAL: steering reached the wheels at ~0.4× (stock driver scale
+error, not mechanical).** The stock AgileX ROS2 `limo_base` driver converts the
+commanded bicycle steering to an inner-wheel angle, clamps it at 28° and sends
+inner/2.47; the chassis steers to central ≈ the value sent (fit 0.98× over 8894
+bag samples, 1.00× at full lock). Full lock was therefore 0.198 rad → R ≈ 1.0 m —
+the "steering ceiling" SPEC.md recorded is software. Detail: `SPEC.md` §7.8.
+- Patched driver (`steering_mode` parameter, default = stock behavior) being
+  written.
+- **Every scored run so far — incl. the 107 counted below — was driven at ~40% of
+  commanded steering. NOT declared invalid: validity for the paper is an open
+  advisor decision.**
+- Speed: the 1.0 m/s cap is not in the ROS protocol (speed travels as int16
+  ×1000) → firmware or motor limit; wheels-off stand test pending.
+
+**2026-10-03 — matrix progress + what landed.** On the robot: **107/680 usable,
+573 left** (~11.5 robot-hours at the measured 72 s/leg). The matrix grew 320 →
+680 with the wiggle families (`DOC/experiment.md`). Landed: browser alert cards,
+Discord off (f5317ed); relay store-and-forward deploy (2cce30b,
+`DOC/deployment.md`); planner rework + wiggle families (f7f5827, decisions below).
+
 **2026-06-12 field day (rooftop, run_id `rooftop_0612_fri`) — SUCCESS.** Banked a
 good chunk of the dataset and caught + fixed a live controller-switch bug. The
 experiment is now driven by `run_executor_node` + the webui leg-batch workflow
@@ -27,7 +47,8 @@ the `run_smoke_e2e` smoke path until repointed. Three fixes committed (see git l
   loop → abort). track_radius is a MIN-radius FLOOR — higher = wider forced curves
   = fits LESS (counterintuitive). Settled at 0.85 alongside the
   self-intersecting-glue reject (commit b46e987, 2026-06-13); at 0.8 the slalom 0.4
-  cell was the one unfittable cell (40 runs deferred).
+  cell was the one unfittable cell (40 runs deferred). *(→ 1.2 on 2026-10-02 — see
+  planner decisions below.)*
 
 **2026-06-08 heading integration — LANDED (synced + built + bench-verified on NUC).**
 The always-on `heading_node` EKF, the `reposition`→`/heading/fused` cutover, and the
@@ -41,7 +62,27 @@ field: the outdoor no-limit-cycle convergence gate — confirm on the first run.
 - **Stage packing = A/B opposed pairs**: each stage = one geometry placed twice,
   headings 180° apart, glued as a racetrack (synthetic B slot first, grid fallback,
   loud single-curve note if both fail). Knob `plan.max_geometries_per_stage`
-  (≤1 = legacy single-curve).
+  (≤1 = legacy single-curve). **Since 2026-10-02 wall-aligned:** pairs are built in
+  the venue's own frame (min-area rectangle) — curve A along a wall, pair + glue
+  sized as one rigid block, slid to best clearance, re-planned against the real
+  walls (it used to lay curves N/S whatever the venue rotation). Stage selection is
+  transit-aware (a stage whose glue from the previous one can't be planned is not
+  chosen).
+- **Glue (2026-10-02): smooth, not compact** — soft preferred radius
+  `plan.glue.min_radius_m` 2.0, long settled straight before the pin, no extra
+  turning. Trackable floor `plan.glue.track_radius_m` **0.85 → 1.2** (0.85 was ~the
+  measured ceiling; RTK on 54 legs: arrival heading error median 7° / p90 12°).
+  A venue too tight for 1.2 falls back to `track_radius_fallback_m` 0.85, flagged
+  in the plan notes. (Both numbers were sized to the stock-driver ceiling — see
+  Status 2026-10-04.)
+- **Planning time:** ~15–50 s per venue for the full matrix (was 127–540 s);
+  18–20 s request→result on the NUC.
+- **Audit:** `tools/analysis/plan_report.py` over
+  `tools/analysis/tests/venue_fixtures/` — 5/7 plan clean; the two ~3 m-wide smoke
+  venues cannot host a slalom pair at all.
+- **Pilot first (`plan.priority`):** wiggle_sine 2.0, wiggle_sine 1.2,
+  wiggle_square 1.2, wiggle_chirp 1.5 run before matrix order; delete the key to
+  return to matrix order.
 - **Slalom shape (hardware)**: `n_arcs=2, θ=90°, L_mid=0.5, L1=1.0, L_end=1.0` (the
   sim's `n_arcs=6 / L_end=25 m` cannot fit any real venue). `plan.slalom:` in
   `experiment.yaml`; planner defaults in `experiment_planner.PLAN_DEFAULTS`. Affects
@@ -49,8 +90,10 @@ field: the outdoor no-limit-cycle convergence gate — confirm on the first run.
 - **Step shape (hardware)**: `L1=L2=1.0, θ=90°` (sim used 5 m straights). `plan.step:`.
 - **Cell ordering**: `plan.geometry_order` = `matrix` (default, yaml axis order) |
   `finish-nearest` (fewest-remaining geometries first).
-- **ntfy.sh topic stays "" (disabled)**; Discord is the push channel (`discord.env`
-  present on the NUC; the executor pages pause/abort/battery/stage-advance/done).
+- **ntfy.sh topic stays "" (disabled)**. ~~Discord is the push channel~~ — **Discord
+  switched off 2026-10-02** (`ntfy.DISCORD_ENABLED`; `HINF_DISCORD=1` re-enables).
+  Pages are browser cards: `/run/status` (pause/abort/done), `/limo_status`
+  (battery), `/operator/alert` (stage advance, anchor warning, odom/RTK watchdog).
 - **Assumptions baked in (flag if wrong)**: **venue name == resume key** — manifest
   credit filters on `run_id == venue name`, so keep the SAME venue name across field
   days or progress resets to 0; one geometry per (family, R) reused across
@@ -74,7 +117,8 @@ field: the outdoor no-limit-cycle convergence gate — confirm on the first run.
   `tools/path_gen/interactive.html` (`BATT_WARN_V` / `BATT_HALT_V` 10.5/10.2),
   `experiment_sequencer_node` config (11.0/10.5).
 - `path_follower_node.py:86` comment `# LIMO max ~3 m/s` contradicts the 1.0 m/s
-  firmware cap (spec C2) — fix the comment.
+  firmware cap (spec C2) — fix the comment. *(Now `:90`. Hold until the speed stand
+  test: the cap is not in the ROS protocol, so where it lives is unverified.)*
 - `estop_cli.py:214` dead-code condition (the comment itself admits `not ok` is
   always False inside that `else`).
 
@@ -261,7 +305,24 @@ is ready; next session is the first real run.
 
 ## Next session — start here
 
-In rough priority order:
+**2026-10-04 list (supersedes the 2026-05 list below):**
+
+1. **Steering sweep (field; wheels on floor → confirm with the operator).** Through
+   the patched driver, raw chassis steering **0.20 → 0.45 rad at crawl**, RTK circle
+   fit per `SPEC.md` §5-M1 → the servo's real limit (δ_max, R_min).
+2. **Speed stand test (wheels off the ground)** for the 1.0 m/s cap, which is not in
+   the ROS protocol (firmware or motor limit) — `SPEC.md` §5-M2.
+3. **Pilot wiggle stages** (`plan.priority`: wiggle_sine 2.0, wiggle_sine 1.2,
+   wiggle_square 1.2, wiggle_chirp 1.5). Open: stock or patched driver? The pilot's
+   rationale (`experiment.yaml` comment) assumes the stock-driver ceiling.
+4. **Advisor decision on existing data.** All scored runs (107 counted toward 680)
+   drove at ~40% of commanded steering. Whether they count is the advisor's call.
+5. **Revisit stock-ceiling choices** once the real limit is known: glue
+   `track_radius_m` 1.2 / fallback 0.85, wiggle radii 2.0/1.5/1.2, `SPEC.md` §3
+   δ_max, the step/slalom R axis.
+
+**Older list (2026-05; mostly done or superseded — kept for history).** In rough
+priority order:
 
 1. **First wheels-on-floor smoke test (indoor).** Indoor S-curve preset is
    ready. Bring up `base_vanilla` + `estop` + `follower` from the orchestrator,
@@ -574,7 +635,8 @@ The first substantive task is done:
 - [ ] Validate actual LIMO vehicle assumptions against sim (wheelbase,
   steering saturation, safe speed envelope, effective control period,
   whether `cmd_vel.angular.z` behaves consistently with the bicycle-model
-  conversion).
+  conversion). **2026-10-04: it does not** — the stock driver delivers ~0.4× the
+  commanded steering (Status; `SPEC.md` §7.8).
 - [ ] Tune only after the interface is correct. Suggested order:
   `dt_ctrl` -> `delta_max` -> `output_gain` -> `K_ff` -> `rho_scale`.
   Start in: `scalecar-vfg-h-infinite/vfg_pathfollowing/controllers/lpv_hinf.py`.

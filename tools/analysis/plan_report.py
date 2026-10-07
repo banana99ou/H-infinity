@@ -94,8 +94,21 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("venues", nargs="*")
     ap.add_argument("--experiment", default=os.path.join(_REPO, "scenarios", "experiment.yaml"))
+    ap.add_argument("--radii", default=None,
+                    help="comma-separated radii overriding matrix.radius_m "
+                         "(e.g. a preview of the calibration lock's radii when "
+                         "radius_m is 'auto' and no lock is present)")
     a = ap.parse_args(argv)
     doc = yaml.safe_load(open(a.experiment))
+    if a.radii:
+        doc.setdefault("matrix", {})["radius_m"] = [float(x) for x in a.radii.split(",")]
+    elif str((doc.get("matrix") or {}).get("radius_m", "")).strip().lower() == "auto":
+        sys.path.insert(0, os.path.join(_REPO, "tools", "analysis"))
+        import manifest  # noqa: E402
+        _e, _r, doc = manifest.load_experiment(a.experiment)
+        if not doc["matrix"]["radius_m"]:
+            print("radius_m is 'auto' and no calibration lock is present — "
+                  "pass --radii to preview a matrix")
     venues = a.venues or sorted(glob.glob(os.path.join(
         _REPO, "tools", "analysis", "tests", "venue_fixtures", "*.json")))
     results = [report(v, doc) for v in venues]

@@ -57,7 +57,10 @@ _REPO_ROOT = next(
 VALID_KINDS = ("reposition", "recipe")
 VALID_CONTROLLERS = ("lpv-hinf", "lpv_hinf", "lpv", "hinf", "pid-ff", "pid_ff", "pid")
 VALID_RECIPE_TYPES = ("step", "slalom", "uturn",
-                      "wiggle_sine", "wiggle_chirp", "wiggle_square")
+                      "wiggle_sine", "wiggle_chirp", "wiggle_square",
+                      # steering calibration figure-8 (calibration.py,
+                      # driven open-loop by calib_node, 2026-10-08)
+                      "calib_fig8")
 
 
 class VenueLoaderNode(Node):
@@ -249,7 +252,21 @@ class VenueLoaderNode(Node):
                 return False, why
             # Inter-stage transit glue (C, 2026-06-11): driven unattended at
             # a stage advance — must clear the venue like any reposition
-            # curve. Checked as a pseudo-leg through the same gate.
+            # curve. Checked as a pseudo-leg through the same gate. The
+            # first-pass wrap glue (2026-10-08) is driven the same way.
+            wg = st.get("wrap_glue")
+            if wg is not None:
+                wps = wg.get("waypoints_wgs84") or []
+                if len(wps) < 2:
+                    return False, (f"stage {st.get('name', si + 1)}: "
+                                   "wrap_glue has < 2 waypoints")
+                ok, why = self._validate_legs(
+                    [{"id": f"{st.get('name', si + 1)}_wrap",
+                      "curves": [{"kind": "reposition", "name": "wrap_glue",
+                                  "waypoints_wgs84": wps}]}], v,
+                    label=f"stage {st.get('name', si + 1)} wrap glue: ")
+                if not ok:
+                    return False, why
             eg = st.get("entry_glue")
             if eg is not None:
                 wps = eg.get("waypoints_wgs84") or []

@@ -261,16 +261,49 @@ def _num(x):
         return None
 
 
-def load_experiment(path):
+def _calibration_module():
+    """limo_path_follower.calibration (pure Python), imported by path so the
+    laptop tools need no colcon install."""
+    pkg = os.path.join(_REPO_ROOT, "scalecar-vfg-h-infinite", "ros2_bridge",
+                       "limo_path_follower")
+    if pkg not in sys.path:
+        sys.path.insert(0, pkg)
+    try:
+        from limo_path_follower import calibration  # type: ignore
+    except Exception:  # noqa: BLE001
+        import calibration  # type: ignore
+    return calibration
+
+
+def load_experiment(path, bag_root=None):
     """Load experiment.yaml → (expected_cells set, repetitions, raw dict).
 
     expected_cells is a set of cell_key tuples from the cartesian product of the
     matrix axes (controller × v_const × path_family × radius_m). A family listed
     in the optional ``radius_m_by_family`` map sweeps its own radii instead of
     ``radius_m`` (the wiggle families live above the measured steering ceiling).
+
+    ``matrix.radius_m: auto`` (2026-10-08) takes the radii from the one-time
+    calibration lock (``<bag_root>/calibration/matrix_lock.json``; bag_root
+    defaults to the repo's ``Experiment Data``). No lock yet -> no radii (the
+    first session's calibration creates it). The returned doc carries the
+    resolved list plus ``_matrix_epoch`` (the lock epoch, None for a fixed
+    list) and ``_matrix_lock``.
     """
     with open(path, "r", encoding="utf-8") as f:
         doc = yaml.safe_load(f)
+    matrix = (doc or {}).get("matrix", {}) or {}
+    if str(matrix.get("radius_m", "")).strip().lower() == "auto":
+        cal = _calibration_module()
+        root = bag_root or os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(path))),
+            "Experiment Data")
+        lock = cal.load_lock(cal.lock_path(root))
+        doc = cal.resolve_matrix(doc, lock)
+        doc["_matrix_lock"] = lock
+    else:
+        doc.setdefault("_matrix_epoch", None)
+        doc.setdefault("_radius_auto", False)
     matrix = doc.get("matrix", {}) or {}
     controllers = matrix.get("controller", [])
     speeds = matrix.get("v_const", [])
@@ -309,6 +342,9 @@ def build_rows(legs, allowlist=None):
             "radius_m": cp.get("radius_m"),
             "path_family": cp.get("path_family"),
             "rep": cp.get("rep"),
+            # Calibration lock epoch the leg was recorded under (2026-10-08);
+            # None for every leg before the auto-radius matrix.
+            "matrix_epoch": sc.get("matrix_epoch"),
             "venue": (sc.get("venue") or {}).get("venue_id"),
             "sidecar_pass": cls.get("pass"),
             "rtk_fixed_pct": rtk.get("fixed_pct"),
@@ -374,7 +410,8 @@ def completeness(rows, expected_cells, target_n):
 
 def write_csv(rows, path):
     cols = ["is_paper", "provenance", "run_id", "cell_id", "leg", "controller",
-            "v_const", "radius_m", "path_family", "rep", "venue", "sidecar_pass",
+            "v_const", "radius_m", "path_family", "rep", "matrix_epoch",
+            "venue", "sidecar_pass",
             "rtk_fixed_pct", "duration_s", "required_topics_ok", "missing_topics",
             "has_sidecar", "bag_dir", "sidecar_path"]
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)

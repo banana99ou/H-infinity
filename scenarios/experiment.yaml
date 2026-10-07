@@ -26,7 +26,13 @@ venue: scenarios/venues/rooftop.json
 # = 320 runs. Start SMALL on the robot (one controller, one radius, N=1) and
 # widen once a full cell verifies end-to-end.
 matrix:
-  radius_m: [1.0, 0.7, 0.5, 0.4]
+  # auto (2026-10-08): the radii come from the one-time steering calibration
+  # lock (calibration: below; <bag_root>/calibration/matrix_lock.json). The
+  # first session's figure-8 measures R_min at 1.0 m/s and locks
+  # R_i = 1 / (fraction_i x margin / R_min), rounded to 0.05 m. Only legs
+  # recorded under that lock's epoch count. Was [1.0, 0.7, 0.5, 0.4] — every
+  # leg of which ran on the stock driver at ~0.45x steering (SPEC.md §7.8).
+  radius_m: auto
   controller: [lpv-hinf, pid]
   v_const: [1.0, 0.5]
   path_family: [step, slalom]
@@ -41,12 +47,35 @@ matrix:
 
 repetitions: 10
 
+# Steering calibration (limo_path_follower/calibration.py, calib_node).
+# Every session starts with an open-loop figure-8 at full lock. No lock yet:
+# 'full' (0.5 + 1.0 m/s) -> locks the radii once and the executor plans the
+# matrix itself. Lock exists: a 'sanity' figure-8 (1.0 m/s) when the last
+# passing check is older than recheck_after_h; it pauses if R_min moved more
+# than sanity_tol. Defaults in calibration.DEFAULTS.
+calibration:
+  enabled: true
+  margin: 0.8                     # steady-state curvature <= 80% of full lock
+  curvature_fractions: [0.4, 0.57, 0.8, 1.0]
+  round_m: 0.05
+  r_min_bounds_m: [0.4, 1.2]      # outside -> refuse to lock (bad measurement)
+  sanity_tol: 0.15
+  recheck_after_h: 4.0
+
 # Auto-layout planner overrides (deep-merged over experiment_planner.PLAN_DEFAULTS).
 plan:
   # priority: [[family, R], ...] runs those still-remaining cells first, in
   # that order (empty = matrix order). The 2026-10-03 wiggle pilot list went
   # with the wiggle archive.
+  # first_pass_reps (2026-10-08): sweep EVERY stage to this many passing runs
+  # per cell before filling any cell to `repetitions` (one balanced pass of
+  # all 32 cells first; doubles as the end-to-end shakedown).
+  first_pass_reps: 1
   glue:
+    # Glue (reposition) speed, 2026-10-08: 0.2 -> 0.4 m/s (the executor's
+    # reposition_speed_mps caps it; live-settable, see
+    # DOC/agent_field_runbook.md §7).
+    v_const: 0.4
     # Trackable min radius for reposition/glue curves. 0.85 m: with the
     # self-intersection reject added to the glue gate (2026-06-13), every
     # geometry fits a clean 2-leg A/B pair whose turnarounds are wide U-turns

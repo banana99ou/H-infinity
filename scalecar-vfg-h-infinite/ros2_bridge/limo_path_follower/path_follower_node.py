@@ -84,6 +84,12 @@ class PathFollowerNode(Node):
         # How densely to sample analytic recipe paths when republishing them as
         # nav_msgs/Path on /reference_path (for viz + bag). Points per metre.
         self.declare_parameter('path_sample_density', 10.0)
+        # Steering command clip, BOTH controllers (SPEC.md §3: set to the
+        # measured delta_max). 0.5 was the sim's clip; the chassis caps at
+        # ~0.35 rad in the patched driver's direct mode (SPEC.md §7.8,
+        # 2026-10-07). Clipping here at the real cap keeps the LPV's
+        # delta_meas input (= previous clipped command) truthful.
+        self.declare_parameter('delta_max_rad', 0.35)
 
         # -- Read parameters --------------------------------------------
         ctrl_type = self.get_parameter('controller_type').value
@@ -97,6 +103,7 @@ class PathFollowerNode(Node):
         self._odom_frame = self.get_parameter('odom_frame').value
         use_demo = bool(self.get_parameter('use_demo_path').value)
         self._R_min = float(self.get_parameter('R_min').value)
+        self._delta_max = abs(float(self.get_parameter('delta_max_rad').value))
         self._path_sample_density = float(
             self.get_parameter('path_sample_density').value)
 
@@ -538,8 +545,8 @@ class PathFollowerNode(Node):
             delta_cmd = self.controller.compute(
                 e_psi, kappa=kappa, dt=self.dt_ctrl)
 
-        # Safety clip
-        delta_cmd = float(np.clip(delta_cmd, -0.5, 0.5))
+        # Safety clip (delta_max_rad; the measured chassis cap)
+        delta_cmd = float(np.clip(delta_cmd, -self._delta_max, self._delta_max))
         self._delta_prev = delta_cmd
 
         # -- Convert to Twist ------------------------------------------

@@ -129,6 +129,14 @@ PROCS = {
         '--ros-args', '-p',
         'venue_file:=/home/agilex/H-infinity/scenarios/venues/active.json',
     ],
+    # Steering calibration (2026-10-08): the open-loop figure-8 at full lock
+    # that measures R_min at the start of every session (calib_node). A
+    # cmd_vel_raw MOVER like reposition/follower — run_executor starts it only
+    # after both are confirmed down (C6) and kills it before anything else
+    # moves. Publishes cmd_vel_raw + /calib/status only.
+    'calib': [
+        'ros2', 'run', 'limo_path_follower', 'calib_node',
+    ],
     # T6: the experiment sequencer (the integrator). Drives the matrix unattended
     # by start/kill-ing the movers above through this orchestrator.
     'sequencer': [

@@ -14,7 +14,8 @@ function extract(name) {
   return html.slice(i, k + 1);
 }
 const fns = ['lbLatlonToEN','lbPolylineLenM','lbDeCast','lbBezierSample',
-  'lbStepRecipeLocal','lbSlalomRecipeLocal','lbRecipeLocal',
+  'lbStepRecipeLocal','lbSlalomRecipeLocal','lbCalibRecipeLocal','lbIsCalib',
+  'lbRecipeLocal',
   'lbPlaceAtStartPose','lbExpLatLon','lbExpEnd','lbRepoCtrl','lbRepoSamples',
   'lbBuiltLegs'];
 let src = fns.map(extract).join('\n');

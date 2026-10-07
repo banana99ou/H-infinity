@@ -35,6 +35,10 @@ try:
     from limo_path_follower import venue_geom
 except Exception:  # pragma: no cover - in-source / odd layout fallback
     import venue_geom
+try:
+    from limo_path_follower import calibration as calib_mod
+except Exception:  # pragma: no cover - in-source / odd layout fallback
+    import calibration as calib_mod
 
 
 # Defaults for the optional ``plan:`` block in experiment.yaml. Shape params
@@ -198,7 +202,10 @@ def remaining_geometries(doc, counts, key_fn=None):
     key_fn = key_fn or _cell_key_dict
     matrix = (doc or {}).get("matrix") or {}
     fams = [str(f) for f in (matrix.get("path_family") or [])]
-    radii = [float(r) for r in (matrix.get("radius_m") or [])]
+    # 'auto' (calibration lock) must be resolved by the caller
+    # (manifest.load_experiment); an unresolved 'auto' means no radii yet.
+    raw = matrix.get("radius_m") or []
+    radii = [] if isinstance(raw, str) else [float(r) for r in raw]
     by_fam = matrix.get("radius_m_by_family") or {}
     ctrls = [str(c) for c in (matrix.get("controller") or [])]
     speeds = [float(v) for v in (matrix.get("v_const") or [])]
@@ -1093,12 +1100,20 @@ def _naive_glue(end, exit_b, start, start_b, cfg):
 # ----------------------------------------------------------------------
 
 def plan_stages(venue, doc, counts, footprint_r=0.30, track_margin=0.30,
-                key_fn=None):
+                key_fn=None, calibration=None):
     """Plan stages covering every remaining (family, R) geometry.
 
     Returns the dict described in the module docstring; never raises on bad
     input (returns ok=False + notes instead) so a ROS host can publish the
     result verbatim.
+
+    ``calibration`` (2026-10-08): None, or {"mode": "full"|"sanity",
+    "pin": {lat, lon, heading_deg} | None}. Prepends a stage named
+    "calibration" holding the open-loop figure-8 (calibration.py) and its
+    approach loop; the matrix stages follow with the usual inter-stage glue,
+    so the robot transits from the figure-8 into the first matrix stage
+    unattended. "pin" re-seats an already-driven calibration at the same
+    place (the executor's re-plan after it locks the radii).
     """
     notes, unfittable, stages = [], [], []
     corners = (venue or {}).get("corners_wgs84") or []
@@ -1127,14 +1142,37 @@ def plan_stages(venue, doc, counts, footprint_r=0.30, track_margin=0.30,
     # Biases A's heading; B follows opposed, so the whole pair tracks the axis.
     major_bearing = _poly_major_bearing(poly)
 
+    spacing = 0.25      # search-time sampling; final check is the loader's 0.10
+    stage_geo = []      # per assembled stage: exit/entry poses (EN) for transit
+    if calibration:
+        cst, cgeo, cnote = _calibration_stage(
+            calibration, doc, poly, excl, req, cfg, lat0, lon0, major_bearing)
+        if cst is None:
+            return {"ok": False, "stages": [], "unfittable": [],
+                    "req_clearance_m": req, "notes": [cnote]}
+        if cnote:
+            notes.append(cnote)
+        stages.append(cst)
+        stage_geo.append(cgeo)
+
     remaining = remaining_geometries(doc, counts, key_fn=key_fn)
     if not remaining:
+        if stages:
+            notes.append(
+                "no matrix cells to place yet" if (doc or {}).get("_radius_auto")
+                and not ((doc or {}).get("matrix") or {}).get("radius_m")
+                else "matrix complete — no remaining (family, R) cells")
+            if (doc or {}).get("_radius_auto") and not (
+                    (doc or {}).get("matrix") or {}).get("radius_m"):
+                notes.append("matrix radii come from the calibration: the "
+                             "executor plans the matrix itself once the "
+                             "figure-8 has locked them")
+            return {"ok": True, "stages": stages, "unfittable": [],
+                    "req_clearance_m": req, "notes": notes}
         return {"ok": True, "stages": [], "unfittable": [],
                 "req_clearance_m": req,
                 "notes": ["matrix complete — no remaining (family, R) cells"]}
 
-    spacing = 0.25      # search-time sampling; final check is the loader's 0.10
-    stage_geo = []      # per assembled stage: exit/entry poses (EN) for transit
     queue = list(remaining)
     # Stage shape (field decision 2026-06-11): one GEOMETRY per stage, placed
     # as an A/B OPPOSED PAIR — the same recipe twice, headings ~180 deg apart,
@@ -1457,6 +1495,45 @@ def plan_stages(venue, doc, counts, footprint_r=0.30, track_margin=0.30,
                 for (e, n) in mids_en]
         stages[i + 1]["entry_glue"] = entry
 
+    # First-pass wrap (2026-10-08, plan.first_pass_reps): the executor sweeps
+    # every stage once at a low per-cell target, then wraps from the LAST stage
+    # back to the FIRST matrix stage for the remaining reps. Plan that transit
+    # like any inter-stage glue so the wrap is not a blind path-join. Skipped
+    # (best-effort glue never emitted) when it does not plan cleanly.
+    fm = 1 if (stages and stages[0].get("calibration")) else 0
+    last = len(stages) - 1
+    if int(cfg.get("first_pass_reps", 0) or 0) > 0 and last > fm:
+        a, b = stage_geo[last], stage_geo[fm]
+        glue_en, note = _plan_glue(a["exit_en"], a["exit_b"],
+                                   b["entry_en"], b["entry_b"],
+                                   poly, excl, req, cfg)
+        if glue_en is None and len(floor_cfgs) > 1:
+            glue_en, note = _plan_glue(a["exit_en"], a["exit_b"],
+                                       b["entry_en"], b["entry_b"],
+                                       poly, excl, req, floor_cfgs[1])
+        if glue_en is None:
+            notes.append(f"wrap glue {stages[last]['name']} -> "
+                         f"{stages[fm]['name']}: none planned (the executor "
+                         "path-joins on the first-pass wrap)")
+        else:
+            if glue_en["kind"] == "mids":
+                pts_en = _bezier_samples([a["exit_en"]] + list(glue_en["pts"])
+                                         + [b["entry_en"]])
+            else:
+                pts_en = list(glue_en["pts"])
+            stages[fm]["wrap_glue"] = {
+                "from_stage": stages[last]["name"],
+                "start_wgs84": dict(zip(("lat", "lon"),
+                                        _en_to_latlon(*a["exit_en"], lat0, lon0))),
+                "waypoints_wgs84": [
+                    dict(zip(("lat", "lon"), _en_to_latlon(e, n, lat0, lon0)))
+                    for (e, n) in pts_en],
+                "v_const": float(cfg["glue"]["v_const"]),
+                "pos_tol_m": float(cfg["glue"]["pos_tol_m"]),
+                "end_heading_deg": round(b["entry_b"], 1),
+                "needs_fix": False,
+            }
+
     needs_attention = (any(st.get("needs_fix") for st in stages)
                        or any((st.get("entry_glue") or {}).get("needs_fix")
                               for st in stages))
@@ -1465,3 +1542,138 @@ def plan_stages(venue, doc, counts, footprint_r=0.30, track_margin=0.30,
             "stages": stages,
             "unfittable": unfittable,
             "notes": notes}
+
+
+
+# ----------------------------------------------------------------------
+# Calibration stage (2026-10-08) + planner stages -> active.json legs
+# ----------------------------------------------------------------------
+
+def _calibration_stage(calibration, doc, poly, excl, req, cfg, lat0, lon0,
+                       major_bearing):
+    """(stage, stage_geo, note) for the calibration figure-8, or
+    (None, None, reason) when it fits nowhere. The cleared footprint is the
+    approach loop + the figure-8 at the PLANNED radius bound (R_plan_m), so
+    any real full-lock radius up to that bound stays inside it."""
+    ccfg = calib_mod.config(doc)
+    mode = str(calibration.get("mode") or "full")
+    pts_local = calib_mod.footprint_local(ccfg)
+    target = req + float(cfg["fit_buffer_m"])
+    pin = calibration.get("pin")
+    note = None
+    if pin:
+        x, y = venue_geom.latlon_to_en(float(pin["lat"]), float(pin["lon"]),
+                                       lat0, lon0)
+        h = float(pin.get("heading_deg", 0.0)) % 360.0
+        clr = _min_clear_placed(pts_local, x, y, h, poly, excl, target)
+        if clr < req:
+            note = (f"calibration re-seated at its driven pin clears only "
+                    f"{clr:.2f} m (< {req:.2f} m)")
+    else:
+        cands = _candidates(pts_local, poly, excl, req, cfg,
+                            prefer_heading=major_bearing)
+        if not cands:
+            return None, None, (
+                "calibration figure-8 (R_plan "
+                f"{float(ccfg['R_plan_m']):.2f} m + approach loop) does not "
+                f"fit the venue with {req:.2f} m clearance")
+        _sc, x, y, h = cands[0]
+    approach = _place(calib_mod.approach_local(ccfg), x, y, h)
+    g = cfg["glue"]
+    lat, lon = _en_to_latlon(x, y, lat0, lon0)
+    stage = {
+        "name": "calibration",
+        "calibration": mode,
+        "geometries": [],
+        "experiments": [{
+            "id": "cal1",
+            "recipe": calib_mod.recipe_for(mode, ccfg),
+            "start": {"lat": lat, "lon": lon, "heading_deg": round(h, 1)},
+        }],
+        "glues": [{
+            "mids": [],
+            "waypoints": [dict(zip(("lat", "lon"), _en_to_latlon(e, n, lat0, lon0)))
+                          for (e, n) in approach],
+            "v_const": float(g["v_const"]),
+            "pos_tol_m": float(g["pos_tol_m"]),
+        }],
+        "needs_fix": False,
+    }
+    geo = {"exit_en": (x, y), "exit_b": h, "entry_en": (x, y), "entry_b": h}
+    return stage, geo, note
+
+
+def stages_to_legs(stages, venue, spacing_m=0.3):
+    """Planner stages -> active.json ``plan_stages`` ([{name, legs,
+    entry_glue}]), the exact shape the WebUI builds on Send (lbBuiltLegs /
+    lbBuildPayload in tools/path_gen/interactive.html). Leg i = the glue that
+    ARRIVES at experiment i (glue (i-1) mod n) + experiment i's recipe.
+    Planner glues carry either verbatim waypoints (Dubins / calibration
+    approach) or Bezier control mids between the previous experiment's END
+    and this experiment's start; the mids are sampled with the planner's own
+    _bezier_samples, i.e. the geometry the planner cleared. Used by the
+    run_executor to re-plan without the browser (post-calibration)."""
+    corners = (venue or {}).get("corners_wgs84") or []
+    lat0, lon0 = float(corners[0]["lat"]), float(corners[0]["lon"])
+
+    def _ll(e, n):
+        la, lo = _en_to_latlon(e, n, lat0, lon0)
+        return {"lat": la, "lon": lo}
+
+    out = []
+    for st in stages or []:
+        exps = st.get("experiments") or []
+        glues = st.get("glues") or []
+        n = len(exps)
+        if n == 0:
+            continue
+        ends = []
+        for e in exps:
+            pts = venue_geom.recipe_points_en(e["recipe"], e["start"], lat0, lon0,
+                                              spacing_m=0.10)
+            if not pts:
+                raise ValueError(f"stage {st.get('name')}: recipe "
+                                 f"{e['recipe'].get('type')} is not buildable")
+            ends.append((pts[-1][0], pts[-1][1]))
+        legs = []
+        for i, e in enumerate(exps):
+            gap = (i - 1 + n) % n
+            g = glues[gap] if gap < len(glues) else {}
+            if g.get("waypoints"):
+                wps = [{"lat": float(w["lat"]), "lon": float(w["lon"])}
+                       for w in g["waypoints"]]
+            else:
+                ctrl = [ends[gap]]
+                ctrl += [venue_geom.latlon_to_en(float(m["lat"]), float(m["lon"]),
+                                                 lat0, lon0)
+                         for m in (g.get("mids") or [])]
+                ctrl.append(venue_geom.latlon_to_en(float(e["start"]["lat"]),
+                                                    float(e["start"]["lon"]),
+                                                    lat0, lon0))
+                wps = [_ll(a, b) for (a, b) in _bezier_samples(ctrl, spacing_m)]
+            rec = e["recipe"]
+            R = (rec.get("params") or {}).get("R")
+            name = f"{e['id']}_{rec.get('type')}"
+            if R is not None:
+                name += "_R" + str(R).replace(".", "p")
+            legs.append({"id": f"leg_{i + 1}", "curves": [
+                {"name": f"repo_to_{e['id']}", "kind": "reposition",
+                 "waypoints_wgs84": wps,
+                 "end_heading_deg": float(e["start"]["heading_deg"]),
+                 "v_const": float(g.get("v_const", PLAN_DEFAULTS["glue"]["v_const"])),
+                 "pos_tol_m": float(g.get("pos_tol_m",
+                                          PLAN_DEFAULTS["glue"]["pos_tol_m"]))},
+                {"name": name, "kind": "recipe",
+                 "scored": not calib_mod.is_calib_recipe(rec),
+                 "start_pose": {"lat": float(e["start"]["lat"]),
+                                "lon": float(e["start"]["lon"]),
+                                "heading_deg": float(e["start"]["heading_deg"])},
+                 "recipe": rec},
+            ]})
+        o = {"name": st.get("name"), "legs": legs}
+        if st.get("entry_glue"):
+            o["entry_glue"] = st["entry_glue"]
+        if st.get("wrap_glue"):
+            o["wrap_glue"] = st["wrap_glue"]
+        out.append(o)
+    return out

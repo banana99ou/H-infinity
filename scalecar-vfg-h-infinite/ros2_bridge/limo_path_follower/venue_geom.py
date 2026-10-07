@@ -108,6 +108,15 @@ def recipe_path(recipe):
                               theta_arc=_f("theta_arc", math.pi / 2),
                               L1=_f("L1", 5.0), L_mid=_f("L_mid", 2.0),
                               n_arcs=_i("n_arcs", 6), L_end=_f("L_end", 25.0))
+        if ptype == "calib_fig8":
+            # Steering calibration (calibration.py): the planned figure-8
+            # footprint at its radius bound. Driven open-loop by calib_node,
+            # never by the follower.
+            try:
+                from limo_path_follower.calibration import CalibFig8Path
+            except ImportError:
+                from calibration import CalibFig8Path
+            return CalibFig8Path(_f("R_plan_m", 1.2))
         if ptype.startswith("wiggle_"):
             try:
                 from limo_path_follower.wiggle_path import wiggle_from_recipe

@@ -243,10 +243,14 @@ class Exec:
         self._goto_payload = None
         self._arrival_glue = None
         self._arrival = None
+        self._matrix_doc = {}             # sidecar matrix_epoch (2026-10-08)
         self.pub_goto = _Pub()
 
     def get_logger(self):
         return _Log(self.warnings)
+
+    def _note_repo_outcome(self, _arrived):
+        pass                              # abort-rate pager: not under test here
 
     def _is_alive(self, _name):
         return True

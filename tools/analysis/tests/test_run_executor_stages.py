@@ -38,6 +38,11 @@ _METHODS = {
     # Preflight support-stack bring-up: the executor must start what it needs
     # itself, so no bring-up step can be skipped by an operator (2026-09-16).
     "_ensure_support_procs", "_is_alive", "_orch_start",
+    # Steering calibration / first pass / epoch (2026-10-08): the stage logic
+    # now consults these; a legacy fixed-radius matrix must behave as before.
+    "_is_calib_leg", "_is_calib_recipe", "_calibration_pending",
+    "_calibration_mode_due", "_pass_target", "_geometry_in_matrix",
+    "_epoch_filter",
 }
 
 # Module-level names the extracted methods close over. Pulled from the SOURCE
@@ -49,8 +54,9 @@ _CONSTS = {"SUPPORT_PROCS", "SUPPORT_RETRY_S"}
 def _extract():
     with open(SRC, encoding="utf-8") as f:
         tree = ast.parse(f.read())
+    import calibration   # noqa: E402  (limo_path_follower, on sys.path)
     ns = {"math": math, "manifest": manifest, "venue_geom": venue_geom,
-          "time": time,
+          "time": time, "calibration": calibration,
           "_notify_discord": lambda *_a, **_k: False}
     for node in tree.body:
         if isinstance(node, ast.Assign) and any(
@@ -117,6 +123,11 @@ class Exec:
         self._curve_idx = 0
         self._transit_curve = None
         self._last_completed_leg_idx = None
+        # Legacy fixed-radius matrix (no calibration lock, no first pass).
+        self._matrix_doc = {"_radius_auto": False, "_matrix_epoch": None}
+        self._cal_cfg = {}
+        self._cal_done_session = False
+        self._bag_root = "/nonexistent"
         self.paused = None
         self.status_msgs = []
         self.alerts = []

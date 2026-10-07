@@ -26,6 +26,9 @@ ORCH_NAMES = {
     "odom_zero",
     "follower",
     "reposition",
+    # Steering-calibration figure-8 (calib_node, 2026-10-08): an open-loop
+    # cmd_vel_raw MOVER — motion-capable, refused without the flag below.
+    "calib",
     # Fused-heading provider (compass cal + rate referee). Not a mover.
     "heading",
     # Webui leg-batch executor (the current experiment pathway). Motion-capable:
@@ -117,7 +120,7 @@ def cmd_start(args) -> int:
     if args.name not in ORCH_NAMES:
         print(f"unknown orchestrator process '{args.name}'. Known: {sorted(ORCH_NAMES)}", file=sys.stderr)
         return 2
-    if args.name in {"base", "base_vanilla", "base_gnss", "follower", "reposition", "run_executor", "sequencer", "sequencer_smoke"} and not args.allow_motion_capable:
+    if args.name in {"base", "base_vanilla", "base_gnss", "follower", "reposition", "calib", "run_executor", "sequencer", "sequencer_smoke"} and not args.allow_motion_capable:
         print(
             f"REFUSE: '{args.name}' is motion-capable or can lead to motion. "
             "Pass --allow-motion-capable after confirming the robot state.",

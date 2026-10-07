@@ -42,8 +42,15 @@ def test_planner_through_real_webui_js_passes_loader_gate():
         venue = json.load(f)
     with open(os.path.join(_REPO, "scenarios", "experiment.yaml")) as f:
         doc = yaml.safe_load(f)
+    # radius_m is 'auto' since 2026-10-08 (calibration lock); without a lock
+    # the plan would be EMPTY and every assertion below would pass vacuously.
+    # Plan a representative locked matrix instead (R_min 0.62 m) and require
+    # it to be non-empty.
+    if isinstance(doc["matrix"].get("radius_m"), str):
+        doc["matrix"]["radius_m"] = [1.95, 1.35, 0.95, 0.75]
     plan = ep.plan_stages(venue, doc, {})
     assert plan["ok"], plan
+    assert len(plan["stages"]) >= 4, "planner produced (almost) no stages"
 
     tmp = tempfile.mkdtemp(prefix="hinf_webui_")
     plan_path = os.path.join(tmp, "plan.json")

@@ -122,6 +122,8 @@ class _Exec:
         self._leg_start_utc = None
         self._achieved_anchor = None
         self._arrival = None
+        self._matrix_doc = {}          # sidecar matrix_epoch (2026-10-08)
+        self._replan_needed = False    # preflight -> REPLAN branch (2026-10-08)
 
     def get_logger(self):
         return self.log

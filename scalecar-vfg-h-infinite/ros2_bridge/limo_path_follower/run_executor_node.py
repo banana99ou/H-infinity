@@ -52,7 +52,9 @@ import json
 import math
 import os
 import sys
+import threading
 import time
+from collections import deque
 from datetime import datetime, timezone
 from enum import Enum
 
@@ -98,6 +100,15 @@ except Exception:  # pragma: no cover
     except Exception:
         experiment_planner = None
 
+# Steering calibration (figure-8 -> one-time matrix lock), 2026-10-08.
+try:
+    from limo_path_follower import calibration
+except Exception:  # pragma: no cover
+    try:
+        import calibration  # type: ignore
+    except Exception:
+        calibration = None
+
 # manifest.py (tools/analysis) lives outside the colcon package. It is the source
 # of truth for "which (controller, v_const, rep) cells already passed" — the
 # system (not the operator) chooses the treatment for each authored geometry by
@@ -114,7 +125,13 @@ except Exception:  # pragma: no cover
 PROC_REPOSITION = "reposition"
 PROC_ODOM_ZERO = "odom_zero"
 PROC_FOLLOWER = "follower"
-MOVERS = (PROC_REPOSITION, PROC_FOLLOWER)
+# Open-loop figure-8 steering calibration (calib_node, 2026-10-08). A third
+# cmd_vel_raw mover under the same C6 rule: exactly one of these is alive.
+PROC_CALIB = "calib"
+MOVERS = (PROC_REPOSITION, PROC_FOLLOWER, PROC_CALIB)
+
+# The calibration bag records the D1 set plus the calib node's own status.
+CALIB_EXTRA_TOPICS = ["/calib/status"]
 
 RTK_FIXED = 4
 RTK_OK = (4, 5)
@@ -258,6 +275,9 @@ class Phase(Enum):
     SET_PARAMS = "set_params"
     PUSH_RECIPE = "push_recipe"
     RUN = "run"
+    CALIB_START = "calib_start"
+    CALIB_RUN = "calib_run"
+    REPLAN = "replan"
     STOP_LEG = "stop_leg"
     DONE = "done"
     PAUSED = "paused"
@@ -304,8 +324,20 @@ class RunExecutor(Node):
         self.declare_parameter("inter_curve_dwell_s", 5.0)
         # Glue (reposition) cruise speed cap. 0.40 m/s oscillated on a tight
         # hook while the heading EKF was being dragged by a relapsing FCU
-        # (field 2026-06-10); 0.2 gives pure pursuit and COG twice the time.
-        self.declare_parameter("reposition_speed_mps", 0.2)
+        # (field 2026-06-10); 0.2 gave pure pursuit and COG twice the time.
+        # 2026-10-08 -> 0.4 (operator): with full steering (driver direct
+        # mode) a replay of the 71 repositions of 2026-10-06 through the real
+        # reposition code arrives identically at 0.2/0.4/0.5 in half the time.
+        # LIVE-settable (ros2 param set /run_executor_node
+        # reposition_speed_mps 0.3): takes effect at the next reposition.
+        # Repeated reposition aborts raise an operator card suggesting 0.3.
+        self.declare_parameter("reposition_speed_mps", 0.4)
+        self.declare_parameter("repo_abort_window", 5)
+        self.declare_parameter("repo_abort_alert_n", 2)
+        # Calibration figure-8: hard cap on the whole open-loop run.
+        self.declare_parameter("calib_timeout_s", 240.0)
+        # Post-calibration re-plan (pure geometry, threaded): give up after.
+        self.declare_parameter("replan_timeout_s", 420.0)
 
         self._active_file = str(self.get_parameter("active_venue_file").value)
         self._bag_root = str(self.get_parameter("bag_root").value)
@@ -330,6 +362,13 @@ class RunExecutor(Node):
             self.get_parameter("arrival_heading_tol_deg").value)
         self._dwell_s = float(self.get_parameter("inter_curve_dwell_s").value)
         self._repo_speed = float(self.get_parameter("reposition_speed_mps").value)
+        self._repo_outcomes = deque(
+            maxlen=max(1, int(self.get_parameter("repo_abort_window").value)))
+        self._repo_alert_n = int(self.get_parameter("repo_abort_alert_n").value)
+        self._repo_alerted = False
+        self._calib_timeout = float(self.get_parameter("calib_timeout_s").value)
+        self._replan_timeout = float(self.get_parameter("replan_timeout_s").value)
+        self.add_on_set_parameters_callback(self._on_set_params)
         self._dwell_until = 0.0
         self._batt_warned = False
 
@@ -346,6 +385,24 @@ class RunExecutor(Node):
         self._transit_curve = None           # one-shot synthetic repo curve
         self._cur_recipe = {}
         self._matrix_doc = {}    # raw experiment.yaml (planner input)
+        # Steering calibration (2026-10-08). _matrix_doc carries the lock the
+        # radii came from (manifest.load_experiment resolves radius_m: auto).
+        self._cal_cfg = dict(calibration.DEFAULTS) if calibration else {}
+        self._cal_done_session = False   # a figure-8 passed since this Start
+        self._cur_calib = False          # the current recipe is the figure-8
+        self._cal_mode = None            # 'full' | 'sanity' for the running one
+        self._cal_seq = 0
+        self._cal_req = None
+        self._cal_req_sent = False
+        self._cal_req_last_t = 0.0
+        self._cal_status = {}
+        self._cal_status_t = None
+        self._cal_result = None
+        self._cal_pin = None
+        self._replan_thread = None
+        self._replan_out = None
+        self._replan_gen = 0
+        self._replan_needed = False
 
         # -- Matrix / treatment sweep (system chooses controller x v x rep) ---
         # The operator authors only GEOMETRY (step shape at radius R); the system
@@ -434,6 +491,7 @@ class RunExecutor(Node):
         self.pub_recipe = self.create_publisher(
             String, "/reference_path_recipe", latched)
         self.pub_plan = self.create_publisher(String, "/plan/result", latched)
+        self.pub_calib_req = self.create_publisher(String, "/calib/request", 10)
         # Operator cards in the battle-station browser (/operator/alert JSON).
         # Latched with a short history so a reconnecting browser replays the
         # recent events (a later "clear" for the same id cancels its card).
@@ -463,6 +521,8 @@ class RunExecutor(Node):
             String, "/heading/fused_status", self._on_heading_status, latched)
         self.create_subscription(
             NavSatFix, "/gps_rtk_f9p_helical/gps/fix", self._on_fix, 10)
+        self.create_subscription(
+            String, "/calib/status", self._on_calib_status, latched)
         try:
             from limo_msgs.msg import LimoStatus  # type: ignore
             self.create_subscription(LimoStatus, "/limo_status", self._on_limo, 10)
@@ -571,12 +631,16 @@ class RunExecutor(Node):
             return
         run_id = str(venue.get("name") or "run")
         counts = self._counts_for(run_id)
+        # Steering calibration first (2026-10-08): 'full' until the matrix is
+        # locked, a short 'sanity' figure-8 once a session; None skips it.
+        mode = self._calibration_mode_due()
         try:
             plan = experiment_planner.plan_stages(
                 venue, self._matrix_doc, counts,
                 footprint_r=self._footprint_r,
                 track_margin=self._track_margin,
-                key_fn=manifest.cell_key)
+                key_fn=manifest.cell_key,
+                calibration=({"mode": mode} if mode else None))
         except Exception as exc:  # noqa: BLE001 - never die in a callback
             _fail(f"planner crashed: {exc!r}")
             return
@@ -622,6 +686,43 @@ class RunExecutor(Node):
 
     def _on_odom(self, msg):
         self._last_odom_t = time.monotonic()
+
+    def _on_calib_status(self, msg):
+        try:
+            d = json.loads(msg.data)
+        except (ValueError, TypeError):
+            return
+        if isinstance(d, dict):
+            self._cal_status = d
+            self._cal_status_t = time.monotonic()
+
+    def _on_set_params(self, params):
+        """Live parameter updates. reposition_speed_mps is the field knob
+        (DOC/agent_field_runbook.md §7): applied at the next reposition."""
+        from rcl_interfaces.msg import SetParametersResult
+        for prm in params:
+            if prm.name == "reposition_speed_mps":
+                try:
+                    v = float(prm.value)
+                except (TypeError, ValueError):
+                    return SetParametersResult(
+                        successful=False, reason="reposition_speed_mps: not a number")
+                if not (0.1 <= v <= 0.6):
+                    return SetParametersResult(
+                        successful=False,
+                        reason="reposition_speed_mps must be within [0.1, 0.6] m/s")
+        for prm in params:
+            if prm.name == "reposition_speed_mps":
+                old, self._repo_speed = self._repo_speed, float(prm.value)
+                self._repo_outcomes.clear()
+                self._repo_alerted = False
+                self.get_logger().warn(
+                    f"reposition_speed_mps {old:.2f} -> {self._repo_speed:.2f} m/s "
+                    "(applies from the next reposition)")
+                self._operator_alert(
+                    "repo_speed", "info", "REPOSITION SPEED",
+                    f"now {self._repo_speed:.2f} m/s (was {old:.2f}).")
+        return SetParametersResult(successful=True)
 
     def _on_driver_config(self, msg):
         try:
@@ -682,17 +783,25 @@ class RunExecutor(Node):
     def _is_alive(self, name):
         return bool(self._orch_status.get(name, False))
 
-    def _other_mover(self, name):
-        return PROC_FOLLOWER if name == PROC_REPOSITION else PROC_REPOSITION
+    def _other_movers(self, name):
+        return [m for m in MOVERS if m != name]
 
     def _start_exclusive_mover(self, name):
-        """Bring up one cmd_vel_raw mover, guaranteeing C6. Returns
+        """Bring up one cmd_vel_raw mover, guaranteeing C6 (every OTHER mover
+        is reported down by the orchestrator first). Returns
         'killing_other' | 'waiting_other_down' | 'started'."""
-        other = self._other_mover(name)
-        if self._is_alive(other):
-            self._orch_kill(other)
+        others = self._other_movers(name)
+        alive = [m for m in others if self._is_alive(m)]
+        if alive:
+            for m in alive:
+                self._orch_kill(m)
             return "killing_other"
-        if other not in self._orch_status:
+        # Wait until the orchestrator has reported every other mover down.
+        # 'calib' is exempt: a PROC table without it (older orchestrator)
+        # can never have it alive.
+        unknown = [m for m in others
+                   if m not in self._orch_status and m != PROC_CALIB]
+        if unknown:
             return "waiting_other_down"
         if not self._is_alive(name):
             self._orch_start(name)
@@ -736,7 +845,9 @@ class RunExecutor(Node):
              # Planner-emitted inter-stage transit glue (C, 2026-06-11): the
              # curve from the PREVIOUS stage's exit pose into this stage's
              # first start pin. Optional — absent means path-join fallback.
-             "entry_glue": st.get("entry_glue")}
+             "entry_glue": st.get("entry_glue"),
+             # First-pass wrap (2026-10-08): last stage -> this one.
+             "wrap_glue": st.get("wrap_glue")}
             for i, st in enumerate(v.get("plan_stages") or [])
             if st.get("legs")]
         self._stage_idx = 0
@@ -752,11 +863,16 @@ class RunExecutor(Node):
             self.get_logger().error("manifest tooling unavailable — cannot sweep")
             return False
         try:
+            _expected, reps, doc = manifest.load_experiment(
+                self._experiment_yaml, bag_root=self._bag_root)
+        except TypeError:   # pre-2026-10-08 manifest (no bag_root): fixed radii
             _expected, reps, doc = manifest.load_experiment(self._experiment_yaml)
         except Exception as exc:
             self.get_logger().error(f"load_experiment failed: {exc}")
             return False
         self._matrix_doc = doc or {}
+        if calibration is not None:
+            self._cal_cfg = calibration.config(self._matrix_doc)
         matrix = doc.get("matrix") or {}
         self._controllers = [str(c) for c in (matrix.get("controller") or [])]
         self._speeds = [float(v) for v in (matrix.get("v_const") or [])]
@@ -782,11 +898,14 @@ class RunExecutor(Node):
         except Exception as exc:
             self.get_logger().warn(f"manifest scan failed: {exc}")
             return counts
+        auto, epoch = self._epoch_filter()
         for r in rows:
             if r.get("sidecar_pass") is not True:
                 continue
             if str(r.get("run_id")) != str(run_id):
                 continue          # other venue/batch — must not mark us done
+            if auto and (epoch is None or r.get("matrix_epoch") != epoch):
+                continue          # another lock's matrix (e.g. stock-driver legs)
             # Bag-level re-gate: pre-2026-06-12 sidecars say pass on
             # recorder-broken bags; those cells must be refilled, not skipped.
             if hasattr(manifest, "quick_gate") and not manifest.quick_gate(
@@ -816,7 +935,12 @@ class RunExecutor(Node):
         if manifest is None:
             return None
         try:
-            expected, reps, _doc = manifest.load_experiment(self._experiment_yaml)
+            try:
+                expected, reps, _doc = manifest.load_experiment(
+                    self._experiment_yaml, bag_root=self._bag_root)
+            except TypeError:
+                expected, reps, _doc = manifest.load_experiment(
+                    self._experiment_yaml)
             rows = manifest.build_rows(manifest.discover_legs(self._bag_root))
         except Exception as exc:
             self.get_logger().warn(f"progress scan failed: {exc}")
@@ -826,7 +950,10 @@ class RunExecutor(Node):
             return None
         per_cell = {k: 0 for k in expected}
         failed = 0
+        auto, epoch = self._epoch_filter()
         for r in rows:
+            if auto and (epoch is None or r.get("matrix_epoch") != epoch):
+                continue
             k = manifest.cell_key({
                 "controller": r.get("controller"), "v_const": r.get("v_const"),
                 "path_family": r.get("path_family"),
@@ -864,11 +991,13 @@ class RunExecutor(Node):
 
     def _geometry_of(self, leg):
         """(path_family, R) for the leg's scored recipe, or None for glue /
-        unscored / non-recipe legs (never swept)."""
+        unscored / non-recipe / calibration legs (never swept)."""
         rec = self._recipe_curve(leg)
         if not rec or not bool(rec.get("scored", True)):
             return None
         recipe = rec.get("recipe") or {}
+        if self._is_calib_recipe(recipe):
+            return None
         fam = recipe.get("type")
         R = (recipe.get("params") or {}).get("R")
         if fam is None or R is None:
@@ -901,6 +1030,8 @@ class RunExecutor(Node):
         if geom is None:
             return None
         fam, R = geom
+        if not self._geometry_in_matrix(fam, R):
+            return None      # an old plan's geometry, not in the locked matrix
         best = None   # (attempts, done, order, c, v)
         order = 0
         for c in self._controllers:
@@ -909,7 +1040,7 @@ class RunExecutor(Node):
                 key = self._cell_key_for(fam, R, c, v)
                 if key is None:
                     continue
-                if self._completed_counts.get(key, 0) >= self._target_n:
+                if self._completed_counts.get(key, 0) >= self._pass_target():
                     continue
                 att = self._attempts.get((fam, R, c, v), 0)
                 if att >= self._max_retries:
@@ -932,7 +1063,78 @@ class RunExecutor(Node):
         return {"controller": c, "v_const": float(v), "rep": int(done)}
 
     def _all_geometries_done(self):
+        """True when the CURRENT leg list has nothing left to drive: no
+        geometry with a remaining treatment and no pending calibration."""
+        if any(self._is_calib_leg(lg) for lg in self._legs):
+            return not self._calibration_pending()
         return all(self._next_treatment_for(lg) is None for lg in self._legs)
+
+    # -- Steering calibration (2026-10-08) --------------------------------
+
+    @staticmethod
+    def _is_calib_recipe(recipe):
+        return str((recipe or {}).get("type", "")).lower() == "calib_fig8"
+
+    def _is_calib_leg(self, leg):
+        rec = self._recipe_curve(leg)
+        return bool(rec) and self._is_calib_recipe(rec.get("recipe"))
+
+    def _calibration_mode_due(self):
+        """'full' (no matrix lock yet) | 'sanity' (lock exists, no passing
+        figure-8 within recheck_after_h) | None."""
+        if calibration is None:
+            return None
+        lock = (self._matrix_doc or {}).get("_matrix_lock")
+        last = None
+        if lock is not None:
+            last = calibration.last_pass_utc(
+                calibration.checks_path(self._bag_root), lock.get("epoch"))
+        return calibration.mode_due(self._cal_cfg, lock, last)
+
+    def _calibration_pending(self):
+        return (not self._cal_done_session
+                and self._calibration_mode_due() is not None)
+
+    def _pass_target(self):
+        """Per-cell target for treatment selection. plan.first_pass_reps
+        (experiment.yaml, 2026-10-08): until EVERY cell of the batch has that
+        many passing runs, stages fill only to it, so a short field day
+        still ends with a balanced first pass across the whole matrix."""
+        n = int(self._target_n or 0)
+        fp = int(((self._matrix_doc or {}).get("plan") or {}).get(
+            "first_pass_reps", 0) or 0)
+        if fp <= 0 or fp >= n:
+            return n
+        for fam, R in self._scored_geometries():
+            for c in self._controllers:
+                for v in self._speeds:
+                    key = self._cell_key_for(fam, R, c, v)
+                    if key is not None and self._completed_counts.get(key, 0) < fp:
+                        return fp
+        return n
+
+    def _geometry_in_matrix(self, fam, R):
+        """With radius_m: auto only (family, R) of the current lock are
+        swept; fixed matrices keep the legacy behaviour (any authored R)."""
+        doc = self._matrix_doc or {}
+        if not doc.get("_radius_auto"):
+            return True
+        m = doc.get("matrix") or {}
+        by_fam = m.get("radius_m_by_family") or {}
+        try:
+            r = round(float(R), 6)
+        except (TypeError, ValueError):
+            return False
+        fams = [str(f) for f in (m.get("path_family") or [])]
+        return str(fam) in fams and r in {
+            round(float(x), 6) for x in by_fam.get(str(fam), m.get("radius_m") or [])}
+
+    def _epoch_filter(self):
+        """(radius_auto, epoch): with radius_m: auto only legs recorded under
+        the current calibration lock count (stock-driver legs and any other
+        lock's legs never credit this matrix)."""
+        doc = self._matrix_doc or {}
+        return bool(doc.get("_radius_auto")), doc.get("_matrix_epoch")
 
     def _all_leg_lists(self):
         """Every stage's legs (global progress scope); [current] when the
@@ -1020,11 +1222,16 @@ class RunExecutor(Node):
     def _advance_stage(self):
         """After the current stage's geometries fill: move to the next stage
         with work, containment-gate it, and continue the batch unattended.
-        Returns 'advanced' | 'paused' | 'none'."""
+        Searches forward first, then wraps to the start (the first-pass
+        sweep, plan.first_pass_reps, revisits every stage). Returns
+        'advanced' | 'paused' | 'none'."""
         if not self._stages:
             return "none"
         old = self._stages[self._stage_idx]
-        for i in range(self._stage_idx + 1, len(self._stages)):
+        n_st = len(self._stages)
+        order = (list(range(self._stage_idx + 1, n_st))
+                 + list(range(0, self._stage_idx + 1)))
+        for i in order:
             st = self._stages[i]
             self._legs = st["legs"]
             if self._all_geometries_done():
@@ -1042,6 +1249,10 @@ class RunExecutor(Node):
             # credit) leaves the robot somewhere the glue does not start.
             self._transit_curve = None
             eg = st.get("entry_glue")
+            wg = st.get("wrap_glue")
+            if not (eg and eg.get("from_stage") == old["name"]) and (
+                    wg and wg.get("from_stage") == old["name"]):
+                eg = wg      # first-pass wrap: last stage -> first matrix stage
             if eg and eg.get("from_stage") == old["name"]:
                 self._transit_curve = self._build_transit(
                     old["legs"], self._last_completed_leg_idx, eg)
@@ -1151,6 +1362,35 @@ class RunExecutor(Node):
         # Same reason: a glue snapshot from before the pause/abort did not
         # bring the robot to wherever the next recipe starts.
         self._arrival_glue = None
+        # Steering calibration bookkeeping (2026-10-08).
+        self._replan_thread = None
+        self._replan_gen += 1
+        self._replan_out = None
+        self._replan_needed = False
+        has_calib = any(self._is_calib_leg(lg) for st in (self._stages or [])
+                        for lg in st["legs"]) or any(
+                            self._is_calib_leg(lg) for lg in (self._legs or []))
+        auto, _epoch = self._epoch_filter()
+        radii = ((self._matrix_doc or {}).get("matrix") or {}).get("radius_m") or []
+        if auto and not radii and not has_calib:
+            self._pause("no steering calibration yet and this batch has no "
+                        "figure-8 — press Auto-plan, Send, Start (the plan now "
+                        "starts with the calibration)")
+            return
+        matrix_stages = [st for st in (self._stages or [])
+                         if not any(self._is_calib_leg(lg) for lg in st["legs"])]
+        if (auto and radii and has_calib and not matrix_stages
+                and not self._calibration_pending()):
+            # The lock exists but the batch is still calibration-only (the
+            # post-lock re-plan was interrupted): re-plan after preflight.
+            cal_leg = next(lg for st in self._stages for lg in st["legs"]
+                           if self._is_calib_leg(lg))
+            self._cal_pin = dict(self._recipe_curve(cal_leg).get("start_pose") or {})
+            self._replan_needed = True
+            self.get_logger().info("calibration-only batch with a lock: "
+                                   "will re-plan the matrix after preflight.")
+            self._enter(Phase.PREFLIGHT)
+            return
         if not self._select_stage_with_work():
             self._enter(Phase.DONE)
             return
@@ -1202,12 +1442,36 @@ class RunExecutor(Node):
         if kind == "reposition":
             self._cur_treatment = None   # glue move — no scored treatment
             self._cur_scored = False
+            self._cur_calib = False
             self._enter(Phase.REPOSITION_START)
+        elif kind == "recipe" and self._is_calib_recipe(self._cur_curve.get("recipe")):
+            # Steering calibration figure-8 (open loop, calib_node). Driven only
+            # while one is due this session; otherwise skipped like a full
+            # geometry (the robot just continues to the next glue).
+            self._cur_treatment = None
+            self._cur_scored = False
+            mode = self._calibration_mode_due()
+            if self._cal_done_session or mode is None:
+                self.get_logger().info("calibration not due — skipping the figure-8.")
+                self._advance_curve()
+                return
+            self._cur_calib = True
+            self._cal_mode = mode
+            self.get_logger().info(
+                f"leg '{self._leg_id(self._leg_idx)}': steering calibration "
+                f"figure-8 ({mode}).")
+            self._operator_alert(
+                "calibration", "info", f"CALIBRATION ({mode.upper()})",
+                "measuring full-lock turning (open-loop figure-8"
+                + (" at 0.5 and 1.0 m/s" if mode == "full" else " at 1.0 m/s")
+                + "). Keep clear; the robot turns tight circles.")
+            self._enter(Phase.KILL_REPOSITION)
         elif kind == "recipe":
             # The SYSTEM picks the treatment (controller x v_const x rep) for this
             # geometry from the matrix + manifest. None => geometry already full /
             # retry-exhausted / unscored => drive it UNSCORED as glue (no bag /
             # sidecar / FIXED gate) so the next reposition still lines up.
+            self._cur_calib = False
             self._cur_treatment = self._next_treatment_for(self._legs[self._leg_idx])
             self._cur_scored = (self._cur_treatment is not None
                                 and bool(self._cur_curve.get("scored", True)))
@@ -1365,6 +1629,10 @@ class RunExecutor(Node):
             missing.append(f"battery {self._battery_v:.2f}V < {self._batt_halt}V")
         if not missing:
             self.get_logger().info("preflight pass")
+            if self._replan_needed:
+                self._replan_needed = False
+                self._enter(Phase.REPLAN)
+                return
             self._begin_current_curve()
             return
         if self._in_phase_s() > self._preflight_timeout:
@@ -1456,13 +1724,34 @@ class RunExecutor(Node):
             # _advance_curve replaces _cur_curve with the recipe: snapshot the
             # glue we arrived on NOW, for the next odom reset to record.
             self._snapshot_glue_arrival()
+            self._note_repo_outcome(True)
             self._advance_curve()
         elif self._repo_state == "aborted":
             self._goto_sent = False
+            self._note_repo_outcome(False)
             self._pause("reposition aborted: " + self._repo_reason())
         elif self._in_phase_s() > self._reposition_timeout:
             self._goto_sent = False
             self._pause("reposition goto timeout")
+
+    def _note_repo_outcome(self, arrived):
+        """Field rule 2026-10-08 (DOC/agent_field_runbook.md §7): when
+        repositions keep aborting at the faster glue speed, page the operator
+        (and their agent) with the exact command to drop back to 0.3 m/s."""
+        self._repo_outcomes.append(bool(arrived))
+        n_abort = sum(1 for a in self._repo_outcomes if not a)
+        if (n_abort >= self._repo_alert_n and self._repo_speed > 0.3 + 1e-6
+                and not self._repo_alerted):
+            self._repo_alerted = True
+            msg = (f"{n_abort} of the last {len(self._repo_outcomes)} repositions "
+                   f"aborted at {self._repo_speed:.2f} m/s. Drop the glue speed to "
+                   "0.3 m/s: ros2 param set /run_executor_node "
+                   "reposition_speed_mps 0.3   (then press Start to resume; "
+                   "if 0.3 still fails, 0.2 is the old proven value — ask before "
+                   "going lower or back up).")
+            self.get_logger().warn("REPOSITION ABORTS: " + msg)
+            self._operator_alert("repo_speed", "warn",
+                                 "REPOSITIONS KEEP ABORTING", msg)
 
     def _tick_kill_reposition(self):
         if self._is_alive(PROC_REPOSITION):
@@ -1682,9 +1971,10 @@ class RunExecutor(Node):
 
     def _tick_bag_start(self):
         curve = self._cur_curve
-        scored = self._cur_scored
+        scored = self._cur_scored or self._cur_calib
         # RTK FIXED(4) gate for scored runs: the bag's RTK is the post-hoc ground
-        # truth, so do not start recording until FIXED.
+        # truth, so do not start recording until FIXED. The calibration needs it
+        # too (its containment guard and the RTK radius cross-check).
         if scored and self._rtk_quality != RTK_FIXED:
             if self._in_phase_s() < self._rtk_fix_wait:
                 self._publish_status(
@@ -1694,7 +1984,8 @@ class RunExecutor(Node):
                 f"RTK not FIXED(4) for scored run (q={self._rtk_quality})")
             return
         self._reset_run_scratch()
-        self._leg_cell_id = self._cell_id_for(curve)
+        self._leg_cell_id = (f"calibration_{self._cal_mode}" if self._cur_calib
+                             else self._cell_id_for(curve))
         if scored:
             if Data_Logger is None:
                 self._pause("recorder unavailable (Data_Logger import failed)")
@@ -1703,9 +1994,15 @@ class RunExecutor(Node):
                 dirname = Data_Logger.build_leg_dirname(
                     self._run_id, self._leg_cell_id,
                     self._leg_id(self._leg_idx))
-                self._leg_bag_path = os.path.join(self._bag_root, dirname)
+                root = (calibration.lock_dir(self._bag_root)
+                        if self._cur_calib and calibration is not None
+                        else self._bag_root)
+                self._leg_bag_path = os.path.join(root, dirname)
+                topics = list(Data_Logger.TOPICS)
+                if self._cur_calib:
+                    topics += [t for t in CALIB_EXTRA_TOPICS if t not in topics]
                 self._recorder = Data_Logger.BagRecorder(
-                    self._leg_bag_path, topics=Data_Logger.TOPICS)
+                    self._leg_bag_path, topics=topics)
                 self._recorder.start()
                 self._leg_start_utc = datetime.now(timezone.utc).isoformat()
                 self._leg_driver_cfg_start = self._driver_cfg
@@ -1713,7 +2010,83 @@ class RunExecutor(Node):
                 self._recorder = None
                 self._pause(f"bag start failed: {exc}")
                 return
-        self._enter(Phase.FOLLOWER_START)
+        self._enter(Phase.CALIB_START if self._cur_calib else Phase.FOLLOWER_START)
+
+    def _tick_calib_start(self):
+        res = self._start_exclusive_mover(PROC_CALIB)
+        if res == "started":
+            self._cal_seq += 1
+            self._cal_req = None
+            self._cal_req_sent = False
+            self._cal_req_last_t = 0.0
+            self._cal_result = None
+            self._run_end_reason = None
+            self._enter(Phase.CALIB_RUN)
+        elif self._in_phase_s() > self._reposition_timeout:
+            self._pause("calibration node start timeout")
+
+    def _calib_request(self):
+        """The /calib/request payload for the current figure-8 (calib_node
+        contract: scratchpad spec / calib_node.py docstring)."""
+        cfg = self._cal_cfg
+        recipe = (self._cur_curve or {}).get("recipe") or {}
+        params = recipe.get("params") or {}
+        speeds = (cfg["full_speeds"] if self._cal_mode == "full"
+                  else cfg["sanity_speeds"])
+        r_plan = float(params.get("R_plan_m", cfg["R_plan_m"]))
+        sp = (self._cur_curve or {}).get("start_pose") or {}
+        v = self._venue or {}
+        return {
+            "seq": self._cal_seq,
+            "mode": self._cal_mode,
+            "speeds": [float(x) for x in speeds],
+            "steer_cmd_rad": float(params.get("steer_cmd_rad", cfg["steer_cmd_rad"])),
+            "R_plan_m": r_plan,
+            "turn_deg": float(params.get("turn_deg", cfg["turn_deg"])),
+            "pin": {"lat": float(sp.get("lat")), "lon": float(sp.get("lon")),
+                    "heading_deg": float(sp.get("heading_deg", 0.0))},
+            "venue": {"corners_wgs84": v.get("corners_wgs84") or [],
+                      "exclusions": v.get("exclusions") or []},
+            "min_clearance_m": max(float(cfg["min_clearance_m"]),
+                                   float(v.get("safety_margin_m", 0.0) or 0.0)),
+            "max_radius_m": 2.0 * r_plan + float(cfg["radius_slack_m"]),
+            "max_duration_s": float(cfg["max_duration_s"]),
+        }
+
+    def _tick_calib_run(self):
+        if not self._is_alive(PROC_CALIB):
+            if self._in_phase_s() > self._settle_s + 5.0:
+                self._end_run("calibration node not alive")
+            return
+        st = self._cal_status if isinstance(self._cal_status, dict) else {}
+        acked = st.get("seq") == self._cal_seq
+        if not acked:
+            # Re-send at ~1 Hz until the node echoes our seq (the goto idiom:
+            # a single volatile publish can race the fresh node's DDS match).
+            if (self.pub_calib_req.get_subscription_count() >= 1
+                    and time.monotonic() - self._cal_req_last_t >= 1.0):
+                try:
+                    if self._cal_req is None:
+                        self._cal_req = self._calib_request()
+                except (TypeError, ValueError, KeyError) as exc:
+                    self._end_run(f"calibration request malformed: {exc!r}")
+                    return
+                self.pub_calib_req.publish(String(data=json.dumps(self._cal_req)))
+                self._cal_req_sent = True
+                self._cal_req_last_t = time.monotonic()
+            if self._in_phase_s() > 30.0:
+                self._end_run("calibration request never acknowledged")
+            return
+        state = str(st.get("state", "")).lower()
+        if state in ("done", "aborted"):
+            self._cal_result = st.get("result") or {}
+            self._run_end_reason = ("done" if state == "done"
+                                    else "calibration aborted: "
+                                    + str(st.get("reason") or "?"))
+            self._enter(Phase.STOP_LEG)
+            return
+        if self._in_phase_s() > self._calib_timeout:
+            self._end_run("calibration timeout")
 
     def _tick_follower_start(self):
         res = self._start_exclusive_mover(PROC_FOLLOWER)
@@ -1831,6 +2204,10 @@ class RunExecutor(Node):
             except Exception as exc:
                 self.get_logger().warn(f"bag stop error: {exc}")
             self._recorder = None
+        if self._cur_calib:
+            self._orch_kill(PROC_CALIB)     # release cmd_vel_raw (C6)
+            self._finish_calibration(curve, info)
+            return
         # Release cmd_vel_raw before anything else moves (C6).
         self._orch_kill(PROC_FOLLOWER)
         reached = (self._run_end_reason == "done")
@@ -1871,6 +2248,286 @@ class RunExecutor(Node):
 
     def _tick_aborted(self):
         pass
+
+    # ==================================================================
+    # Steering calibration: verdict, lock, re-plan (2026-10-08)
+    # ==================================================================
+
+    def _finish_calibration(self, curve, bag_info):
+        """After the figure-8: record it, then
+          full   -> lock the matrix radii (once) and re-plan the matrix here,
+          sanity -> compare with the lock and continue,
+        or pause with a card the operator / their agent can act on."""
+        mode = self._cal_mode
+        result = self._cal_result if isinstance(self._cal_result, dict) else {}
+        now = datetime.now(timezone.utc)
+        cfg = self._cal_cfg
+        lock_doc = (self._matrix_doc or {}).get("_matrix_lock")
+        record = {"stamp_utc": now.isoformat(), "mode": mode, "ok": False,
+                  "epoch": (lock_doc or {}).get("epoch"), "reason": None,
+                  "bag": self._leg_bag_path, "run_id": self._run_id,
+                  "venue": (self._venue or {}).get("name"),
+                  "pin": (curve or {}).get("start_pose"),
+                  "end_reason": self._run_end_reason,
+                  "driver_config": self._driver_cfg, "result": result}
+        verdict, why, new_lock = False, None, None
+        try:
+            if self._run_end_reason != "done":
+                why = str(self._run_end_reason)
+            elif not result.get("ok"):
+                why = f"figure-8 measurement not usable: {result.get('reason')}"
+            elif mode == "full":
+                lock, err = calibration.compute_lock(
+                    result, cfg, now_utc=now,
+                    source={"bag": self._leg_bag_path, "run_id": self._run_id,
+                            "venue": (self._venue or {}).get("name"),
+                            "driver_config": self._driver_cfg})
+                if lock is None:
+                    why = err
+                else:
+                    path = calibration.lock_path(self._bag_root)
+                    try:
+                        calibration.write_lock(path, lock)
+                        verdict, new_lock = True, lock
+                        record["epoch"] = lock["epoch"]
+                        why = (f"locked R_min {lock['R_min_m']:.2f} m -> "
+                               f"radii {lock['radius_m']}")
+                    except FileExistsError:
+                        # Someone locked meanwhile: judge this run against it.
+                        existing = calibration.load_lock(path)
+                        record["mode"] = mode = "sanity"
+                        record["epoch"] = (existing or {}).get("epoch")
+                        verdict, why, _r = calibration.sanity_check(
+                            result, existing, cfg)
+            else:
+                if lock_doc is None:
+                    why = "no matrix lock to check the sanity figure-8 against"
+                else:
+                    verdict, why, _r = calibration.sanity_check(result, lock_doc, cfg)
+        except Exception as exc:  # noqa: BLE001 - a verdict must not crash the node
+            verdict, why = False, f"calibration bookkeeping failed: {exc!r}"
+        record["ok"] = bool(verdict)
+        record["reason"] = why
+        try:
+            calibration.append_check(calibration.checks_path(self._bag_root), record)
+        except Exception as exc:  # noqa: BLE001
+            self.get_logger().error(f"calibration check log write failed: {exc}")
+        self._write_calib_sidecar(curve, bag_info, record)
+        self.get_logger().info(f"calibration ({mode}) verdict ok={verdict}: {why}")
+        if not verdict:
+            msg = f"{mode} calibration FAILED: {why}"
+            self._operator_alert(
+                "calibration", "critical", "CALIBRATION FAILED",
+                msg + " — press Start to retry the figure-8. If it fails again, "
+                "stop and report this card.")
+            self._pause(msg)
+            return
+        self._cal_done_session = True
+        if new_lock is not None:
+            warn = ("; WARN " + " | ".join(new_lock["warnings"])
+                    if new_lock.get("warnings") else "")
+            self._operator_alert(
+                "calibration", "info", "R_min LOCKED",
+                f"R_min {new_lock['R_min_m']:.2f} m at {new_lock['lock_speed']:g} "
+                f"m/s -> matrix R = {new_lock['radius_m']} (epoch "
+                f"{new_lock['epoch']}){warn}. Planning the matrix now "
+                "(~1-2 min, the robot stays still).")
+            self._cal_pin = dict((curve or {}).get("start_pose") or {})
+            self._enter(Phase.REPLAN)
+            return
+        self._operator_alert("calibration", "info", "CALIBRATION OK", str(why))
+        self._advance_curve()
+
+    def _write_calib_sidecar(self, curve, bag_info, record):
+        """Sidecar next to the calibration bag. path_family calib_fig8 is not
+        a matrix family, so the manifest never credits it to a cell."""
+        if not self._leg_bag_path:
+            return
+        try:
+            sc = {
+                "schema_version": "calibration-1",
+                "run_id": self._run_id,
+                "cell_id": self._leg_cell_id,
+                "leg": self._leg_id(self._leg_idx),
+                "cell_params": {"controller": None, "v_const": None,
+                                "radius_m": None, "path_family": "calib_fig8",
+                                "rep": 0},
+                "classification": {"pass": bool(record.get("ok")),
+                                   "reached_end": self._run_end_reason == "done",
+                                   "end_reason": self._run_end_reason},
+                "wallclock": {"start_utc": self._leg_start_utc,
+                              "end_utc": (bag_info or {}).get("end_utc"),
+                              "duration_s": (bag_info or {}).get("duration_s")},
+                "venue": {"venue_id": (self._venue or {}).get("name")},
+                "bag_path": self._leg_bag_path,
+                "calibration": record,
+                "driver_config": {"at_start": self._leg_driver_cfg_start,
+                                  "at_end": self._driver_cfg},
+                "achieved_anchor": self._achieved_anchor,
+            }
+            json.dumps(sc, allow_nan=False)
+            Data_Logger.write_sidecar(self._leg_bag_path, sc)
+        except Exception as exc:  # noqa: BLE001
+            self.get_logger().error(f"calibration sidecar write failed: {exc!r}")
+
+    def _replan_worker(self, gen, venue, doc, counts, pin):
+        """Background thread: plan the locked matrix around the figure-8 just
+        driven and build the active.json stages (pure geometry; no ROS).
+        Publishes (gen, out); a stale generation (Start/pause in between) is
+        ignored by _tick_replan."""
+        out = None
+        try:
+            plan = experiment_planner.plan_stages(
+                venue, doc, counts, footprint_r=self._footprint_r,
+                track_margin=self._track_margin, key_fn=manifest.cell_key,
+                calibration={"mode": "full", "pin": pin})
+            stages = plan.get("stages") or []
+            if not stages:
+                raise ValueError("planner returned no stages: "
+                                 + "; ".join(plan.get("notes") or []))
+            dropped = []
+            keep = []
+            for st in stages:
+                if st.get("needs_fix"):
+                    dropped.append(f"{st.get('name')} "
+                                   f"{[(g['family'], g['R']) for g in st.get('geometries') or []]}"
+                                   " (no clean placement)")
+                    continue
+                keep.append(st)
+            final = []
+            for st in experiment_planner.stages_to_legs(keep, venue):
+                ok, rep_ = venue_geom.check_legs_containment(
+                    st["legs"], venue, self._footprint_r, self._track_margin)
+                if not ok:
+                    dropped.append(f"{st['name']} (containment: "
+                                   f"{rep_.splitlines()[-1][:120]})")
+                    continue
+                for key in ("entry_glue", "wrap_glue"):
+                    g = st.get(key)
+                    if not g:
+                        continue
+                    wps = g.get("waypoints_wgs84") or []
+                    gok = False
+                    if not g.get("needs_fix") and len(wps) >= 2:
+                        gok, _r = venue_geom.check_legs_containment(
+                            [{"id": key, "curves": [{"kind": "reposition",
+                                                      "name": key,
+                                                      "waypoints_wgs84": wps}]}],
+                            venue, self._footprint_r, self._track_margin)
+                    if not gok:
+                        st.pop(key)     # executor falls back to the path-join
+                final.append(st)
+            if not final or final[0]["name"] != "calibration":
+                raise ValueError("the calibration stage is missing from the re-plan")
+            out = {"plan_stages": final, "dropped": dropped,
+                   "notes": plan.get("notes") or [], "plan": plan}
+        except Exception as exc:  # noqa: BLE001
+            out = {"error": repr(exc)}
+        self._replan_out = (gen, out)
+
+    def _tick_replan(self):
+        if self._replan_thread is None:
+            if experiment_planner is None or manifest is None:
+                self._pause("re-plan impossible: planner/manifest unavailable")
+                return
+            if not self._load_matrix():
+                self._pause("re-plan: experiment.yaml unreadable")
+                return
+            self._rebuild_counts()
+            venue = {k: v for k, v in (self._venue or {}).items()
+                     if k not in ("plan_stages", "legs")}
+            self._replan_gen += 1
+            self._replan_out = None
+            self._replan_thread = threading.Thread(
+                target=self._replan_worker,
+                args=(self._replan_gen, venue, dict(self._matrix_doc),
+                      dict(self._completed_counts), dict(self._cal_pin or {})),
+                daemon=True)
+            self._replan_thread.start()
+            self.get_logger().info("re-plan started (matrix radii from the new lock).")
+            self._publish_status(message="planning the matrix from the new lock")
+            return
+        if self._replan_thread is not None and self._replan_thread.is_alive():
+            if self._in_phase_s() > self._replan_timeout:
+                self._replan_thread = None
+                self._replan_gen += 1          # orphan the stuck worker
+                self._pause("re-plan timed out — Auto-plan, Send, Start "
+                            "(the lock is kept; no new figure-8 needed)")
+                return
+            if int(self._in_phase_s()) % 5 == 0:
+                self._publish_status(message="planning the matrix from the new lock")
+            return
+        got, self._replan_out, self._replan_thread = self._replan_out, None, None
+        out = got[1] if (isinstance(got, tuple) and got[0] == self._replan_gen) else None
+        if not out or out.get("error"):
+            why = (out or {}).get("error", "no result")
+            self._operator_alert("replan", "critical", "MATRIX RE-PLAN FAILED",
+                                 f"{why} — Auto-plan, Send, Start (the lock is kept).")
+            self._pause(f"re-plan failed: {why}")
+            return
+        self._apply_replan(out)
+
+    def _apply_replan(self, out):
+        """Persist the re-planned batch exactly as venue_loader does on Send
+        (<name>.json + active.json, atomic), reload it, and continue from the
+        figure-8's exit into the first matrix stage."""
+        v = {k: val for k, val in (self._venue or {}).items()
+             if k not in ("plan_stages", "legs")}
+        v["plan_stages"] = out["plan_stages"]
+        v["legs"] = out["plan_stages"][0]["legs"]
+        v.setdefault("schema_version", 2)
+        v["auto_replan"] = {
+            "stamp_utc": datetime.now(timezone.utc).isoformat(),
+            "epoch": (self._matrix_doc or {}).get("_matrix_epoch"),
+            "radius_m": ((self._matrix_doc or {}).get("matrix") or {}).get("radius_m"),
+            "dropped": out.get("dropped") or [],
+        }
+        name = str(v.get("name") or "venue")
+        safe = "".join(c if (c.isalnum() or c in "-._") else "-" for c in name)
+        try:
+            for path in (os.path.join(os.path.dirname(self._active_file),
+                                      safe + ".json"), self._active_file):
+                tmp = path + ".tmp"
+                with open(tmp, "w", encoding="utf-8") as f:
+                    json.dump(v, f, indent=2)
+                os.replace(tmp, path)
+        except Exception as exc:  # noqa: BLE001
+            self._pause(f"re-plan persist failed: {exc!r}")
+            return
+        self._reload_active()
+        self._rebuild_counts()
+        if not self._stages or self._stages[0]["name"] != "calibration":
+            self._pause("re-plan reload lost the calibration stage")
+            return
+        self._stage_idx = 0
+        self._legs = self._stages[0]["legs"]
+        self._last_completed_leg_idx = 0
+        self._leg_idx = 0
+        self._curve_idx = 0
+        n_matrix = len(self._stages) - 1
+        dropped = out.get("dropped") or []
+        msg = (f"matrix planned: {n_matrix} stage(s), "
+               f"{self._runs_target()} scored runs"
+               + (f"; NOT placed: {dropped}" if dropped else "") + ".")
+        self.get_logger().info(msg)
+        self._operator_alert("replan", "warn" if dropped else "info",
+                             "MATRIX PLANNED", msg)
+        try:
+            plan = dict(out.get("plan") or {})
+            plan["venue_name"] = self._run_id
+            plan.setdefault("notes", []).insert(
+                0, "planned and loaded by the robot after the calibration lock")
+            self.pub_plan.publish(String(data=json.dumps(plan)))
+        except Exception:  # noqa: BLE001
+            pass
+        res = self._advance_stage()
+        if res == "paused":
+            return
+        if res == "none":
+            self._enter(Phase.DONE)
+            return
+        self._dwell_until = time.monotonic() + self._dwell_s
+        self._begin_current_curve()
 
     # ==================================================================
     # Sidecar
@@ -1985,6 +2642,14 @@ class RunExecutor(Node):
                 "at_end": self._driver_cfg,
                 "expected": dict(self._driver_expect),
             }
+            # Calibration lock the matrix radii came from (2026-10-08). Progress
+            # credits only legs of the current epoch (manifest.build_rows).
+            lock = (self._matrix_doc or {}).get("_matrix_lock") or {}
+            sidecar["matrix_epoch"] = (self._matrix_doc or {}).get("_matrix_epoch")
+            sidecar["matrix_lock"] = ({"epoch": lock.get("epoch"),
+                                       "R_min_m": lock.get("R_min_m"),
+                                       "radius_m": lock.get("radius_m")}
+                                      if lock else None)
             Data_Logger.write_sidecar(self._leg_bag_path, sidecar)
             return bool(classification["pass"])
         except Exception as exc:
@@ -2073,6 +2738,8 @@ class RunExecutor(Node):
         elif self.phase in (Phase.FOLLOWER_START, Phase.SET_PARAMS,
                             Phase.PUSH_RECIPE, Phase.RUN):
             cmd_owner = "follower"
+        elif self.phase in (Phase.CALIB_START, Phase.CALIB_RUN):
+            cmd_owner = "calib"
         curve = self._cur_curve or {}
         runs_done = self._runs_done()
         self.pub_status.publish(String(data=json.dumps({

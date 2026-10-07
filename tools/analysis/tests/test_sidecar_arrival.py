@@ -44,7 +44,8 @@ import venue_geom          # noqa: E402
 
 SRC = os.path.join(_PKG, "run_executor_node.py")
 
-_FUNCS = {"glue_arrival_metrics"}
+_FUNCS = {"glue_arrival_metrics", "driver_config_problems",
+          "leg_driver_config_verdict"}
 _METHODS = {"_tick_reposition_goto", "_snapshot_glue_arrival",
             "_capture_arrival", "_write_sidecar"}
 _CONSTS = {"ARRIVAL_TAIL_ALIGN_DEG", "PROC_REPOSITION", "RTK_FIXED"}
@@ -397,6 +398,11 @@ class _SidecarExec(Exec):
         self._venue = {"name": "t"}
         self._leg_start_utc = None
         self._achieved_anchor = None
+        cfg = {"steering_mode": "direct", "odom_model": "hinf",
+               "node_start_unix": 1.0}
+        self._leg_driver_cfg_start = dict(cfg)
+        self._driver_cfg = dict(cfg)
+        self._driver_expect = {"steering_mode": "direct", "odom_model": "hinf"}
 
     def _leg_id(self, _idx):
         return "leg_1"

@@ -30,6 +30,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 
 #include "limo_base/limo_driver.h"
 
@@ -60,11 +61,32 @@ LimoDriver::LimoDriver(std::string node_name):rclcpp::Node(node_name),keep_runni
     this->get_parameter("steering_mode", steering_mode_);
     this->get_parameter("max_steering_rad", max_steering_rad_);
     if (steering_mode_ != "agilex" && steering_mode_ != "direct") {
-        RCLCPP_ERROR(this->get_logger(), "steering_mode '%s' unknown; using agilex",
+        RCLCPP_ERROR(this->get_logger(), "steering_mode '%s' unknown; using direct",
                      steering_mode_.c_str());
-        steering_mode_ = "agilex";
+        steering_mode_ = "direct";
     }
     direct_steering_ = (steering_mode_ == "direct");
+    // H-infinity patch: odom_model agilex (stock) | hinf (see limo_driver.h).
+    rcl_interfaces::msg::ParameterDescriptor read_only;
+    read_only.read_only = true;
+    this->declare_parameter("odom_model", odom_model_, read_only);
+    this->declare_parameter("odom_point_x_m", odom_point_x_, read_only);
+    this->get_parameter("odom_model", odom_model_);
+    this->get_parameter("odom_point_x_m", odom_point_x_);
+    if (odom_model_ != "agilex" && odom_model_ != "hinf") {
+        RCLCPP_ERROR(this->get_logger(), "odom_model '%s' unknown; using hinf",
+                     odom_model_.c_str());
+        odom_model_ = "hinf";
+    }
+    if (!(odom_point_x_ >= 0.0 && odom_point_x_ <= wheelbase_)) {
+        RCLCPP_ERROR(this->get_logger(), "odom_point_x_m %.3f outside [0, %.3f]; using %.3f",
+                     odom_point_x_, wheelbase_, wheelbase_ / 2.0);
+        odom_point_x_ = wheelbase_ / 2.0;
+    }
+    hinf_odom_ = (odom_model_ == "hinf");
+    hinf_odometry_ = HinfOdometry(odom_point_x_);
+    node_start_unix_ = std::chrono::duration<double>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
     param_cb_ = this->add_on_set_parameters_callback(
         [this](const std::vector<rclcpp::Parameter> &params) {
             rcl_interfaces::msg::SetParametersResult res;
@@ -91,6 +113,7 @@ LimoDriver::LimoDriver(std::string node_name):rclcpp::Node(node_name),keep_runni
             }
             RCLCPP_INFO(this->get_logger(), "steering_mode=%s max_steering_rad=%.3f",
                         steering_mode_.c_str(), max_steering_rad_);
+            publishConfig();
             return res;
         });
 
@@ -102,6 +125,8 @@ LimoDriver::LimoDriver(std::string node_name):rclcpp::Node(node_name),keep_runni
     std::cout << "- odom topic name: " << pub_odom_tf_ << std::endl;
     std::cout << "- steering mode: " << steering_mode_
               << " (max " << max_steering_rad_ << " rad in direct)" << std::endl;
+    std::cout << "- odom model: " << odom_model_
+              << " (point " << odom_point_x_ << " m ahead of the rear axle in hinf)" << std::endl;
 
     
     if(use_mcnamu_) {
@@ -113,6 +138,12 @@ LimoDriver::LimoDriver(std::string node_name):rclcpp::Node(node_name),keep_runni
     odom_publisher_=this->create_publisher<nav_msgs::msg::Odometry>("/odom",50);
     status_publisher_ = this->create_publisher<limo_msgs::msg::LimoStatus>("/limo_status",50);
     imu_publisher_ = this->create_publisher<sensor_msgs::msg::Imu>("/imu",10);
+    // Latched driver configuration (JSON), re-published on every parameter
+    // change, so bags and the run executor can see which steering/odometry
+    // produced the data, and a respawn shows up as a new node_start_unix.
+    config_publisher_ = this->create_publisher<std_msgs::msg::String>(
+        "/limo_base/config", rclcpp::QoS(rclcpp::KeepLast(1)).reliable().transient_local());
+    publishConfig();
 
     motion_cmd_sub_= this->create_subscription<geometry_msgs::msg::Twist>(
         "/cmd_vel",10,std::bind(&LimoDriver::twistCmdCallback,this,std::placeholders::_1));
@@ -572,6 +603,7 @@ void LimoDriver::publishIMUData(double stamp) {
     if(delta_theta_< 0.1 && delta_theta_> -0.1) delta_theta_=0;
     real_theta_ = real_theta_ + delta_theta_;
     last_theta_ = present_theta_;
+    hinf_odometry_.updateYawDeg(imu_data_.yaw);   // raw yaw, no deadband
     //ROS_INFO("present_theta_:%f;delta_theta_:%f;real_theta_:%f;last_theta_:%f",present_theta_,delta_theta_,real_theta_,last_theta_);
 
     imu_msg.orientation.x = q.x();
@@ -657,10 +689,22 @@ void LimoDriver::publishOdometry(double stamp, double linear_velocity,
         default:
             break;
     }
-    rad = degToRad(real_theta_);
+    // The twist above stays stock in both odom models (the follower reads
+    // speed as hypot(vx, vy) = |v|; steer diagnostics read angular.z).
+    double pose_x, pose_y;
+    if (hinf_odom_ && motion_mode_ != MODE_MCNAMU) {
+        hinf_odometry_.step(linear_velocity, dt);
+        pose_x = hinf_odometry_.x();
+        pose_y = hinf_odometry_.y();
+        rad = hinf_odometry_.yawRad();
+    } else {
+        rad = degToRad(real_theta_);
 
-    position_x_ += cos(rad) * vx * dt - sin(rad) * vy * dt;
-    position_y_ += sin(rad) * vx * dt + cos(rad) * vy * dt;
+        position_x_ += cos(rad) * vx * dt - sin(rad) * vy * dt;
+        position_y_ += sin(rad) * vx * dt + cos(rad) * vy * dt;
+        pose_x = position_x_;
+        pose_y = position_y_;
+    }
 
     // geometry_msgs::Quaternion odom_quat = tf::createQuaternionMsgFromYaw(rad);
     // double limo_yaw=tf2::Quaternion::setRPY();
@@ -679,8 +723,8 @@ void LimoDriver::publishOdometry(double stamp, double linear_velocity,
         tf_msg.header.frame_id = odom_frame_;
         tf_msg.child_frame_id = base_frame_;
  
-        tf_msg.transform.translation.x = position_x_;
-        tf_msg.transform.translation.y = position_y_;
+        tf_msg.transform.translation.x = pose_x;
+        tf_msg.transform.translation.y = pose_y;
         tf_msg.transform.translation.z = 0.0;
         tf_msg.transform.rotation = odom_quat;
         tf_broadcaster_->sendTransform(tf_msg);
@@ -695,8 +739,8 @@ void LimoDriver::publishOdometry(double stamp, double linear_velocity,
     odom_msg.header.frame_id = odom_frame_;
     odom_msg.child_frame_id = base_frame_;
 
-    odom_msg.pose.pose.position.x = position_x_;
-    odom_msg.pose.pose.position.y = position_y_;
+    odom_msg.pose.pose.position.x = pose_x;
+    odom_msg.pose.pose.position.y = pose_y;
     odom_msg.pose.pose.position.z = 0.0;
     odom_msg.pose.pose.orientation = odom_quat;
 
@@ -726,6 +770,20 @@ void LimoDriver::publishLimoState(double stamp, uint8_t vehicle_state, uint8_t c
     status_msg.motion_mode = motion_mode;
 
     status_publisher_->publish(status_msg);
+}
+
+void LimoDriver::publishConfig() {
+    if (!config_publisher_) return;
+    char buf[256];
+    std::snprintf(buf, sizeof(buf),
+                  "{\"steering_mode\": \"%s\", \"max_steering_rad\": %.3f, "
+                  "\"odom_model\": \"%s\", \"odom_point_x_m\": %.3f, "
+                  "\"node_start_unix\": %.3f}",
+                  steering_mode_.c_str(), max_steering_rad_, odom_model_.c_str(),
+                  odom_point_x_, node_start_unix_);
+    std_msgs::msg::String msg;
+    msg.data = buf;
+    config_publisher_->publish(msg);
 }
 
 double LimoDriver::convertInnerAngleToCentral(double inner_angle) {

@@ -60,6 +60,10 @@ TOPICS = [
     # the odom-belief metric (run_eval prefers this when present).
     "/wheel/odom_zeroed",
     "/imu",
+    # Chassis driver configuration (latched JSON: steering_mode, odom_model,
+    # node_start_unix). Which steering/odometry produced the leg, and a driver
+    # respawn mid-leg shows as a second message with a new node_start_unix.
+    "/limo_base/config",
     "/estop",
     # --- Path-follower interface (D1; produced by T1) ---
     # NOTE: these four are authored by task T1 (parallel). We record against the
@@ -91,6 +95,10 @@ QOS_OVERRIDES = {
                      "history": "keep_last", "depth": 100},
     "/cmd_vel": {"reliability": "reliable", "durability": "volatile",
                  "history": "keep_last", "depth": 100},
+    # Latched: published once per driver start, so the recorder must request
+    # TRANSIENT_LOCAL or a bag started after the driver records nothing.
+    "/limo_base/config": {"reliability": "reliable", "durability": "transient_local",
+                          "history": "keep_last", "depth": 1},
 }
 
 QOS_OVERRIDES_PATH = "/tmp/data_logger_qos_overrides.yaml"

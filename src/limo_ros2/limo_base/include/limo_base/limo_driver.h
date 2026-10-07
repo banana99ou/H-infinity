@@ -57,6 +57,7 @@
 // #include <limo_base/LimoStatus.h>
 #include "limo_base/serial_port.h"
 #include "limo_base/limo_protocol.h"
+#include "limo_base/odom_model.h"
 
 namespace AgileX {
 
@@ -88,6 +89,7 @@ private:
     void publishLimoState(double stamp, uint8_t vehicle_state, uint8_t control_mode,
                           double battery_voltage, uint16_t error_code, int8_t motion_mode);
     void publishIMUData(double stamp);
+    void publishConfig();
 
 private:
     rclcpp::Node *node_;
@@ -108,11 +110,27 @@ private:
     // steering angle itself: this chassis steers to the raw value it receives
     // (fit 0.98x over 8894 bag samples), so the stock /2.47 delivered every
     // steering command ~2.5x too small and capped full lock at R ~1.0 m.
-    std::string steering_mode_ = "agilex";
+    // Default "direct" since 2026-10-07: every launch path (and every
+    // odom_watchdog respawn) must come back with the experiment's steering,
+    // not silently revert to stock.
+    std::string steering_mode_ = "direct";
     double max_steering_rad_ = 0.408;   // direct mode clamp (stock 28 deg inner ~ 0.408 central)
-    std::atomic<bool> direct_steering_{false};   // read by the serial thread (parseFrame)
+    std::atomic<bool> direct_steering_{true};   // read by the serial thread (parseFrame)
+    // H-infinity patch (2026-10-07). "agilex" = stock odometry (deadbanded IMU
+    // yaw, position crabbed by the believed steering angle). "hinf" = rear axle
+    // integrated along the raw IMU yaw, published at odom_point_x_ ahead of it
+    // (see odom_model.h). Read-only: switching mid-run would jump the pose.
+    std::string odom_model_ = "hinf";
+    double odom_point_x_ = 0.1;         // m ahead of the rear axle (sim CG, l_r = L/2)
+    bool hinf_odom_ = true;
+    HinfOdometry hinf_odometry_;
+    double node_start_unix_ = 0.0;      // in /limo_base/config: a respawn shows as a new value
+    rclcpp::Publisher<std_msgs::msg::String>::SharedPtr config_publisher_;
     rclcpp::node_interfaces::OnSetParametersCallbackHandle::SharedPtr param_cb_;
-    double present_theta_,last_theta_,delta_theta_,real_theta_,rad;
+    // Stock yaw state. Zero-initialised: the vendor left these indeterminate
+    // (a shadowed local in publishIMUData meant to seed them never did).
+    double present_theta_ = 0.0, last_theta_ = 0.0, delta_theta_ = 0.0,
+           real_theta_ = 0.0, rad = 0.0;
     rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr odom_publisher_;
     rclcpp::Publisher<limo_msgs::msg::LimoStatus>::SharedPtr status_publisher_;
 

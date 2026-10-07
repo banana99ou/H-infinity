@@ -212,6 +212,40 @@ def glue_arrival_metrics(waypoints_wgs84, end_heading_deg,
     }
 
 
+# Chassis driver configuration (2026-10-07). limo_base publishes it latched on
+# /limo_base/config. The stock driver delivered ~0.4x steering and a crabbed,
+# deadbanded odometry; a driver that comes back stock (old binary, other launch
+# params, a respawn) is a different plant and must not produce scored legs.
+def driver_config_problems(cfg, expect):
+    """Reasons the parsed /limo_base/config `cfg` (dict, or None if never
+    received) fails `expect` ({key: required value}; empty values are not
+    checked). [] means OK."""
+    if not isinstance(cfg, dict):
+        return ["no /limo_base/config from the chassis driver "
+                "(pre-2026-10-07 driver, or not running)"]
+    out = []
+    for key, want in expect.items():
+        if want in (None, ""):
+            continue
+        if cfg.get(key) != want:
+            out.append(f"driver {key}={cfg.get(key)!r}, expected {want!r}")
+    return out
+
+
+def leg_driver_config_verdict(at_start, at_end, expect):
+    """(ok, reasons) for one scored leg. The config must satisfy `expect` at
+    both ends and be identical across the leg: a changed node_start_unix is a
+    driver respawn (odometry restarted at the origin mid-leg), any other change
+    a runtime parameter set."""
+    reasons = [f"start: {r}" for r in driver_config_problems(at_start, expect)]
+    reasons += [f"end: {r}" for r in driver_config_problems(at_end, expect)]
+    if (isinstance(at_start, dict) and isinstance(at_end, dict)
+            and at_start != at_end):
+        reasons.append("driver config changed during the leg "
+                       "(respawn or runtime parameter set)")
+    return (not reasons), reasons
+
+
 class Phase(Enum):
     IDLE = "idle"
     PREFLIGHT = "preflight"
@@ -252,6 +286,10 @@ class RunExecutor(Node):
         self.declare_parameter("rtk_loss_wait_s", 5.0)       # FIXED loss during scored run
         self.declare_parameter("heartbeat_s", 30.0)
         self.declare_parameter("battery_volts_halt", 10.5)
+        # Chassis driver config every scored leg requires (/limo_base/config);
+        # "" disables that key's check.
+        self.declare_parameter("expect_steering_mode", "direct")
+        self.declare_parameter("expect_odom_model", "hinf")
         self.declare_parameter("rtk_run_window_pct", 95.0)
         self.declare_parameter("robot_footprint_radius_m", 0.30)
         self.declare_parameter("path_tracking_margin_m", 0.30)
@@ -281,6 +319,10 @@ class RunExecutor(Node):
         self._rtk_loss_wait = float(self.get_parameter("rtk_loss_wait_s").value)
         self._heartbeat_s = float(self.get_parameter("heartbeat_s").value)
         self._batt_halt = float(self.get_parameter("battery_volts_halt").value)
+        self._driver_expect = {
+            "steering_mode": str(self.get_parameter("expect_steering_mode").value),
+            "odom_model": str(self.get_parameter("expect_odom_model").value),
+        }
         self._rtk_window_pct = float(self.get_parameter("rtk_run_window_pct").value)
         self._footprint_r = float(self.get_parameter("robot_footprint_radius_m").value)
         self._track_margin = float(self.get_parameter("path_tracking_margin_m").value)
@@ -355,6 +397,8 @@ class RunExecutor(Node):
         self._estop = False
         self._rtk_quality = None
         self._battery_v = None
+        self._driver_cfg = None            # parsed /limo_base/config (latched)
+        self._leg_driver_cfg_start = None  # snapshot when the leg's bag starts
         self._orch_status = {}
         self._support_start_t = {}    # PROC -> last /orchestrator/start we sent
         self._repo_state = None
@@ -411,6 +455,8 @@ class RunExecutor(Node):
         self.create_subscription(
             String, "/gps_rtk_f9p_helical/gps/rtk_status", self._on_rtk, 10)
         self.create_subscription(Odometry, "/wheel/odom", self._on_odom, 10)
+        self.create_subscription(
+            String, "/limo_base/config", self._on_driver_config, latched)
         self.create_subscription(
             String, "/odom_zero/status", self._on_odom_zero_status, latched)
         self.create_subscription(
@@ -576,6 +622,13 @@ class RunExecutor(Node):
 
     def _on_odom(self, msg):
         self._last_odom_t = time.monotonic()
+
+    def _on_driver_config(self, msg):
+        try:
+            d = json.loads(msg.data)
+        except (ValueError, TypeError):
+            d = None
+        self._driver_cfg = d if isinstance(d, dict) else None
 
     def _on_limo(self, msg):
         try:
@@ -1305,6 +1358,7 @@ class RunExecutor(Node):
             missing.append("estop engaged")
         if self._last_odom_t is None or (time.monotonic() - self._last_odom_t) > 1.0:
             missing.append("no fresh /wheel/odom")
+        missing += driver_config_problems(self._driver_cfg, self._driver_expect)
         if self._rtk_quality not in RTK_OK:
             missing.append(f"RTK quality {self._rtk_quality} not in {RTK_OK}")
         if self._battery_v is not None and self._battery_v < self._batt_halt:
@@ -1654,6 +1708,7 @@ class RunExecutor(Node):
                     self._leg_bag_path, topics=Data_Logger.TOPICS)
                 self._recorder.start()
                 self._leg_start_utc = datetime.now(timezone.utc).isoformat()
+                self._leg_driver_cfg_start = self._driver_cfg
             except Exception as exc:
                 self._recorder = None
                 self._pause(f"bag start failed: {exc}")
@@ -1860,6 +1915,15 @@ class RunExecutor(Node):
                         "quick-gate FAIL on "
                         f"{os.path.basename(self._leg_bag_path)}: "
                         f"{';'.join(qg['reasons'])}")
+            # Same plant for the whole leg: expected steering/odometry at both
+            # ends and no driver respawn in between (leg_driver_config_verdict).
+            cfg_ok, cfg_why = leg_driver_config_verdict(
+                self._leg_driver_cfg_start, self._driver_cfg, self._driver_expect)
+            classification["driver_config_ok"] = cfg_ok
+            if not cfg_ok:
+                classification["pass"] = False
+                classification["driver_config_reasons"] = cfg_why
+                self.get_logger().warn("driver-config FAIL: " + "; ".join(cfg_why))
             sp = curve.get("start_pose") or {}
             path_frame_anchor = None
             if sp:
@@ -1914,6 +1978,13 @@ class RunExecutor(Node):
             # TypeError the sidecar (and so the leg). Always present on legs
             # from 2026-10-04 on; None only if the capture never ran.
             sidecar["arrival"] = self._arrival
+            # Which chassis steering/odometry produced the leg (additive
+            # top-level key, same skew reasoning as 'arrival').
+            sidecar["driver_config"] = {
+                "at_start": self._leg_driver_cfg_start,
+                "at_end": self._driver_cfg,
+                "expected": dict(self._driver_expect),
+            }
             Data_Logger.write_sidecar(self._leg_bag_path, sidecar)
             return bool(classification["pass"])
         except Exception as exc:
@@ -1972,6 +2043,7 @@ class RunExecutor(Node):
         self._leg_bag_path = None
         self._leg_cell_id = None
         self._leg_start_utc = None
+        self._leg_driver_cfg_start = None
         self._leg_estopped = False
         self._leg_rtk_fixed_samples = 0
         self._leg_rtk_total_samples = 0

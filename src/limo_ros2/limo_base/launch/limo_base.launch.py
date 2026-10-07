@@ -27,6 +27,12 @@ def generate_launch_description():
     odom_frame_arg = LaunchConfiguration('odom_frame',default='odom')
     base_link_frame_arg = LaunchConfiguration('base_frame',default='base_link')
     pub_odom_tf_arg_ = LaunchConfiguration('pub_odom_tf', default='true')
+    # H-infinity patch (2026-10-07): the experiment's chassis configuration.
+    # Defaults match limo_driver.h, so every orchestrator / odom_watchdog
+    # respawn comes back the same. Stock behaviour for an A/B:
+    #   steering_mode:=agilex odom_model:=agilex
+    steering_mode_arg_ = LaunchConfiguration('steering_mode', default='direct')
+    odom_model_arg_ = LaunchConfiguration('odom_model', default='hinf')
 
     remapping = [
                 ('odom', '/wheel/odom'),
@@ -43,7 +49,9 @@ def generate_launch_description():
                 'odom_frame': odom_frame_arg,
                 'base_frame': base_link_frame_arg,
                 'pub_odom_tf': pub_odom_tf_arg_,
-                'use_mcnamu': False
+                'use_mcnamu': False,
+                'steering_mode': steering_mode_arg_,
+                'odom_model': odom_model_arg_,
         }],
         remappings=remapping
         )

@@ -103,6 +103,15 @@ private:
 
     bool pub_odom_tf_ = false;
     bool use_mcnamu_ = false;
+    // H-infinity patch (2026-10-04). "agilex" = stock Ackermann path (inner
+    // wheel angle, 28 deg clamp, / angle_scale). "direct" = send the bicycle
+    // steering angle itself: this chassis steers to the raw value it receives
+    // (fit 0.98x over 8894 bag samples), so the stock /2.47 delivered every
+    // steering command ~2.5x too small and capped full lock at R ~1.0 m.
+    std::string steering_mode_ = "agilex";
+    double max_steering_rad_ = 0.408;   // direct mode clamp (stock 28 deg inner ~ 0.408 central)
+    std::atomic<bool> direct_steering_{false};   // read by the serial thread (parseFrame)
+    rclcpp::node_interfaces::OnSetParametersCallbackHandle::SharedPtr param_cb_;
     double present_theta_,last_theta_,delta_theta_,real_theta_,rad;
     rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr odom_publisher_;
     rclcpp::Publisher<limo_msgs::msg::LimoStatus>::SharedPtr status_publisher_;

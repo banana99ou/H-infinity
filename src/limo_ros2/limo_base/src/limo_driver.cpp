@@ -28,6 +28,9 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
+#include <algorithm>
+#include <cmath>
+
 #include "limo_base/limo_driver.h"
 
 int flag=0; 
@@ -50,13 +53,55 @@ LimoDriver::LimoDriver(std::string node_name):rclcpp::Node(node_name),keep_runni
     this->get_parameter_or<std::string>("base_frame", base_frame_, "base_link");
     this->get_parameter_or<bool>("pub_odom_tf", pub_odom_tf_, "false");
     this->get_parameter_or<bool>("use_mcnamu", use_mcnamu_, "false");
-    
+    // H-infinity patch: steering_mode agilex (stock) | direct (see limo_driver.h).
+    // Settable at runtime (ros2 param set) so one stack can A/B both modes.
+    this->declare_parameter("steering_mode", steering_mode_);
+    this->declare_parameter("max_steering_rad", max_steering_rad_);
+    this->get_parameter("steering_mode", steering_mode_);
+    this->get_parameter("max_steering_rad", max_steering_rad_);
+    if (steering_mode_ != "agilex" && steering_mode_ != "direct") {
+        RCLCPP_ERROR(this->get_logger(), "steering_mode '%s' unknown; using agilex",
+                     steering_mode_.c_str());
+        steering_mode_ = "agilex";
+    }
+    direct_steering_ = (steering_mode_ == "direct");
+    param_cb_ = this->add_on_set_parameters_callback(
+        [this](const std::vector<rclcpp::Parameter> &params) {
+            rcl_interfaces::msg::SetParametersResult res;
+            res.successful = true;
+            for (const auto &p : params) {
+                if (p.get_name() == "steering_mode" &&
+                    p.as_string() != "agilex" && p.as_string() != "direct") {
+                    res.successful = false;
+                    res.reason = "steering_mode must be agilex or direct";
+                } else if (p.get_name() == "max_steering_rad" &&
+                           !(p.as_double() > 0.0 && p.as_double() <= 0.6)) {
+                    res.successful = false;
+                    res.reason = "max_steering_rad must be in (0, 0.6]";
+                }
+            }
+            if (!res.successful) return res;
+            for (const auto &p : params) {
+                if (p.get_name() == "steering_mode") {
+                    steering_mode_ = p.as_string();
+                    direct_steering_ = (steering_mode_ == "direct");
+                } else if (p.get_name() == "max_steering_rad") {
+                    max_steering_rad_ = p.as_double();
+                }
+            }
+            RCLCPP_INFO(this->get_logger(), "steering_mode=%s max_steering_rad=%.3f",
+                        steering_mode_.c_str(), max_steering_rad_);
+            return res;
+        });
+
 
     std::cout << "Loading parameters: " << std::endl;
     std::cout << "- port name: " << port_name << std::endl;
     std::cout << "- odom frame name: " << odom_frame_ << std::endl;
     std::cout << "- base frame name: " << base_frame_ << std::endl;
     std::cout << "- odom topic name: " << pub_odom_tf_ << std::endl;
+    std::cout << "- steering mode: " << steering_mode_
+              << " (max " << max_steering_rad_ << " rad in direct)" << std::endl;
 
     
     if(use_mcnamu_) {
@@ -250,7 +295,12 @@ void LimoDriver::parseFrame(const LimoFrame& frame) {
             double angular_velocity = static_cast<int16_t>((frame.data[3] & 0xff) | (frame.data[2] << 8)) / 1000.0;
             double lateral_velocity = static_cast<int16_t>((frame.data[5] & 0xff) | (frame.data[4] << 8)) / 1000.0;
             double steering_angle = static_cast<int16_t>((frame.data[7] & 0xff) | (frame.data[6] << 8)) / 1000.0;
-            if (steering_angle > 0) {
+            if (direct_steering_) {
+                // direct: the reported value is the bicycle angle; publishOdometry
+                // expects the inner angle (it maps back to central exactly).
+                steering_angle = convertCentralAngleToInner(steering_angle);
+            }
+            else if (steering_angle > 0) {
                 steering_angle *= left_angle_scale_;
             }
             else {
@@ -436,6 +486,23 @@ void LimoDriver::twistCmdCallback(const geometry_msgs::msg::Twist::SharedPtr msg
             break;
         }
         case MODE_ACKERMANN: {
+            if (direct_steering_) {
+                // Send the bicycle (central) angle itself: the chassis steers to
+                // the value it receives, so no inner-angle conversion and no
+                // / angle_scale. Same sign/zero-speed behaviour as the stock path
+                // (v=0 with w!=0 -> full lock toward w), clamped to the limit.
+                const double v = msg->linear.x;
+                const double w = msg->angular.z;
+                double delta = 0.0;
+                if (std::fabs(v) > 1e-3) {
+                    delta = std::atan(wheelbase_ * w / v);
+                } else if (std::fabs(w) > 1e-3) {
+                    delta = std::copysign(max_steering_rad_, w);
+                }
+                delta = std::max(-max_steering_rad_, std::min(max_steering_rad_, delta));
+                setMotionCommand(v, 0, 0, delta);
+                break;
+            }
             double r = msg->linear.x / msg->angular.z;
             if(fabs(r) < track_/2.0)
             {

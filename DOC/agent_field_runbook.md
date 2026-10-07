@@ -18,6 +18,23 @@ fix this copy. Live status lives in `ToDo.md`.
 > and HOLDs without it. **Still unverified in the field:** the outdoor
 > no-limit-cycle convergence gate. Confirm against `ToDo.md`.
 
+> **Patched chassis driver (2026-10-07) — read before the first session on it.**
+> The robot now runs `limo_base` with `steering_mode=direct` (full steering; the
+> stock driver delivered ~0.4×) and `odom_model=hinf` (fixed odometry) by
+> default — `DOC/deployment.md` G6, `SPEC.md` §7.8. Consequences for you:
+> - **Pull before you push.** `git pull` your laptop clone before any
+>   `tools/sync/sync.sh push`: the relay mirrors your laptop, so a stale clone
+>   reverts the robot's executor/logger code (the driver itself is not
+>   relay-deployed and stays patched).
+> - **The executor refuses to start** unless `/limo_base/config` reads
+>   `direct` / `hinf` (§4). If it blocks on that, restart the `base` PROC — do
+>   not edit the executor's `expect_*` params to get past it.
+> - **First floor session on it:** nothing has driven on the floor with this
+>   driver yet. The robot now turns ~2.5× tighter for the same command, and
+>   reposition/glue were tuned on the old plant. Supervise the first legs with
+>   the E-STOP at hand; after the first few legs pull the bags
+>   (`tools/sync/sync.sh pull`) so the new odometry can be checked against RTK.
+
 ---
 
 ## 0 · Mission — what you are proving
@@ -178,6 +195,11 @@ Checks: node graph, the `cmd_vel_raw → estop → /cmd_vel` chain with a **sing
 and **RTK FIXED (quality=4)**.
 
 Then confirm the items preflight can't:
+- **Patched driver live** —
+  `rr "$SRC timeout 6 ros2 topic echo --once --qos-durability transient_local --qos-reliability reliable /limo_base/config std_msgs/msg/String"`
+  must show `"steering_mode": "direct"` and `"odom_model": "hinf"`. No message =
+  old driver binary or `base` down; anything else = restart the `base` PROC.
+  (The executor enforces this too and refuses preflight otherwise.)
 - **RTK quality** — `rr "$SRC ros2 topic echo /gps_rtk_f9p_helical/gps/rtk_status --once"`.
   `quality=4` (FIXED, cm) is the target. `quality=5` (FLOAT, dm) only **WARNs** in
   preflight, but the sequencer's M1/F2 gate is **FIXED-only** and will pause the

@@ -114,6 +114,57 @@ under RTK outdoors as the first field step, before concluding anything is broken
 The Pixhawk is also mounted rotated 90°, so its heading carries a fixed offset
 that must be calibrated against RTK course-over-ground.
 
+### G5 · The chassis silently ignores every command (remote switch B)
+
+Commands reach `/cmd_vel` but nothing moves, `/wheel/odom` speed stays 0.00.
+Read `ros2 topic echo --once /limo_status` (2026-10-06/07, FS remote):
+
+| switch **B** | `control_mode` | meaning |
+|---|---|---|
+| position 3 | **1** | serial command — ROS drives. Required for every run. |
+| position 2 | **3** | remote control — serial commands are ignored |
+| position 1 | 0 | standby |
+
+- Turning the remote **off while B is at 2** → `vehicle_state 2`, `error_code 4`
+  (`LIMO: Remote control lost connect!` in `base.log`) and continuous beeping.
+  Turn it back on and set B to 3.
+- After coming back from standby, `control_mode` can stay 0 until the base
+  driver restarts (orchestrator `kill`/`start` `base`), which re-sends the
+  command-mode enable.
+
+### G6 · The stock driver steers ~0.4× — patched `limo_base` (not relay-deployed)
+
+`SPEC.md` §7.8. The NUC's `limo_base` (`~/agilex_ws/src/limo_ros2/limo_base`) runs
+the repo fork `src/limo_ros2/limo_base` (commits `5db1a73` vendor, `2b2c3cb` patch)
+since 2026-10-06 21:08 KST, default `steering_mode=agilex` = stock behavior.
+- Switch at runtime: `ros2 param set /limo_base_node steering_mode direct|agilex`
+  (invalid values are rejected; the setting is lost when the base restarts).
+- **Not** covered by `sync.sh push`/the relay (they build `limo_path_follower`
+  only). To install a change, from the repo root:
+  ```bash
+  TS=$(date -u +%Y%m%dT%H%M%SZ); ssh agilex@agilex-nuc12wski7 "B=~/H-infinity-deploy-backups/limo_base_vendor_$TS; mkdir -p \$B && cp -a ~/agilex_ws/src/limo_ros2/limo_base/src ~/agilex_ws/src/limo_ros2/limo_base/include \$B/ && cp -a ~/agilex_ws/build/limo_base/limo_base \$B/limo_base.bin" && scp -q src/limo_ros2/limo_base/src/limo_driver.cpp agilex@agilex-nuc12wski7:agilex_ws/src/limo_ros2/limo_base/src/ && scp -q src/limo_ros2/limo_base/include/limo_base/limo_driver.h agilex@agilex-nuc12wski7:agilex_ws/src/limo_ros2/limo_base/include/limo_base/ && ssh agilex@agilex-nuc12wski7 'source /opt/ros/humble/setup.bash && cd ~/agilex_ws && colcon build --packages-select limo_base --symlink-install'
+  ```
+  The new binary is used the next time `base` starts. Rollback: copy `src/` and
+  `include/` back from the backup and rebuild. Original stock source:
+  `~/H-infinity-deploy-backups/limo_base_vendor_20261006T120828Z`.
+- `/wheel/odom` `twist.angular.z` is the driver's *belief* (commanded rate), not
+  a measurement — use `/imu` for yaw rate.
+
+### G7 · Steering tests need open floor, not a corridor
+
+A constant-steer test sweeps a 2-D area, not a lane. `tools/qc/steer_floor.py`
+(both modes, 0.3 m/s, 3 s per step, turning left) used **2.8 m ahead × 3.3 m
+left** before the operator stopped it; a 0.30 + 0.35 rad pass needs ~0.7 m ahead
+× 1.25 m left *from the start*, which an L-corridor's first straight does not
+give (two near-collisions indoors, 2026-10-07). In a tight spot drive it in
+reverse (`v=-0.15`: ~0.65 m back, ~0.4 m toward the steer side, 0 forward). The
+script refuses unless the chassis is in command mode, the estop relays, and no
+one else commands; it aborts if the operator takes over (B → 2) or anyone else
+publishes. Also seen: a fresh rclpy node can take several seconds to discover
+publishers on the NUC (wait, don't fail fast), and with the battle-station
+teleop panel open, `ros2 bag record` subscribes to `cmd_vel_raw` with an
+incompatible durability and drops other publishers' messages — record `/cmd_vel`.
+
 ---
 
 ## Bench / pedestal testing (synthetic sim) — NOT the field test
@@ -351,7 +402,15 @@ bags into a dataset + metrics.
   - `relay-install` (cron line) / `relay-log` (staged stamp, state, log tail).
   - Tailscale ACL: an ssh `accept` rule `tag:relay → tag:share` for user
     `agilex`; without it Tailscale SSH wants a browser check and `relay-log`
-    shows `blocked: …`.
+    shows `blocked: …`. (The laptop → NUC ssh still prints a Tailscale
+    "additional check … Authentication checked" banner; it passes.)
+  - The relay restarts `limo-battle` by SIGKILLing its main process
+    (`Restart=on-failure`). The NUC also has a sudoers rule
+    `/etc/sudoers.d/limo-battle-restart` — `agilex` NOPASSWD
+    `/usr/bin/systemctl restart limo-battle` — installed by the operator in the
+    relay setup session; `robot_side.sh` could switch to `sudo -n systemctl
+    restart limo-battle` (not done). The relay host `work-fmcl` has
+    `loginctl enable-linger` on, so its cron keeps running logged-out.
   - One exclude list for every hop: `tools/sync/code_excludes.txt`.
   - `pull` (NUC→laptop artifacts), `init-artifacts` (make `Experiment Data/` a
     local-only repo).

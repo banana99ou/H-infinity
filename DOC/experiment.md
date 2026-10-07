@@ -150,36 +150,31 @@ Calibration procedure (one-time per venue, redo after any layout change):
 |---|---|
 | **controller** | `lpv-hinf`, `pid-ff` |
 | **v_const** | **1.0 m/s** (primary); **0.5 m/s** (sim-comparable sanity point) |
-| **path family** | **step-curvature** (paper primary), **slalom** (paper §5), **wiggle_sine / wiggle_chirp / wiggle_square** (added 2026-10-02, advisor: "more wiggly paths") |
-| **R** | step, slalom: {1.0, 0.7, 0.5, 0.4} m — spans PID-favored → crossover → LPV-favored regime. wiggle_*: {2.0, 1.5, 1.2} m (`matrix.radius_m_by_family`) |
+| **path family** | **step-curvature** (paper primary), **slalom** (paper §5). *(wiggle_sine / wiggle_chirp / wiggle_square were added 2026-10-02 and **archived 2026-10-06** — see below.)* |
+| **R** | {1.0, 0.7, 0.5, 0.4} m — spans PID-favored → crossover → LPV-favored regime |
 | **N** | **10** repetitions per cell |
 
-Total: step/slalom 2 × 4 R × 2 controllers × 2 v = 32 cells; wiggle 3 × 3 R ×
-2 × 2 = 36 cells → **68 cells × N = 10 = 680 recorded headline runs** (was 320
-before the wiggle families; turnarounds/glue are not counted). At the measured
-~72 s wall time per leg (2026-10-03) that is ~13.6 robot-hours. Live progress
-is in `ToDo.md`.
+Total: 2 families × 4 R × 2 controllers × 2 v = 32 cells × N = 10 = **320 recorded
+headline runs** (turnarounds/glue are not counted). At the measured ~72 s wall
+time per leg (2026-10-03) that is ~6.4 robot-hours. Live progress is in `ToDo.md`.
 
-**Wiggle families** (`ros2_bridge/limo_path_follower/wiggle_path.py`): defined
-by curvature κ(s) with peak |κ| = 1/R, so R keeps one meaning across families;
-length does not grow with R — 2 periods (6 m at λ = 3 m; chirp ~4.3 m) + 0.5 m
-lead-in/out (`plan.wiggle`). `sine`: κ = (1/R)·cos(2πs/λ). `chirp`: same peak, λ shrinks
-3 → 1.5 m (sweeps curvature *rate* — bandwidth). `square`: back-to-back ±1/R
-arcs (curvature steps of 2/R). Radii were sized to the measured steering
-ceiling (1.2 = at it for v = 1.0; 1.5 / 2.0 clear of it) — a ceiling that
-turned out to be the stock driver's scale error (`SPEC.md` §7.8).
-
-**Pilot first:** `plan.priority` in `experiment.yaml` runs these cells before
-matrix order — wiggle_sine 2.0, wiggle_sine 1.2, wiggle_square 1.2,
-wiggle_chirp 1.5 (does the LIMO follow wiggles at all, below vs at the
-ceiling, step response, bandwidth). The executor cycles treatments least-done
-first, so a pilot stopped early stays balanced across controller × speed.
-Delete the key to return to matrix order.
+**Wiggle families — ARCHIVED 2026-10-06 (operator).** Out of the matrix
+(`experiment.yaml` keeps the radii commented out with restore instructions); may
+later replace the single-turn (step) family. Kept: the generator
+(`ros2_bridge/limo_path_follower/wiggle_path.py`), its tests, the battle-station
+Leg-batch types and `plan.priority` (run listed cells first). Definition, for
+when they come back: curvature κ(s) with peak |κ| = 1/R; 2 periods (6 m at
+λ = 3 m; chirp ~4.3 m) + 0.5 m lead-in/out (`plan.wiggle`). `sine`:
+κ = (1/R)·cos(2πs/λ); `chirp`: λ 3 → 1.5 m (curvature rate / bandwidth);
+`square`: back-to-back ±1/R arcs. Radii 2.0/1.5/1.2 were sized to the stock-driver
+steering ceiling (`SPEC.md` §7.8).
 
 **Steering caveat (2026-10-04):** every scored run so far drove at ~0.4× the
 commanded steering (stock driver; full lock ≈ R 1.0 m), so the step / slalom
 cells (R ≤ 1.0) ran at or past the steering limit. Whether those runs count is
-an open advisor decision — `SPEC.md` §7.8, `ToDo.md`.
+an open advisor decision — `SPEC.md` §7.8, `ToDo.md`. The patched driver
+(`steering_mode=direct`, installed 2026-10-06, default still stock) measured
+R_min 0.55 m on the floor: R 0.7 becomes reachable, R 0.5 / 0.4 stay below it.
 
 **Headline plot for the paper:** max heading error vs R at v = 1.0 m/s,
 both controllers overlaid, error bars across N = 10. The crossover point

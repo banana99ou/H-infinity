@@ -535,10 +535,39 @@ exercised; vertices 3–5 stay dormant. Report the achieved ρ(t) range honestly
    **0.198 rad → R ≈ 1.0 m** (L = 0.2) — the "never better than ~0.85 m" ceiling
    of §5 finding 1. (Not reconciled here: the crawl-speed bags' 0.85–0.98 m sits
    up to ~15% tighter than that 1.0 m kinematic figure.)
-   - **Patched driver** in progress: a `steering_mode` parameter, default = stock
-     behavior.
-   - **Physical limit still unknown** → M1 steering sweep through the patched
-     driver, raw 0.20 → 0.45 rad at crawl (wheels on floor: operator confirms).
+   - **Patched driver — built, tested, committed (2026-10-06/07; `5db1a73` vendor
+     import as it ran on the NUC, `2b2c3cb` patch).** `steering_mode` = `agilex`
+     (default, stock path unchanged) | `direct` (sends atan(L·ω/v) unscaled,
+     clamped to `max_steering_rad` 0.408; feedback read as the bicycle angle).
+     Settable at runtime: `ros2 param set /limo_base_node steering_mode direct`.
+     Installed on the NUC 2026-10-06 21:08 KST, **default left at `agilex`** —
+     no run uses it yet. Install/rollback: `DOC/deployment.md` G5.
+   - **Measured limit (2026-10-06/07):**
+     - Remote control (bypasses ROS), junior's tape test: full lock R ≈ 0.4 m.
+     - Pedestal, direct mode: chassis reports what it is sent up to **~0.35 rad**
+       (sent 0.408 → reported 0.348 left / −0.350 right) → firmware/servo cap.
+     - Floor, IMU yaw rate at 0.15–0.3 m/s: stock full lock driven 0.190 rad,
+       **R 1.04 m**; direct 0.25 rad → R 0.79 m; direct 0.35 rad → driven
+       0.350 rad, **R 0.55 m** (rear axle). So δ_max ≈ 0.35 rad, R_min ≈ 0.55 m
+       through ROS; ρ ceiling at the 1.0 m/s cap ≈ **1.8 rad/s** (was ≈ 1.0).
+       Matrix R 0.7 becomes reachable; R 0.5 / 0.4 are still below R_min.
+     - First step out of straight read low in every pass (0.71–0.88 of the
+       report); later steps 0.92–1.02. Probably unsettled — unverified.
+     - Raw data + scripts: `Experiment Data/diagnostics/2026-10-06_steering/`
+       (gitignored archive), `tools/qc/steer_floor.py`, `tools/qc/steer_pedestal.py`.
+   - **Where the turn is lost** (2026-10-06 scored legs, 36 bags, 9369 moving
+     samples; `tools/analysis/steering_2026_10/chain_check.py`): estop passes
+     `cmd_vel_raw` → `/cmd_vel` 1:1; the chassis' steering report = 0.98× the
+     value sent (it reports its setpoint, not a measured wheel angle — it does
+     cap at ~0.35); driven angle vs report 0.74 (IMU) / 0.86 (RTK) in the fast
+     scored legs. **`/wheel/odom` `twist.angular.z` is the driver's belief**
+     (0.98× commanded) — never use it as measured yaw rate; use `/imu`.
+   - **Not a local regression:** upstream `agilexrobotics/limo_ros2` (humble)
+     has the same ÷2.47 / 28° code; the robot's binary was built from this
+     source (same hash, log strings, constants). Driver-vs-firmware mismatch;
+     which side is "wrong" needs the chassis firmware version + AgileX's
+     protocol definition of the 0x111 steering field (ask AgileX). No upstream
+     issue reports it.
    - **Existing data — OPEN, advisor decision.** Every scored run so far
      (including the 107 counted toward the 680-run matrix as of 2026-10-03) was
      driven at ~40% of commanded steering. They are **not** declared invalid;
@@ -549,4 +578,6 @@ exercised; vertices 3–5 stay dormant. Report the achieved ρ(t) range honestly
      match before predictions are trusted; §5 finding 5 modeled a clip only.
    - Choices sized to the stock ceiling — glue `track_radius_m` 1.2, wiggle
      radii 2.0/1.5/1.2 (`DOC/experiment.md`), §3 δ_max — revisit once the real
-     limit is measured.
+     limit is measured. (Wiggles were archived from the matrix 2026-10-06.)
+   - `max_steering_rad` default could drop 0.408 → 0.35 to match the chassis
+     (no behavior change; the chassis caps there anyway) — not done.

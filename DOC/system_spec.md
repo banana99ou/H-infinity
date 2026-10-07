@@ -35,7 +35,7 @@ The locked capability list. Each is testable; acceptance is in §5.
 - **P3** Generate **turnaround** references: U-turn (semicircle @ R_min) and 3-point turn (incl. reverse).
 - **P4** Deliver the reference to the controller **without geometry-distorting transforms** — the controller tracks the exact analytic curve, matching the sim.
 - **P5** Retain **ad-hoc hand-drawn** (waypoint/Bezier) paths for non-matrix testing.
-- **P6** Generate **curvature-defined wiggle** references (`wiggle_sine` / `wiggle_chirp` / `wiggle_square`) from {R, wavelength, wavelength_end (chirp), n_periods, L1, L_end}; peak |κ| = 1/R. *(Added 2026-10-02 with the wiggle families — `DOC/experiment.md` matrix.)*
+- **P6** Generate **curvature-defined wiggle** references (`wiggle_sine` / `wiggle_chirp` / `wiggle_square`) from {R, wavelength, wavelength_end (chirp), n_periods, L1, L_end}; peak |κ| = 1/R. *(Added 2026-10-02 with the wiggle families; the families were archived from the matrix 2026-10-06 — the generator stays — `DOC/experiment.md`.)*
 
 ### 3.2 Control & safety
 - **C1** Select **LPV-H∞ or PID-FF** per run; expose controller tuning params.

@@ -5,6 +5,38 @@ Working checklist for getting the professor-provided H-infinity stack from
 
 ## Status
 
+**2026-10-07 — patched driver measured: R_min 1.04 m → 0.55 m. Wiggles archived.
+Reposition undershoot root-caused.** (Chat of 2026-10-06/07; artifacts in
+`Experiment Data/diagnostics/2026-10-06_steering/`, scripts in
+`tools/analysis/steering_2026_10/` and `tools/qc/steer_{floor,pedestal}.py`.)
+- **Matrix:** wiggle families **archived** from `experiment.yaml` (2026-10-06,
+  operator) → back to step + slalom, **320 runs**. Code/tests/battle-station types
+  kept; may later replace the single-turn (step) family. Pushed to the NUC via
+  the relay (deployed 2026-10-06 18:21 KST). `plan.priority` key removed (was the
+  wiggle pilot list; the mechanism stays). *Not committed yet.*
+- **Driver:** patch committed (`5db1a73`, `2b2c3cb`) and installed on the NUC,
+  default `agilex` (stock). Measured: stock full lock R 1.04 m, direct
+  0.35 rad → R 0.55 m; chassis caps at ~0.35 rad; remote full lock ≈ 0.4 m.
+  Upstream AgileX driver has the same ÷2.47. Detail: `SPEC.md` §7.8.
+- **Reposition undershoot — cause = the same steering scale** (83 repositions
+  in the 2026-10-06 `[io-dbg]` reposition log; `tools/analysis/steering_2026_10/`):
+  gyro yaw rate 0.45× commanded (driver formula predicts 0.45, off by
+  0.016 rad/s); pure pursuit's own steady state κ_path/κ_cmd 0.41; RTK fixes on
+  arcs **outside 772 / inside 8** (median 17 cm out); arrival heading error has
+  the sign of the last turn in **64/64** arrivals (median +13° on the R 1.2 m /
+  1 m-tail glue, ≈0° on R 1.5 m / 2 m-tail). The robot runs wide, cuts in at
+  the pin, and the position-only arrival gate stops it still turned in.
+  R 1.0 m glues (planner fallback tier) = stock full lock → **5/5 aborted**.
+  Replay with the node's own control code (`sim.py`) reproduces the log
+  (+15° vs +13°, R 1.0 glue 0/4); with correct steering: +1.6°, R 1.0 glue 4/4.
+- **Junior** keeps collecting data on the stock driver meanwhile (operator,
+  2026-10-06). Remote test done (above). Hardware hack / QCar port no longer
+  needed for steering.
+- Found on the way: sidecar `git_commit` records the NUC's own git HEAD
+  (`3bda80d` on 2026-10-06 legs), not the deployed code stamp (then
+  `5361e81+dirty`) — provenance bug. The reposition `[io-dbg]` log is the only
+  record of reposition trajectories and lives in `/tmp` (wiped on reboot).
+
 **2026-10-04 — CRITICAL: steering reached the wheels at ~0.4× (stock driver scale
 error, not mechanical).** The stock AgileX ROS2 `limo_base` driver converts the
 commanded bicycle steering to an inner-wheel angle, clamps it at 28° and sends
@@ -305,7 +337,33 @@ is ready; next session is the first real run.
 
 ## Next session — start here
 
-**2026-10-04 list (supersedes the 2026-05 list below):**
+**2026-10-07 list (supersedes the 2026-10-04 list below):**
+
+1. **Advisor: switch data collection to `steering_mode=direct`?** Fixes the
+   controllers' steering and the reposition undershoot, but changes conditions
+   mid-dataset; every run so far drove at ~0.4–0.45× commanded steering.
+2. If yes: make `direct` the launched default (`limo_base.launch.py` param /
+   orchestrator `base` entry); re-plan with R_min 0.55 m (matrix R 0.5 / 0.4
+   still infeasible; ρ ≤ ~1.8 rad/s at 1.0 m/s); redo the §2.3 sim-fidelity
+   match; drop `max_steering_rad` 0.408 → 0.35.
+3. If no (stay stock): reposition-only fix — pre-distort ω in `reposition_node`
+   so the stock ÷2.47 chain lands on the asked angle (sim: +15° → +1.6° on the
+   R 1.2 glue), must be turned off if `direct` lands — plus a glue floor ≥ 1.2 m
+   (the 0.85 fallback tier produced R 1.0 glues that abort 5/5). Not built.
+4. **Glue-start aborts:** 7 repositions started 3–4.5 m from the glue start,
+   facing 73–155° off (glue planned from where the previous leg *should* have
+   ended). Unexplained; check leg end pose vs plan in the bags.
+5. **Speed cap 1.0 m/s** — still untested (stand test; also a full-throttle
+   remote run shows whether the cap applies outside ROS).
+6. Sidecar provenance: record the deploy stamp (`~/.hinf_deploy_stamp`), not
+   the NUC's git HEAD.
+7. Ask AgileX: units of the 0x111 steering field + firmware version.
+8. Uncommitted: `experiment.yaml` (archive) + `plan.priority` code/test;
+   sidecar arrival recording (`run_executor_node.py`, `test_sidecar_arrival.py`);
+   unfinished drafts `tools/analysis/{pilot_report,reposition_sim}.py`.
+9. Docs: `DOC/experiment.md` matrix now says 320 / wiggles archived.
+
+**2026-10-04 list (superseded by the 2026-10-07 list above):**
 
 1. **Steering sweep (field; wheels on floor → confirm with the operator).** Through
    the patched driver, raw chassis steering **0.20 → 0.45 rad at crawl**, RTK circle

@@ -11,8 +11,8 @@ Footprint (sim, both passes, 75-100% of the reported angle): <= 2.7 m ahead,
 
 Publishes ONLY cmd_vel_raw (-> estop_cli -> /cmd_vel). Refuses unless base +
 estop are up, estop is clear, chassis is in Ackermann mode, odom/IMU are live
-and nobody else publishes cmd_vel_raw. Zero command + steering_mode=agilex on
-exit, Ctrl-C or any error.
+and nobody else publishes cmd_vel_raw. Zero command + the steering_mode it found
+restored on exit, Ctrl-C or any error.
 """
 import math, sys, time
 import rclpy
@@ -81,10 +81,14 @@ def call(cli, req):
     return f.result()
 
 
+def get_mode():
+    g = call(getp, GetParameters.Request(names=["steering_mode"]))
+    return g.values[0].string_value if g and g.values else None
+
+
 def set_mode(m):
     call(setp, SetParameters.Request(parameters=[Parameter("steering_mode", value=m).to_parameter_msg()]))
-    g = call(getp, GetParameters.Request(names=["steering_mode"]))
-    return (g.values[0].string_value if g and g.values else "?") == m
+    return get_mode() == m
 
 
 def send(cmd):
@@ -105,6 +109,7 @@ def med(xs):
 
 rows = []
 rc = 0
+orig_mode = None   # steering_mode found before the first pass
 try:
     t0 = time.monotonic()
     while time.monotonic() - t0 < 12.0 and not (odo and imu and est and stat
@@ -132,6 +137,9 @@ try:
     if problems:
         print("REFUSING: " + "; ".join(problems)); rc = 2
     else:
+        # Restored on exit: the driver default is direct since 2026-10-07 and
+        # run_executor refuses preflight on anything else.
+        orig_mode = get_mode() or "direct"
         for pi, (mode, steps) in enumerate(PASSES):
             if pi:
                 stop(2.0)
@@ -165,7 +173,8 @@ try:
 finally:
     stop(1.0)
     try:
-        print("restore steering_mode=agilex:", "ok" if set_mode("agilex") else "FAILED")
+        if orig_mode is not None:   # only undo a change this script made
+            print(f"restore steering_mode={orig_mode}:", "ok" if set_mode(orig_mode) else "FAILED")
     finally:
         stop(0.3)
         n.destroy_node(); rclpy.shutdown()

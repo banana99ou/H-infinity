@@ -9,7 +9,8 @@ wheel angle to the person watching. Sequence (left, then right), wheel speed
   A  agilex  straight 2 s | stock FULL LOCK 5 s | straight 3 s
   B  direct  0.198 4 s | 0.30 4 s | 0.408 5 s | straight 3 s
   C  direct  -0.408 (right) 5 s | straight 2 s
-then steering_mode back to agilex and zero command (also on error / Ctrl-C).
+then steering_mode back to what it was before A, and zero command (also on
+error / Ctrl-C).
 Watch: is the B 0.408 lock visibly further than the A stock lock?
 """
 import math, sys, time
@@ -45,11 +46,15 @@ def call(cli, req):
     return f.result()
 
 
+def get_mode():
+    g = call(getp, GetParameters.Request(names=["steering_mode"]))
+    return g.values[0].string_value if g and g.values else None
+
+
 def mode(m):
     r = call(setp, SetParameters.Request(parameters=[Parameter("steering_mode", value=m).to_parameter_msg()]))
     ok = bool(r and r.results and r.results[0].successful)
-    g = call(getp, GetParameters.Request(names=["steering_mode"]))
-    now = g.values[0].string_value if g and g.values else "?"
+    now = get_mode() or "?"
     print(f"  steering_mode -> {m}: {'ok' if ok and now == m else 'FAILED'} (reads {now})", flush=True)
     return ok and now == m
 
@@ -81,6 +86,7 @@ def stop(sec=1.0):
 
 
 rc = 0
+orig_mode = None   # steering_mode found before pass A
 try:
     t_disc = time.monotonic()
     while time.monotonic() - t_disc < 12.0 and not (odo and n.get_publishers_info_by_topic("/cmd_vel")):
@@ -95,6 +101,9 @@ try:
     else:
         def tw(d):  # yaw rate that asks for bicycle angle d at V
             return V * math.tan(d) / L
+        # Restored on exit: the driver default is direct since 2026-10-07 and
+        # run_executor refuses preflight on anything else.
+        orig_mode = get_mode() or "direct"
         print("A agilex (stock)", flush=True)
         if not mode("agilex"): raise SystemExit(3)
         hold("straight", 0.0, 2.0, "agilex")
@@ -112,7 +121,8 @@ try:
 finally:
     stop()
     try:
-        mode("agilex")
+        if orig_mode is not None:   # only undo a change this script made
+            mode(orig_mode)
     finally:
         stop(0.5)
         n.destroy_node(); rclpy.shutdown()

@@ -59,8 +59,10 @@ fix this copy. Live status lives in `ToDo.md`.
 >   + `tail -40 /tmp/limo_orchestrator/calib.log`. Usual causes: RTK not FIXED;
 >   "not turning" (driver not in direct mode — check `/limo_base/config`); left the
 >   venue clearance (re-plan); "steering changed" (sanity vs lock).
-> - **Pause "no steering calibration yet and this batch has no figure-8":** the
->   browser sent an old plan — Auto-plan again, Send, Start.
+> - **`START REFUSED` card "no steering calibration yet and this batch has no
+>   figure-8":** the browser sent an old plan — Auto-plan again, Send, Start.
+>   Preflight waiting on "the orchestrator has no 'calib' PROC": the stack predates
+>   the deploy — ask the human to restart `limo-battle` (no movers running).
 > - **Never delete or edit `Experiment Data/calibration/matrix_lock.json`** — it
 >   defines the matrix; a new lock starts a new matrix and orphans the data.
 >   Results: `matrix_lock.json`, `checks.jsonl` (every figure-8) and the

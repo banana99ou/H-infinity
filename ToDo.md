@@ -5,6 +5,39 @@ Working checklist for getting the professor-provided H-infinity stack from
 
 ## Status
 
+**2026-10-08 (night) — automatic steering calibration + auto-radius matrix built
+(operator: "imperative we get R_min tomorrow").** Procedure unchanged
+(Auto-plan → Send → Start); details for the field agent in
+`DOC/agent_field_runbook.md` (top box).
+- **Calibration stage:** every plan starts with an open-loop figure-8 at full
+  lock (`calib_node`, new mover PROC `calib`, C6 with three movers). First session
+  = `full` (0.5 + 1.0 m/s) → writes the ONE-TIME lock
+  `Experiment Data/calibration/matrix_lock.json` (R_min = worse side at 1.0 m/s;
+  radii = 1/(f × 0.8/R_min), f = 0.4/0.57/0.8/1.0, rounded 0.05 m) → the executor
+  re-plans the matrix itself (threaded, ~1 min), persists active.json, transits into
+  stage 2. Later sessions: `sanity` figure-8 at 1.0 m/s when the last pass is > 4 h
+  old; > 15 % change pauses. Every attempt → `calibration/checks.jsonl`.
+- **Matrix:** `radius_m: auto` (`calibration.py`, `manifest.load_experiment`).
+  Only legs whose sidecar `matrix_epoch` = the lock epoch count → progress restarts
+  at 0/320; stock-driver legs never credit. `plan.first_pass_reps: 1` = one rep of
+  every cell (all stages) before filling any cell; wrap glue planned.
+- **Limits:** follower steering clip 0.5 → 0.35 rad (`delta_max_rad`); glue speed
+  0.2 → 0.4 m/s, `reposition_speed_mps` live-settable, abort-rate card (2 of 5)
+  suggests 0.3.
+- **Tests:** `test_calib_node.py` (30, simulated robot + every abort),
+  `test_calibration_plan.py` (lock math, auto matrix, planner stage, Python legs ==
+  real WebUI JS), `test_executor_calibration_flow.py` (REAL executor on fake rclpy:
+  Start → figure-8 → lock → re-plan → transit → first pass; sanity fail → retry).
+- **Not verified on the floor:** the figure-8 itself, the calib_node SIGTERM path
+  on Humble (pedestal-tested), reposition at 0.4 m/s with full steering.
+- Speed-cap investigation: no software/firmware lever; commanding > 1.0 m/s
+  already gives ~1.2 m/s (motor saturation). Stock-data saturation check: R ≤ 0.7
+  arcs saturated for both controllers; R 1.0 partly; stock data cannot test the
+  SPEC §0 claim. (Morning report, 2026-10-08.)
+- **Open:** mirrored right turns (fit-checked: fits the live rooftop at 1/2/5 m
+  lead-ins as separate stages) and the lead-in length (2 m vs 5 m, operator call)
+  are NOT built yet.
+
 **2026-10-07 (evening) — patched driver v2 deployed (`15cefbe`): direct steering
 + fixed odometry are the defaults; full code audit done.**
 - **Odometry was wrong too** (`SPEC.md` §7.8): stock pose yaw dropped every IMU

@@ -617,3 +617,12 @@ exercised; vertices 3–5 stay dormant. Report the achieved ρ(t) range honestly
      limit is measured. (Wiggles were archived from the matrix 2026-10-06.)
    - `max_steering_rad` default could drop 0.408 → 0.35 to match the chassis
      (no behavior change; the chassis caps there anyway) — not done.
+   - **2026-10-08: measured in the field, every session (automatic).** Each plan
+     starts with an open-loop figure-8 at full lock (`calib_node`; result,
+     lock and checks under `Experiment Data/calibration/`). The first one locks
+     the matrix radii from R_min at 1.0 m/s (`calibration.py`; `radius_m: auto`
+     in `experiment.yaml`); later ones are sanity checks. §3's steering clip is
+     now the follower param `delta_max_rad` = 0.35 (was the hard-coded ±0.5),
+     so the LPV's `delta_meas` (previous clipped command) no longer exceeds what
+     the chassis can deliver. The sim's δ_max for the §2.3 / §6 regeneration
+     should come from the lock's `delta_max_rad`.

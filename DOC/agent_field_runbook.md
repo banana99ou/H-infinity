@@ -35,6 +35,40 @@ fix this copy. Live status lives in `ToDo.md`.
 >   the E-STOP at hand; after the first few legs pull the bags
 >   (`tools/sync/sync.sh pull`) so the new odometry can be checked against RTK.
 
+> **Steering calibration + auto matrix (2026-10-08) — read before the session.**
+> The operator procedure is unchanged: **Auto-plan → Send → Start** in the
+> battle station. What is new happens inside that one Start:
+> - **First session ever (no lock yet):** the plan has ONE stage, `calibration`.
+>   After Start the robot drives a loop + straight to the calibration pin, then an
+>   **open-loop figure-8 at full steering lock**: a full left and a full right
+>   circle at 0.5 m/s, then again at 1.0 m/s (~30 s, circles ~1.2 m across at up
+>   to 1 m/s — keep people ≥ 3 m clear). Cards, in order: `CALIBRATION (FULL)` →
+>   `R_min LOCKED` (the measured R_min and the matrix radii) → `MATRIX PLANNED`
+>   (the robot plans the whole matrix itself, ~1–2 min standing still) → it drives
+>   on into stage 2 unattended. **Getting the R_min number is the session's #1
+>   goal** — if anything blocks it, report to the human right away.
+> - **Later sessions:** the plan starts with a short `sanity` figure-8 at 1.0 m/s
+>   (only if the last passing one is > 4 h old); it pauses if R_min moved > 15 %.
+> - **First pass:** the batch drives ONE rep of every cell (all 8 stages) before
+>   filling any cell to 10, so a short day still ends balanced.
+> - **Progress restarts at 0/320**: only legs recorded under the lock's `epoch`
+>   count (the old stock-driver legs never do). That is expected.
+> - **`CALIBRATION FAILED` card:** read the reason, press Start once to retry (the
+>   robot goes back to the pin and redoes the figure-8). Second failure → stop and
+>   send the human the card text + `tail -40 /tmp/limo_orchestrator/run_executor.log`
+>   + `tail -40 /tmp/limo_orchestrator/calib.log`. Usual causes: RTK not FIXED;
+>   "not turning" (driver not in direct mode — check `/limo_base/config`); left the
+>   venue clearance (re-plan); "steering changed" (sanity vs lock).
+> - **Pause "no steering calibration yet and this batch has no figure-8":** the
+>   browser sent an old plan — Auto-plan again, Send, Start.
+> - **Never delete or edit `Experiment Data/calibration/matrix_lock.json`** — it
+>   defines the matrix; a new lock starts a new matrix and orphans the data.
+>   Results: `matrix_lock.json`, `checks.jsonl` (every figure-8) and the
+>   calibration bags, all under `Experiment Data/calibration/`.
+> - Use the current battle station (`git pull`): an older page still works but
+>   draws the figure-8 wrong. Steering clip is now 0.35 rad (the measured cap) in
+>   the follower; glue speed 0.4 m/s (§7 ADJUST).
+
 ---
 
 ## 0 · Mission — what you are proving
@@ -304,6 +338,21 @@ rr "$SRC ros2 topic info /cmd_vel_raw"     # Publisher count must be <= 1
 > additions — never exercised outdoors. The last runaway threw **no error and never
 > incremented `fail`**; the human eyeball was the only catch. Watch **actual motion**
 > as ground truth; do not wait for an alarm to fire.
+
+**ADJUST — reposition speed (2026-10-08):**
+- Glue/reposition drives at **0.4 m/s** (`experiment.yaml` `plan.glue.v_const`,
+  capped by the `run_executor_node` param `reposition_speed_mps`, which is
+  **live-settable** and applies from the next reposition). Was 0.2. (Replay of the
+  71 repositions of 2026-10-06 through the real reposition code with full steering:
+  same arrivals at 0.2 / 0.4 / 0.5, median 41 s → 21 s each.) 0.4 oscillated once,
+  on 2026-06-10, while the heading estimate was being dragged by a faulty FCU feed
+  on the old 0.45× steering; not retried since — watch the first repositions.
+- The executor raises a `REPOSITIONS KEEP ABORTING` card carrying the command below.
+- **Rule:** if **2 of the last 5 repositions abort** at 0.4, drop to 0.3
+  and tell the human:
+  `rr "$SRC ros2 param set /run_executor_node reposition_speed_mps 0.3"` (takes
+  effect at the next reposition). If 0.3 still fails, 0.2 is the old proven value —
+  stop and ask the human before going lower or back up.
 
 **Stop controls (escalating):**
 ```bash

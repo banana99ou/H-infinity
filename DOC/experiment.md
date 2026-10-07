@@ -173,8 +173,11 @@ steering ceiling (`SPEC.md` §7.8).
 commanded steering (stock driver; full lock ≈ R 1.0 m), so the step / slalom
 cells (R ≤ 1.0) ran at or past the steering limit. Whether those runs count is
 an open advisor decision — `SPEC.md` §7.8, `ToDo.md`. The patched driver
-(`steering_mode=direct`, installed 2026-10-06, default still stock) measured
-R_min 0.55 m on the floor: R 0.7 becomes reachable, R 0.5 / 0.4 stay below it.
+(`steering_mode=direct`, installed 2026-10-06, the default since 2026-10-07)
+measured R_min 0.55 m on the floor: R 0.7 becomes reachable, R 0.5 / 0.4 stay
+below it (they need δ = 0.38 / 0.46 rad; the chassis stops at ~0.35). The same
+runs also had a crabbed, deadbanded odometry (`SPEC.md` §7.8; fixed 2026-10-07,
+`odom_model=hinf`).
 
 **Headline plot for the paper:** max heading error vs R at v = 1.0 m/s,
 both controllers overlaid, error bars across N = 10. The crossover point

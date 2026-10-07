@@ -146,7 +146,9 @@ Notes:
   (control is on `/wheel/odom`, see ADR-01).
 - E-stop button in the battle station works as long as the operator has
   the AP. If the AP drops, the LIMO firmware watchdog stops the robot
-  within ~0.5 s of `/cmd_vel` silence (LIMO base default).
+  after `/cmd_vel` silence: measured 2026-10-07 on the pedestal, speed held
+  0.52 s after the last command and was zero by 0.6 s (the 2026-06 GNSS-session
+  bags agree: held ~0.5 s, zero by ≤ 1.0 s). The ROS driver has no timeout of its own.
 
 ## Operational checklist (outdoor)
 

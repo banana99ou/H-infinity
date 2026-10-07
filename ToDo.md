@@ -5,6 +5,74 @@ Working checklist for getting the professor-provided H-infinity stack from
 
 ## Status
 
+**2026-10-07 (evening) — patched driver v2 deployed (`15cefbe`): direct steering
++ fixed odometry are the defaults; full code audit done.**
+- **Odometry was wrong too** (`SPEC.md` §7.8): stock pose yaw dropped every IMU
+  step < 0.1°, and position crabbed by the believed steering angle — after one
+  90° step `/wheel/odom` read "on the path" while RTK had the robot 0.2–0.7 m
+  outside. New `odom_model=hinf` (rear axle on raw IMU yaw, pose at the sim CG
+  0.1 m ahead). Bag replay, 64 June legs: post-turn error vs RTK 0.364 → 0.130 m,
+  better on 41/41. Pedestal 2026-10-07: 9/9 checks pass.
+- **Defaults are now `steering_mode=direct`, `odom_model=hinf`** in the driver
+  and `limo_base.launch.py` — every restart used to revert to stock silently.
+  `/limo_base/config` (latched) is bagged; `run_executor` preflight requires
+  direct/hinf and fails a leg whose driver config changed mid-leg.
+  Runbook + rollback: `DOC/deployment.md` G6.
+- **Live checks on the NUC (no motion):** recorder records `/limo_base/config`
+  with the new QoS override; `quick_gate` does not require it; the real
+  `RunExecutor` receives the live config with no problems.
+- **Firmware stops the chassis on `/cmd_vel` silence:** held 0.52 s, zero by
+  0.6 s (pedestal). The ROS driver has no timeout.
+- **NOT verified yet — first floor session:** turning odometry vs RTK, and
+  reposition / glue behaviour with full steering authority (its tuning was done
+  on the 0.4× plant). Run a short pilot before any scored batch.
+- **Fixed:** `tools/qc/steer_floor.py` / `steer_pedestal.py` used to leave
+  `agilex` on exit (→ executor preflight blocked until `base` restarted); they
+  now restore the mode they found, and change nothing if they refuse to run.
+  Not yet exercised on the robot.
+
+**2026-10-07 audit — open items** (5 read-only reviewers + re-verification;
+ME = re-run by the auditor, MEAS = reviewer-measured, INF = inferred).
+Safety / autonomy, before scored runs:
+- [ ] Executor ignores odom loss during RUN (`run_executor_node._tick_run`); a
+      driver respawn restarts odom at the origin and `odom_zero` has no jump
+      handling → follower resumes on a false pose (ME code; jump INF). The leg is
+      now failed by the driver-config verdict, but the robot keeps driving.
+- [ ] Geofence fails open: never trips without a first fix; NaN fixes refresh
+      its staleness timer; executor never starts or requires it
+      (`tools/safety/geofence_watchdog.py:66-81`, ME read).
+- [ ] Pause/abort only SIGTERMs the movers — no zero, no `/estop_trigger`; the
+      robot coasts on the last command until the firmware stops it (~0.6 s).
+- [ ] Containment checks the authored pin pose, the recipe runs from the
+      achieved pose; the 20° arrival gate allows up to 1.6 m at the far end vs a
+      0.30 m margin (`arrival_heading_tol_deg`; MEAS).
+- [ ] R 0.5 / 0.4 cells infeasible even in direct (δ 0.38 / 0.46 > ~0.35).
+      Steering limits disagree: follower clip 0.5, driver 0.408, chassis ~0.35,
+      reposition r_min 0.37 m.
+- [ ] `StepCurvaturePath(direction=-1)` cusp is still offered by the WebUI Leg
+      batch and not rejected downstream (MEAS).
+- [ ] E-STOP button / Space toggle stop↔clear with no debounce; rosbridge has
+      no topic whitelist (INF).
+Data / analysis:
+- [ ] Wilcoxon on per-R means can never reach p < 0.05 (= `SPEC.md` §7 item 4;
+      still in `aggregate.py`).
+- [ ] RTK truth defaults to the commanded pin frame (`build_dataset.py
+      --rtk-frame pin`), charging the ~7° arrival error to the controller;
+      `--rtk-frame achieved` silently falls back per leg; `achieved_anchor.valid`
+      is inversely related to accuracy (MEAS).
+- [ ] Sidecar `git_commit` is the NUC checkout's HEAD, never the deployed code
+      (`0900ea1` does not exist in the laptop repo; ME). `reached_end` is true by
+      construction (no sidecar for unfinished legs); the 107 count has no
+      is_paper filter (INF).
+- [ ] `run_qc.py laptop` is red: `test_cti_underestimates_on_non_monotone_data`.
+- [ ] RTK antenna lever arm uncompensated (fit ≈ 0.10 m fwd, 0.075 m right —
+      tape it); RTK stamps are NMEA arrival time (~0.12 s late) (MEAS).
+- [ ] Speed cap: commanding 1.5 m/s drove ~1.2 m/s (2026-06-16 GNSS session;
+      odom ME, RTK MEAS) — contradicts the 1.0 m/s cap in `system_spec.md` §6.
+- [ ] Re-check on the new odometry: `SPEC.md` §5 bag-mined finding 3 (yaw noise
+      fitted on deadbanded yaw); `DOC/dataset_report_2026_09_08.md` (claims one
+      commit d6dfd38 for all runs, "pass 82/83").
+
 **2026-10-07 — patched driver measured: R_min 1.04 m → 0.55 m. Wiggles archived.
 Reposition undershoot root-caused.** (Chat of 2026-10-06/07; artifacts in
 `Experiment Data/diagnostics/2026-10-06_steering/`, scripts in
@@ -13,7 +81,7 @@ Reposition undershoot root-caused.** (Chat of 2026-10-06/07; artifacts in
   operator) → back to step + slalom, **320 runs**. Code/tests/battle-station types
   kept; may later replace the single-turn (step) family. Pushed to the NUC via
   the relay (deployed 2026-10-06 18:21 KST). `plan.priority` key removed (was the
-  wiggle pilot list; the mechanism stays). *Not committed yet.*
+  wiggle pilot list; the mechanism stays). *Committed 2026-10-07 in `024b71b`.*
 - **Driver:** patch committed (`5db1a73`, `2b2c3cb`) and installed on the NUC,
   default `agilex` (stock). Measured: stock full lock R 1.04 m, direct
   0.35 rad → R 0.55 m; chassis caps at ~0.35 rad; remote full lock ≈ 0.4 m.

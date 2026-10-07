@@ -124,7 +124,8 @@ a hole). Usable space is the periphery around the island; curves and turnarounds
 | `/path_follower/done` | `std_msgs/Bool` (latched) | follower → sequencer | crisp completion edge (O3) |
 | `cmd_vel_raw` → `/cmd_vel` | `geometry_msgs/Twist` | controller/reposition → estop → base | sole actuation path (C3) |
 | `/estop`, `/estop_trigger` | `std_msgs/Bool` | estop ↔ * | latched safety (C4) |
-| `/wheel/odom` | `nav_msgs/Odometry` | base → overlay / bag | raw wheel odom (recorded as L1 reference; not the control input) |
+| `/wheel/odom` | `nav_msgs/Odometry` | base → overlay / bag | raw wheel odom (recorded as L1 reference; not the control input). Since 2026-10-07 (`odom_model=hinf`): pose = point 0.1 m ahead of the rear axle (sim CG) integrated on the raw IMU yaw; twist is stock, `angular.z` = commanded-steering belief, not measured |
+| `/limo_base/config` | `std_msgs/String` (JSON, latched, transient-local) | base → run_executor / bag | chassis driver configuration `{steering_mode, max_steering_rad, odom_model, odom_point_x_m, node_start_unix}`; preflight requires `direct`/`hinf`, a scored leg fails if it changed mid-leg (2026-10-07) |
 | `/wheel/odom_zeroed` | `nav_msgs/Odometry` | overlay → follower / bag | re-anchored control feedback in the per-leg path frame (L1,L3) |
 | `/odom_zero/reset` | `std_msgs/Bool` | sequencer → overlay | command odom zero (L3) |
 | `/odom_zero/status` | `std_msgs/String` (JSON, latched, transient-local) | overlay → sequencer | reset-latch confirmation `{has_reset, origin{x,y,yaw}, stamp}` (L3 closed-loop) |
@@ -174,6 +175,10 @@ compute-cost figure from a bag directory in one command.
   was the stock `limo_base` driver's steering scale (~0.4×, full lock 0.198 rad →
   R ≈ 1.0 m), not the linkage — the physical limit is unmeasured (sweep pending).
   Speed-cap provenance per C2. See `SPEC.md` §7.8.
+  *2026-10-07:* the patched driver (`steering_mode=direct`, now the default)
+  measured δ_max ≈ 0.35 rad, R_min ≈ 0.55 m through ROS (floor, IMU). **Flag
+  (not yet resolved):** the 1.0 m/s cap is contradicted by the 2026-06-16 GNSS
+  session — commanding 1.5 m/s drove ~1.2 m/s (odom 1.20–1.25, RTK 1.22).
 - **Ackermann** mode (`motion_mode == 1`) required and checked before wheels-on-floor.
 - **ADR-01**: RTK never fused into the control loop.
 - Safety chain (C3) and E-stop semantics (C4) are inviolable.

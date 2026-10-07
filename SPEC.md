@@ -321,11 +321,17 @@ Methods: RTK circle fit on the NMEA GGA track (7 Hz, quality 4, fit residual
    explanation is refuted); wheel-odom under-reads speed by ~10% vs RTK
    (odom 0.91–0.93 vs VTG 1.02–1.05) — calibration bias, also skews the
    belief-frame turn radius (belief 0.95–1.04 m vs true 1.1–1.2 m).
+   *2026-10-07 audit (reviewer-measured, not re-run): on straights odom speed
+   is only 1–1.6% under RTK; the ~10% is `twist.linear.x` = v·cos δ_belief in
+   turns. The belief-frame radius is also skewed by the odometry crab (§7.8).*
 3. **Yaw noise (the §0 fragility, now measured):** odom-yaw white floor
    during motion ≈ **0.006–0.010 rad @50 Hz at v=1.0**, 0.003–0.004 at v=0.5,
    0.0002 at v=0.2 — speed-scaling (vibration-driven), and **3–5× smaller
    than the sim's σ_ψ=0.03**. Slow drift dominates the long term (June-11:
    9–11 cm RMS position drift per leg).
+   *2026-10-07: measured on the stock odom yaw, which drops every IMU step
+   < 0.1° (§7.8) — small increments are zeroed, so this floor is biased low.
+   Re-measure on `/imu` or `odom_model=hinf` before it decides the headline.*
 4. **Controller rate:** `/path_follower/timing` inter-arrival median 50 ms =
    **20 Hz confirmed** (matches deployed dt_ctrl).
 5. **Headline sensitivity at measured reality** (dt=0.05, δ_max=0.175 both,
@@ -540,8 +546,37 @@ exercised; vertices 3–5 stay dormant. Report the achieved ρ(t) range honestly
      (default, stock path unchanged) | `direct` (sends atan(L·ω/v) unscaled,
      clamped to `max_steering_rad` 0.408; feedback read as the bicycle angle).
      Settable at runtime: `ros2 param set /limo_base_node steering_mode direct`.
-     Installed on the NUC 2026-10-06 21:08 KST, **default left at `agilex`** —
-     no run uses it yet. Install/rollback: `DOC/deployment.md` G5.
+     Installed on the NUC 2026-10-06 21:08 KST with the default left at `agilex`.
+     **Since 2026-10-07 23:10 KST (`15cefbe`) the default is `direct`** — before,
+     every `base` restart (incl. `odom_watchdog` respawns) silently reverted to
+     stock. No scored run uses it yet. Install/rollback: `DOC/deployment.md` G6.
+   - **The stock odometry was wrong too (found 2026-10-07, fixed in `15cefbe`).**
+     Two defects under the controller's only feedback, both in the vendor code:
+     - Pose yaw = chassis IMU Euler yaw with every per-frame step < 0.1° dropped
+       (`limo_driver.cpp` publishIMUData). At 100 Hz roughly half of any heading
+       change slower than ~15°/s is lost (median 2.1° per v=1 leg, 4.3° at v=0.5).
+       So `/wheel/odom` yaw **is** an IMU measurement, not a command echo — only
+       `twist.angular.z` is the echo — but a deadbanded one. The yaw-noise floor
+       of §5 bag-mined finding 3 was fitted on this deadbanded signal.
+     - Position integrates (v cos δ_b, v sin δ_b) where δ_b is the steering angle
+       the driver *believes* (×2.47 too large under stock steering), so the pose
+       is no fixed body point. After one 90° step `/wheel/odom` sat on the
+       reference while RTK put the robot 0.2–0.7 m outside the turn (3 R1 legs,
+       RTK fitted on the pre-turn straight only: 0.20 / 0.59 / 0.72 m).
+     - **Fix: `odom_model=hinf`** (`include/limo_base/odom_model.h`): rear axle
+       integrated along the raw, unwrapped IMU yaw; pose published 0.1 m ahead
+       (the CG the vendor sim tracks, `models/kinematic.py` l_r). No steering
+       angle enters, so the pose is the same in both steering modes; the twist
+       stays stock. Replayed through the real header on 64 June stock-mode bags:
+       stock model reproduces the recorded odom to ≤ 2.3 mm (harness check);
+       C++ vs an independent Python integrator ≤ 0.023 mm; post-turn error vs
+       RTK **0.364 → 0.130 m median, better on 41/41 legs** (the rest matches
+       the ~7.5 cm lateral antenna offset; point offset 0.0/0.1/0.2 m →
+       0.136/0.130/0.221 m). Pedestal 2026-10-07: steering 0.25 rad leaves the
+       pose straight (stock would crab ~20 cm). **Not yet checked on the floor**
+       (turning vs RTK) — first direct-mode bags.
+     - Every scored run so far had both defects in its control feedback and in
+       its odom-belief metrics.
    - **Measured limit (2026-10-06/07):**
      - Remote control (bypasses ROS), junior's tape test: full lock R ≈ 0.4 m.
      - Pedestal, direct mode: chassis reports what it is sent up to **~0.35 rad**
@@ -561,7 +596,8 @@ exercised; vertices 3–5 stay dormant. Report the achieved ρ(t) range honestly
      value sent (it reports its setpoint, not a measured wheel angle — it does
      cap at ~0.35); driven angle vs report 0.74 (IMU) / 0.86 (RTK) in the fast
      scored legs. **`/wheel/odom` `twist.angular.z` is the driver's belief**
-     (0.98× commanded) — never use it as measured yaw rate; use `/imu`.
+     (0.98× commanded) — never use it as measured yaw rate; use `/imu`. (Still
+     true under `odom_model=hinf`: only the pose changed.)
    - **Not a local regression:** upstream `agilexrobotics/limo_ros2` (humble)
      has the same ÷2.47 / 28° code; the robot's binary was built from this
      source (same hash, log strings, constants). Driver-vs-firmware mismatch;

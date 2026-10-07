@@ -132,23 +132,54 @@ Read `ros2 topic echo --once /limo_status` (2026-10-06/07, FS remote):
   driver restarts (orchestrator `kill`/`start` `base`), which re-sends the
   command-mode enable.
 
-### G6 · The stock driver steers ~0.4× — patched `limo_base` (not relay-deployed)
+### G6 · The stock driver steers ~0.4× and its odometry crabs — patched `limo_base` (not relay-deployed)
 
 `SPEC.md` §7.8. The NUC's `limo_base` (`~/agilex_ws/src/limo_ros2/limo_base`) runs
-the repo fork `src/limo_ros2/limo_base` (commits `5db1a73` vendor, `2b2c3cb` patch)
-since 2026-10-06 21:08 KST, default `steering_mode=agilex` = stock behavior.
-- Switch at runtime: `ros2 param set /limo_base_node steering_mode direct|agilex`
-  (invalid values are rejected; the setting is lost when the base restarts).
+the repo fork `src/limo_ros2/limo_base` (`5db1a73` vendor, `2b2c3cb` steering
+patch, `15cefbe` odometry + defaults). **Since 2026-10-07 23:10 KST the defaults
+are the experiment's configuration:** `steering_mode=direct`, `odom_model=hinf`.
+Every start path (`base`, `base_vanilla`, `base_gnss`, an `odom_watchdog`
+respawn, a reboot) comes back that way; before, every restart silently reverted
+to stock steering.
+- **Check it:** `/limo_base/config` (latched JSON: `steering_mode`,
+  `max_steering_rad`, `odom_model`, `odom_point_x_m`, `node_start_unix`). It is
+  bagged on every leg; a new `node_start_unix` means the driver restarted.
+  `run_executor` refuses preflight unless it reads `direct` / `hinf` (params
+  `expect_steering_mode` / `expect_odom_model`; `""` disables a check) and fails
+  a scored leg whose config was wrong at either end or changed mid-leg.
+- **Stock behaviour for an A/B:**
+  `ros2 launch limo_base limo_base.launch.py port_name:=limo_base steering_mode:=agilex odom_model:=agilex`.
+  `steering_mode` is also settable at runtime (`ros2 param set /limo_base_node
+  steering_mode agilex|direct`); `odom_model` and `odom_point_x_m` are read-only
+  (switching mid-run would jump the pose). A runtime stock setting blocks the
+  executor's preflight until `base` restarts. `tools/qc/steer_floor.py` and
+  `steer_pedestal.py` restore the mode they found on exit (since 2026-10-07;
+  before, they left `agilex`).
+- **`odom_model=hinf`:** the rear axle is integrated along the raw IMU yaw (no
+  0.1° deadband) and the pose is published 0.1 m ahead of it (the simulator's
+  CG). No steering angle enters, so the pose is the same in both steering modes.
+  The **twist is still stock**: `twist.angular.z` is the driver's *belief*
+  (v·tanδ/L of the commanded steering), not a measurement — use `/imu` for yaw
+  rate.
 - **Not** covered by `sync.sh push`/the relay (they build `limo_path_follower`
-  only). To install a change, from the repo root:
+  only). To install a change, from the repo root (back up, copy, build):
   ```bash
-  TS=$(date -u +%Y%m%dT%H%M%SZ); ssh agilex@agilex-nuc12wski7 "B=~/H-infinity-deploy-backups/limo_base_vendor_$TS; mkdir -p \$B && cp -a ~/agilex_ws/src/limo_ros2/limo_base/src ~/agilex_ws/src/limo_ros2/limo_base/include \$B/ && cp -a ~/agilex_ws/build/limo_base/limo_base \$B/limo_base.bin" && scp -q src/limo_ros2/limo_base/src/limo_driver.cpp agilex@agilex-nuc12wski7:agilex_ws/src/limo_ros2/limo_base/src/ && scp -q src/limo_ros2/limo_base/include/limo_base/limo_driver.h agilex@agilex-nuc12wski7:agilex_ws/src/limo_ros2/limo_base/include/limo_base/ && ssh agilex@agilex-nuc12wski7 'source /opt/ros/humble/setup.bash && cd ~/agilex_ws && colcon build --packages-select limo_base --symlink-install'
+  TS=$(date -u +%Y%m%dT%H%M%SZ); ssh agilex@agilex-nuc12wski7 "B=~/H-infinity-deploy-backups/limo_base_$TS; mkdir -p \$B && cp -a ~/agilex_ws/src/limo_ros2/limo_base/src ~/agilex_ws/src/limo_ros2/limo_base/include ~/agilex_ws/src/limo_ros2/limo_base/launch \$B/ && cp -a ~/agilex_ws/build/limo_base/limo_base \$B/limo_base.bin" && scp -q src/limo_ros2/limo_base/src/limo_driver.cpp agilex@agilex-nuc12wski7:agilex_ws/src/limo_ros2/limo_base/src/ && scp -q src/limo_ros2/limo_base/include/limo_base/limo_driver.h src/limo_ros2/limo_base/include/limo_base/odom_model.h agilex@agilex-nuc12wski7:agilex_ws/src/limo_ros2/limo_base/include/limo_base/ && scp -q src/limo_ros2/limo_base/launch/limo_base.launch.py agilex@agilex-nuc12wski7:agilex_ws/src/limo_ros2/limo_base/launch/ && ssh agilex@agilex-nuc12wski7 'source /opt/ros/humble/setup.bash && cd ~/agilex_ws && colcon build --packages-select limo_base --symlink-install'
   ```
-  The new binary is used the next time `base` starts. Rollback: copy `src/` and
-  `include/` back from the backup and rebuild. Original stock source:
-  `~/H-infinity-deploy-backups/limo_base_vendor_20261006T120828Z`.
-- `/wheel/odom` `twist.angular.z` is the driver's *belief* (commanded rate), not
-  a measurement — use `/imu` for yaw rate.
+  Leave `LIMO+MAVROS+RTK_Node_Launcher.launch.py` alone: the workspace copy
+  differs from the repo's (no GPS `respawn`). The new binary is used the next
+  time `base` starts. Rollback: copy `src/`, `include/` and `launch/` back from
+  the backup and rebuild. Backups: before the odometry patch
+  `~/H-infinity-deploy-backups/limo_base_20261007T141040Z`; original stock
+  source `~/H-infinity-deploy-backups/limo_base_vendor_20261006T120828Z`.
+- **Pedestal check after an install** (wheels free; ~15 s at 0.2 m/s through
+  `cmd_vel_raw`): standing still the pose must not drift and odom yaw must equal
+  IMU yaw; steering 0.25 rad must leave the pose on a straight line (stock
+  odometry crabs ~20 cm sideways); `/limo_base/config` must keep one
+  `node_start_unix`. 2026-10-07: all pass (the script is not in the repo yet).
+- **Command silence stops the chassis by itself** (measured on the pedestal
+  2026-10-07): wheel speed held 0.52 s after the last `/cmd_vel`, zero by 0.6 s.
+  The driver has no command timeout of its own.
 
 ### G7 · Steering tests need open floor, not a corridor
 

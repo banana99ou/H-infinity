@@ -102,7 +102,8 @@ model are in [`DOC/experiment.md`](DOC/experiment.md).
 ## Status
 
 Rooftop data collection is in progress, and one known issue affects the existing
-runs: the stock chassis driver delivers only ~0.4× the commanded steering. Progress,
+runs: the stock chassis driver delivered only ~0.4× the commanded steering, and its
+odometry was skewed. A patched driver is installed since 2026-10-07. Progress,
 known issues and next steps are in **[STATUS.md](STATUS.md)**.
 
 ## Getting started

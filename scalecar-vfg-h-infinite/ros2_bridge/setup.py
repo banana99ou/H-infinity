@@ -29,6 +29,7 @@ setup(
             'bag_node = limo_path_follower.bag_node:main',
             'venue_loader_node = limo_path_follower.venue_loader_node:main',
             'run_executor_node = limo_path_follower.run_executor_node:main',
+            'calib_node = limo_path_follower.calib_node:main',
         ],
     },
 )

@@ -218,6 +218,12 @@ def remaining_geometries(doc, counts, key_fn=None):
     if cfg.get("geometry_order") == "finish-nearest":
         # Stable sort: ties keep matrix order (family, then its radius list).
         out.sort(key=lambda t: t[2])
+    # plan.priority: [[family, R], ...] still-remaining cells go first, in the
+    # listed order (stages run in plan order, so these run next). Used to
+    # bring a representative pilot forward without touching the matrix.
+    pri = [(str(f), round(float(r), 6)) for (f, r) in (cfg.get("priority") or [])]
+    rank = {k: i for i, k in enumerate(pri)}
+    out.sort(key=lambda t: rank.get((t[0], round(t[1], 6)), len(pri)))
     return out
 
 

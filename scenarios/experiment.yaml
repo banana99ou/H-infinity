@@ -23,27 +23,29 @@ venue: scenarios/venues/rooftop.json
 
 # The headline curvature sweep at fixed speed (DOC/experiment.md matrix).
 # Full paper matrix is 2 controllers x 2 speeds x 2 families x 4 radii x N=10
-# = 320 runs, plus the wiggle families below (3 x 3 radii x 2 x 2 x 10 = 360).
-# Start SMALL on the robot (one controller, one radius, N=1) and widen once a
-# full cell verifies end-to-end.
+# = 320 runs. Start SMALL on the robot (one controller, one radius, N=1) and
+# widen once a full cell verifies end-to-end.
 matrix:
   radius_m: [1.0, 0.7, 0.5, 0.4]
   controller: [lpv-hinf, pid]
   v_const: [1.0, 0.5]
-  path_family: [step, slalom, wiggle_sine, wiggle_chirp, wiggle_square]
-  # Wiggle families (2026-10-02, advisor: "try more wiggly paths"): curvature
-  # changes often but stays ABOVE the measured steering ceiling — the LIMO never
-  # turned tighter than ~0.85-1.2 m (SPEC.md), so they sweep their own radii.
-  # 1.2 sits at the ceiling measured at v=1.0; 1.5 / 2.0 stay clear of it.
-  radius_m_by_family:
-    wiggle_sine: [2.0, 1.5, 1.2]
-    wiggle_chirp: [2.0, 1.5, 1.2]
-    wiggle_square: [2.0, 1.5, 1.2]
+  path_family: [step, slalom]
+  # ARCHIVED 2026-10-06 — wiggle families (wiggle_sine / _chirp / _square,
+  # limo_path_follower/wiggle_path.py) are out of the matrix; may later replace
+  # the single-turn (step) family. Code, tests and the battle-station Leg batch
+  # types stay. To restore: add them to path_family and uncomment:
+  # radius_m_by_family:
+  #   wiggle_sine: [2.0, 1.5, 1.2]
+  #   wiggle_chirp: [2.0, 1.5, 1.2]
+  #   wiggle_square: [2.0, 1.5, 1.2]
 
 repetitions: 10
 
 # Auto-layout planner overrides (deep-merged over experiment_planner.PLAN_DEFAULTS).
 plan:
+  # priority: [[family, R], ...] runs those still-remaining cells first, in
+  # that order (empty = matrix order). The 2026-10-03 wiggle pilot list went
+  # with the wiggle archive.
   glue:
     # Trackable min radius for reposition/glue curves. 0.85 m: with the
     # self-intersection reject added to the glue gate (2026-06-13), every

@@ -49,6 +49,7 @@ remaining treatments (manifest-driven, restart-safe); when a stage fills,
 the executor containment-gates the next stage and advances unattended.
 """
 import json
+import math
 import os
 import sys
 import time
@@ -159,6 +160,56 @@ except Exception:  # noqa: BLE001
 # Battery warn threshold (volts) for the once-per-crossing Discord page;
 # matches preflight.sh / ntfy.py conventions (warn 10.8, halt 10.5).
 BATT_WARN_V = 10.8
+
+# Arrival attribution (sidecar "arrival", 2026-10-04). Field analysis found the
+# robot reaches the start pin a median 7 deg (p90 12 deg, RTK) off its heading,
+# but the sidecar did not say which glue it arrived on, so only 9 of 56 legs
+# could be matched to glue geometry. Every scored leg now records the glue as
+# sent to reposition plus these metrics. The tail threshold mirrors the
+# planner's settle_align_deg default (experiment_planner._glue_quality) and
+# tools/analysis/plan_report.py, so plan-time and run-time numbers compare.
+ARRIVAL_TAIL_ALIGN_DEG = 5.0
+
+
+def glue_arrival_metrics(waypoints_wgs84, end_heading_deg,
+                         align_deg=ARRIVAL_TAIL_ALIGN_DEG):
+    """Geometry of the glue polyline the robot arrived on (pure, no ROS).
+
+    Projects the waypoints EXACTLY as sent to reposition into a local EN frame
+    about waypoint 0 (venue_geom's equirectangular model; metrics are frame-
+    invariant) and reuses the planner's own helpers, so these are the same
+    numbers the planner optimized:
+      max_curvature_1pm / min_turn_radius_m  Menger curvature over consecutive
+          waypoint triples (_max_curvature). A straight glue has curvature 0
+          and min_turn_radius_m None (infinite; strict JSON has no Infinity).
+      tail_straight_m  the final stretch whose segment bearing stays within
+          align_deg of end_heading_deg (_tail_straight): the straight the
+          tracker settles its heading on before the pin. None when the glue
+          has no explicit end heading.
+      length_m  polyline length.
+    Raises on malformed input or a missing planner — the caller guards it.
+    """
+    wps = list(waypoints_wgs84 or [])
+    if not wps:
+        raise ValueError("glue has no waypoints")
+    lat0, lon0 = float(wps[0]["lat"]), float(wps[0]["lon"])
+    pts = [venue_geom.latlon_to_en(float(w["lat"]), float(w["lon"]), lat0, lon0)
+           for w in wps]
+    length = sum(math.hypot(b[0] - a[0], b[1] - a[1])
+                 for a, b in zip(pts[:-1], pts[1:]))
+    k = float(experiment_planner._max_curvature(pts))
+    tail = None
+    if end_heading_deg is not None:
+        tail = float(experiment_planner._tail_straight(
+            pts, float(end_heading_deg) % 360.0, float(align_deg)))
+    return {
+        "n_waypoints": len(pts),
+        "length_m": round(length, 3),
+        "max_curvature_1pm": round(k, 4),
+        "min_turn_radius_m": round(1.0 / k, 3) if k > 1e-9 else None,
+        "tail_straight_m": round(tail, 3) if tail is not None else None,
+        "tail_align_deg": float(align_deg),
+    }
 
 
 class Phase(Enum):
@@ -317,6 +368,13 @@ class RunExecutor(Node):
         self._last_fix = None           # (lat, lon)
         self._last_fix_t = None
         self._achieved_anchor = None    # snapshot taken at odom-zero confirm
+        # Arrival attribution: the goto payload last sent, the glue snapshot
+        # taken when reposition's 'arrived' is accepted (consumed by the next
+        # recipe's odom reset), and the sidecar 'arrival' record built there.
+        self._repo_status_t = None      # monotonic receive time of _repo_status
+        self._goto_payload = None
+        self._arrival_glue = None
+        self._arrival = None
 
         # -- ROS interfaces --------------------------------------------
         latched = QoSProfile(
@@ -437,8 +495,9 @@ class RunExecutor(Node):
     def _on_plan_request(self, msg):
         """Auto-plan request from the WebUI: {venue: {...}} in, the planner's
         stage list out on /plan/result (latched). Planning is synchronous
-        (~5 s) so it is REFUSED while a batch is actively driving — the tick
-        state machine must not stall under a moving robot."""
+        (~18-20 s request->result for the full matrix, measured on the NUC
+        2026-10-03) so it is REFUSED while a batch is actively driving — the
+        tick state machine must not stall under a moving robot."""
         def _fail(why):
             self.get_logger().warn(f"/plan/request refused: {why}")
             self.pub_plan.publish(String(data=json.dumps(
@@ -486,6 +545,7 @@ class RunExecutor(Node):
         try:
             d = json.loads(msg.data)
             self._repo_status = d if isinstance(d, dict) else {}
+            self._repo_status_t = time.monotonic()
             self._repo_state = str(d.get("state", "")).lower().strip()
         except (ValueError, TypeError):
             pass
@@ -1035,6 +1095,9 @@ class RunExecutor(Node):
         # longer starts where the robot stands. Path-join handles it instead.
         self._transit_curve = None
         self._last_completed_leg_idx = None
+        # Same reason: a glue snapshot from before the pause/abort did not
+        # bring the robot to wherever the next recipe starts.
+        self._arrival_glue = None
         if not self._select_stage_with_work():
             self._enter(Phase.DONE)
             return
@@ -1165,6 +1228,7 @@ class RunExecutor(Node):
                 self._odom_reset_command_t = None
                 self._odom_reset_first_sent_t = None
                 self._achieved_anchor = None
+                self._arrival = None
             if phase == Phase.FOLLOWER_START:
                 # Neutralize the latched recipe BEFORE the follower spawns: a
                 # fresh follower replays the last latched message, and the
@@ -1309,6 +1373,7 @@ class RunExecutor(Node):
                     self._goto_seq += 1   # one id per curve, kept across re-sends
                 payload["seq"] = self._goto_seq
                 self.pub_goto.publish(String(data=json.dumps(payload)))
+                self._goto_payload = payload   # as sent (sidecar 'arrival')
                 self._goto_sent = True
                 self._goto_last_send_t = time.monotonic()
             if self._in_phase_s() > self._reposition_timeout:
@@ -1334,6 +1399,9 @@ class RunExecutor(Node):
                 self.get_logger().warn(
                     "arrived with UNKNOWN heading error (fused heading stale?) — "
                     "proceeding; recipe heading unverified.")
+            # _advance_curve replaces _cur_curve with the recipe: snapshot the
+            # glue we arrived on NOW, for the next odom reset to record.
+            self._snapshot_glue_arrival()
             self._advance_curve()
         elif self._repo_state == "aborted":
             self._goto_sent = False
@@ -1382,6 +1450,7 @@ class RunExecutor(Node):
                 f"odom_zero latch confirmed at (x={origin.get('x')}, "
                 f"y={origin.get('y')}, yaw={origin.get('yaw')}).")
             self._capture_achieved_anchor()
+            self._capture_arrival()
             self._enter(Phase.BAG_START)
             return
         if time.monotonic() - self._odom_reset_first_sent_t > self._odom_settle_s:
@@ -1453,6 +1522,109 @@ class RunExecutor(Node):
                 f"hdg={self._achieved_anchor['heading_deg']:.1f} deg "
                 f"(std {self._achieved_anchor['heading_std_deg']} deg, "
                 f"mode {mode}, repo err {err_deg} deg).")
+
+    def _snapshot_glue_arrival(self):
+        """Freeze the glue reposition just reported 'arrived' on: the goto
+        payload exactly as SENT (capped v_const, pos_tol, end heading, seq),
+        the curve name (a leg glue, or 'stage_transit'), and the status the
+        arrival gate accepted. Consumed by _capture_arrival at the next
+        recipe's odom reset. Never raises — bookkeeping must not stop a batch.
+        """
+        try:
+            p = self._goto_payload or {}
+            problems = []
+            if p.get("seq") != self._goto_seq:
+                problems.append(f"last goto sent has seq {p.get('seq')} != "
+                                f"accepted seq {self._goto_seq}")
+            glue = {
+                "curve_name": (self._cur_curve or {}).get("name"),
+                "seq": p.get("seq"),
+                "waypoints_wgs84": list(p.get("waypoints") or []),
+                "end_heading_deg": p.get("end_heading_deg"),
+                "pos_tol_m": p.get("pos_tol_m"),
+                "v_const": p.get("v_const"),
+            }
+            self._arrival_glue = {
+                "glue": glue,
+                "status": dict(self._repo_status or {}),
+                "stamp_utc": datetime.now(timezone.utc).isoformat(),
+                "problems": problems,
+            }
+        except Exception as exc:  # noqa: BLE001
+            # Keep a marker (not None): None would read as "no glue arrived".
+            self._arrival_glue = {"glue": None, "status": None, "stamp_utc": None,
+                                  "problems": [f"glue snapshot failed: {exc!r}"]}
+            self.get_logger().warn(f"glue arrival snapshot failed: {exc!r}")
+
+    def _capture_arrival(self):
+        """Build the sidecar 'arrival' record: HOW the robot reached this
+        recipe's start pin, so arrival heading error can be attributed to the
+        glue geometry (turn radius, settled straight tail) after the fact.
+
+          glue               the reposition curve as sent (_snapshot_glue_arrival)
+          glue_metrics       glue_arrival_metrics() of it
+          status_at_arrival  the /reposition/status the 'arrived' gate accepted
+          final_status       the LAST /reposition/status before the kill — the
+                             robot sat through the inter-curve dwell, so its
+                             err_deg is the latest pre-zero heading error — and
+                             final_status_age_s, its age at the odom reset
+          problems           why any part is missing (never silently absent)
+
+        Consumes the glue snapshot, so a recipe NOT directly preceded by a glue
+        records captured=false instead of inheriting an earlier leg's glue.
+        Never raises, and the record is checked to serialize as STRICT JSON
+        here: a NaN/Infinity reaching write_sidecar would fail the whole leg.
+        """
+        snap, self._arrival_glue = self._arrival_glue, None
+        try:
+            problems = []
+            rec = {"captured": False, "glue": None, "glue_metrics": None,
+                   "status_at_arrival": None, "arrived_utc": None,
+                   "final_status": None, "final_status_age_s": None,
+                   "problems": problems}
+            if snap is None:
+                problems.append("no reposition glue arrived immediately before "
+                                "this recipe")
+            else:
+                problems += list(snap.get("problems") or [])
+                glue = snap.get("glue")
+                rec["captured"] = glue is not None
+                rec["glue"] = glue
+                rec["status_at_arrival"] = snap.get("status")
+                rec["arrived_utc"] = snap.get("stamp_utc")
+                if glue is not None:
+                    try:
+                        rec["glue_metrics"] = glue_arrival_metrics(
+                            glue.get("waypoints_wgs84"),
+                            glue.get("end_heading_deg"))
+                    except Exception as exc:  # noqa: BLE001
+                        problems.append(f"glue metrics failed: {exc!r}")
+                st = self._repo_status if isinstance(self._repo_status, dict) else {}
+                if st:
+                    rec["final_status"] = dict(st)
+                    if self._repo_status_t is not None:
+                        rec["final_status_age_s"] = round(
+                            time.monotonic() - self._repo_status_t, 2)
+                    if glue is not None and st.get("seq") != glue.get("seq"):
+                        problems.append(f"final status seq {st.get('seq')} != "
+                                        f"glue seq {glue.get('seq')}")
+                else:
+                    problems.append("no /reposition/status held at odom reset")
+            json.dumps(rec, allow_nan=False)
+        except Exception as exc:  # noqa: BLE001
+            self._arrival = {"captured": False,
+                             "problems": [f"arrival capture failed: {exc!r}"]}
+            self.get_logger().warn(f"arrival capture failed: {exc!r}")
+            return
+        self._arrival = rec
+        m = rec["glue_metrics"] or {}
+        fin = rec["final_status"] or {}
+        self.get_logger().info(
+            f"arrival: glue '{(rec['glue'] or {}).get('curve_name')}' "
+            f"R_min={m.get('min_turn_radius_m')} m "
+            f"tail={m.get('tail_straight_m')} m, "
+            f"final repo err {fin.get('err_deg')} deg"
+            + (f"; problems: {'; '.join(problems)}" if problems else "") + ".")
 
     def _tick_bag_start(self):
         curve = self._cur_curve
@@ -1735,6 +1907,13 @@ class RunExecutor(Node):
                 path_frame_anchor=path_frame_anchor,
                 achieved_anchor=self._achieved_anchor,
             )
+            # How the robot reached the start pin (glue as sent + its metrics +
+            # reposition's final status; see _capture_arrival). Additive
+            # top-level key, set here rather than through a new build_sidecar
+            # argument so an executor/Data_Logger version skew on the NUC can't
+            # TypeError the sidecar (and so the leg). Always present on legs
+            # from 2026-10-04 on; None only if the capture never ran.
+            sidecar["arrival"] = self._arrival
             Data_Logger.write_sidecar(self._leg_bag_path, sidecar)
             return bool(classification["pass"])
         except Exception as exc:

@@ -316,6 +316,18 @@ def test_plan_is_noise_proof():
     assert h1 == h2
 
 
+def test_priority_cells_run_first():
+    doc = _doc(priority=[["slalom", 0.5], ["step", 0.4]])
+    order = [(f, R) for (f, R, _n) in ep.remaining_geometries(doc, {})]
+    assert order[:2] == [("slalom", 0.5), ("step", 0.4)], order
+    # a completed priority cell is simply absent; the rest keep matrix order
+    done = {ep._cell_key("slalom", 0.5, c, v): 10
+            for c in ("lpv-hinf", "pid") for v in (1.0, 0.5)}
+    order2 = [(f, R) for (f, R, _n) in ep.remaining_geometries(doc, done)]
+    assert order2[0] == ("step", 0.4) and ("slalom", 0.5) not in order2
+    assert order2[1:] == [x for x in order if x not in (("slalom", 0.5), ("step", 0.4))]
+
+
 def test_dubins_endpoint_verification():
     cases = [((0, 0, 0), (3, 0, 0)), ((0, 0, 0), (-3.4, 1.5, 0)),
              ((0, 0, 0), (0, 3, math.pi)), ((0, 0, 0), (0.5, 0.2, 0.3))]

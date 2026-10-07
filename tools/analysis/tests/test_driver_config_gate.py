@@ -124,6 +124,7 @@ class _Exec:
         self._arrival = None
         self._matrix_doc = {}          # sidecar matrix_epoch (2026-10-08)
         self._replan_needed = False    # preflight -> REPLAN branch (2026-10-08)
+        self._orch_status = {}         # preflight 'calib' PROC check: skipped when empty
 
     def get_logger(self):
         return self.log

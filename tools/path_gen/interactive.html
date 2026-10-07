@@ -4060,6 +4060,7 @@ function lbRestore() {
                       exps: (Array.isArray(st.exps) ? st.exps : []).filter(okExp),
                       repos: okRepos(st.repos),
                       entry_glue: st.entry_glue || null,
+                      wrap_glue: st.wrap_glue || null,
                       needs_fix: !!st.needs_fix, fix_reason: st.fix_reason || '' }))
         .filter(st => st.exps.length);
       lbPlanMeta = d.planMeta || null;

@@ -346,6 +346,88 @@ def test_repo_abort_pages_with_the_fallback_command_and_param_is_live():
         shutil.rmtree(tmp)
 
 
+def test_start_refusals_are_loud():
+    # Fails if a Start that is refused before any motion leaves the executor
+    # silently IDLE (no pause reason, no /run/status, no card) — the review
+    # finding of 2026-10-08: _pause() is a no-op from IDLE.
+    tmp = tempfile.mkdtemp(prefix="hinf_flow_")
+    try:
+        node, world, plan, active, bag_root = _setup(tmp)
+        # yesterday's browser plan: matrix legs, no figure-8, no lock
+        with open(os.path.join(_REPO, "tools", "analysis", "tests",
+                               "venue_fixtures", "active.json")) as f:
+            old = json.load(f)
+        with open(active, "w") as f:
+            json.dump(old, f)
+        node._on_go(fake_ros.String(data=""))
+        assert node.phase.value == "paused", node.phase
+        assert "no steering calibration yet" in (node._pause_reason or "")
+        assert any(a["title"] == "START REFUSED" for a in _alerts())
+        last = json.loads(fake_ros.BUS.sent["/run/status"][-1].data)
+        assert last["phase"] == "paused" and last["pause_reason"]
+    finally:
+        shutil.rmtree(tmp)
+
+
+def test_fixed_radius_matrix_has_no_calibration():
+    # Fails if a legacy fixed radius list (no 'auto') still schedules a
+    # figure-8 (and would write the one-time lock on its first session).
+    tmp = tempfile.mkdtemp(prefix="hinf_flow_")
+    try:
+        node, world, plan, active, bag_root = _setup(tmp)
+        node._matrix_doc = dict(node._matrix_doc, _radius_auto=False,
+                                _matrix_lock=None)
+        assert node._calibration_mode_due() is None
+    finally:
+        shutil.rmtree(tmp)
+
+
+def test_first_pass_skips_retry_exhausted_cells():
+    # Fails if ONE retry-exhausted cell keeps the whole batch at the first-
+    # pass target forever (the batch would end DONE at ~1 rep per cell).
+    tmp = tempfile.mkdtemp(prefix="hinf_flow_")
+    try:
+        node, world, plan, active, bag_root = _setup(tmp)
+        lock, _e = cal.compute_lock(_calib_result("full", 0.60), cal.config({}))
+        node._matrix_doc = cal.resolve_matrix(node._matrix_doc | {
+            "matrix": dict(node._matrix_doc["matrix"], radius_m="auto")}, lock)
+        node._matrix_doc["plan"] = {"first_pass_reps": 1}
+        R = lock["radius_m"][0]
+        node._stages = [{"name": "s", "legs": [
+            {"id": "l", "curves": [{"kind": "recipe", "scored": True,
+             "recipe": {"type": "step", "params": {"R": R}},
+             "start_pose": {"lat": 0, "lon": 0, "heading_deg": 0}}]}]}]
+        node._legs = node._stages[0]["legs"]
+        node._target_n, node._max_retries = 10, 2
+        node._controllers, node._speeds = ["lpv-hinf", "pid"], [1.0]
+        k = lambda c: node._cell_key_for("step", R, c, 1.0)
+        node._completed_counts = {k("lpv-hinf"): 1, k("pid"): 0}
+        assert node._pass_target() == 1
+        node._attempts = {("step", R, "pid", 1.0): 2}       # exhausted
+        assert node._pass_target() == 10
+    finally:
+        shutil.rmtree(tmp)
+
+
+def test_new_executor_never_reuses_a_calib_seq():
+    # Fails if two executor processes start their calibration seq at the
+    # same value (a restarted executor would take the still-alive node's
+    # old 'done' status as its own result).
+    tmp = tempfile.mkdtemp(prefix="hinf_flow_")
+    try:
+        node1, *_ = _setup(tmp)
+        time.sleep(1.1)
+        node2 = rex.RunExecutor()
+        assert node2._cal_seq != node1._cal_seq
+        node2._cal_status = {"seq": node2._cal_seq + 1, "state": "done"}
+        node2._orch_status = {m: False for m in MOVERS}
+        node2._orch_status["calib"] = True
+        node2._tick_calib_start()
+        assert node2._cal_status == {}, "stale calib status survived CALIB_START"
+    finally:
+        shutil.rmtree(tmp)
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_") and callable(fn):

@@ -391,7 +391,10 @@ class RunExecutor(Node):
         self._cal_done_session = False   # a figure-8 passed since this Start
         self._cur_calib = False          # the current recipe is the figure-8
         self._cal_mode = None            # 'full' | 'sanity' for the running one
-        self._cal_seq = 0
+        # Seeded from the clock: a restarted executor must never reuse a seq a
+        # still-alive calib_node already finished (its latched status would be
+        # taken as THIS run's result).
+        self._cal_seq = int(time.time()) % 1000000000
         self._cal_req = None
         self._cal_req_sent = False
         self._cal_req_last_t = 0.0
@@ -1082,8 +1085,8 @@ class RunExecutor(Node):
     def _calibration_mode_due(self):
         """'full' (no matrix lock yet) | 'sanity' (lock exists, no passing
         figure-8 within recheck_after_h) | None."""
-        if calibration is None:
-            return None
+        if calibration is None or not (self._matrix_doc or {}).get("_radius_auto"):
+            return None       # fixed radius list (legacy): no calibration stage
         lock = (self._matrix_doc or {}).get("_matrix_lock")
         last = None
         if lock is not None:
@@ -1106,8 +1109,12 @@ class RunExecutor(Node):
         if fp <= 0 or fp >= n:
             return n
         for fam, R in self._scored_geometries():
+            if not self._geometry_in_matrix(fam, R):
+                continue
             for c in self._controllers:
                 for v in self._speeds:
+                    if self._attempts.get((fam, R, c, v), 0) >= self._max_retries:
+                        continue      # retry-exhausted: must not freeze the pass
                     key = self._cell_key_for(fam, R, c, v)
                     if key is not None and self._completed_counts.get(key, 0) < fp:
                         return fp
@@ -1335,16 +1342,30 @@ class RunExecutor(Node):
                     "classification failures — check RTK/venue, then Start to resume")
         self._progress = self._global_progress()
 
+    def _refuse(self, reason):
+        """Start refused BEFORE anything moved: PAUSED with the reason on
+        /run/status + an operator card. (_pause is a no-op from IDLE, which
+        made these refusals silent.)"""
+        self._pause_reason = reason
+        self.get_logger().warn(f"START REFUSED: {reason}")
+        self._operator_alert("start_refused", "warn", "START REFUSED", reason)
+        self._safe_state()
+        self._enter(Phase.PAUSED)
+        self._publish_status(message=f"refused: {reason}")
+
     def _start_or_resume(self):
         """Shared Start/resume entry: reload venue + matrix + manifest counts,
         reset session retry state, containment-gate, then PREFLIGHT (or DONE)."""
         self.phase = Phase.IDLE   # so _pause/_enter below are not no-ops on resume
+        # A new Start is a new session: the 4 h window in mode_due (not this
+        # flag) is what prevents re-running a recent figure-8.
+        self._cal_done_session = False
         self._reload_active()
         if not self._legs:
             self._publish_status(message="no legs loaded — Send a venue first")
             return
         if not self._load_matrix():
-            self._pause("experiment.yaml unreadable — cannot choose treatments")
+            self._refuse("experiment.yaml unreadable — cannot choose treatments")
             return
         self._rebuild_counts()
         self._attempts = {}
@@ -1373,18 +1394,27 @@ class RunExecutor(Node):
         auto, _epoch = self._epoch_filter()
         radii = ((self._matrix_doc or {}).get("matrix") or {}).get("radius_m") or []
         if auto and not radii and not has_calib:
-            self._pause("no steering calibration yet and this batch has no "
-                        "figure-8 — press Auto-plan, Send, Start (the plan now "
-                        "starts with the calibration)")
+            self._refuse("no steering calibration yet and this batch has no "
+                         "figure-8 — press Auto-plan, Send, Start (the plan now "
+                         "starts with the calibration)")
             return
+        if auto and radii and not has_calib and self._calibration_mode_due():
+            self._operator_alert(
+                "calibration", "warn", "SANITY CHECK SKIPPED",
+                "a steering sanity figure-8 is due but this batch has none — "
+                "Auto-plan, Send, Start to include it (running without it).")
         matrix_stages = [st for st in (self._stages or [])
                          if not any(self._is_calib_leg(lg) for lg in st["legs"])]
         if (auto and radii and has_calib and not matrix_stages
                 and not self._calibration_pending()):
             # The lock exists but the batch is still calibration-only (the
             # post-lock re-plan was interrupted): re-plan after preflight.
-            cal_leg = next(lg for st in self._stages for lg in st["legs"]
-                           if self._is_calib_leg(lg))
+            cal_leg = next((lg for st in self._stages for lg in st["legs"]
+                            if self._is_calib_leg(lg)), None)
+            if cal_leg is None:
+                self._refuse("calibration leg outside plan_stages — Auto-plan, "
+                             "Send, Start")
+                return
             self._cal_pin = dict(self._recipe_curve(cal_leg).get("start_pose") or {})
             self._replan_needed = True
             self.get_logger().info("calibration-only batch with a lock: "
@@ -1399,7 +1429,8 @@ class RunExecutor(Node):
         if not ok:
             self.get_logger().error(
                 "VENUE CONTAINMENT FAILED — refusing to run (no motion):\n" + report)
-            self._pause("refused: a planned curve leaves the venue (see log)")
+            self._refuse("a planned curve leaves the venue (see log) — re-plan, "
+                         "Send, Start")
             return
         self.get_logger().info("venue containment OK — " + report)
         stage = f" stage '{self._stage_name()}'" if self._stages else ""
@@ -1623,6 +1654,11 @@ class RunExecutor(Node):
         if self._last_odom_t is None or (time.monotonic() - self._last_odom_t) > 1.0:
             missing.append("no fresh /wheel/odom")
         missing += driver_config_problems(self._driver_cfg, self._driver_expect)
+        if (self._orch_status and PROC_CALIB not in self._orch_status
+                and any(self._is_calib_leg(lg) for lg in self._legs)
+                and self._calibration_pending()):
+            missing.append("the orchestrator has no 'calib' PROC (started before "
+                           "the 2026-10-08 deploy) — restart limo-battle")
         if self._rtk_quality not in RTK_OK:
             missing.append(f"RTK quality {self._rtk_quality} not in {RTK_OK}")
         if self._battery_v is not None and self._battery_v < self._batt_halt:
@@ -1984,8 +2020,9 @@ class RunExecutor(Node):
                 f"RTK not FIXED(4) for scored run (q={self._rtk_quality})")
             return
         self._reset_run_scratch()
-        self._leg_cell_id = (f"calibration_{self._cal_mode}" if self._cur_calib
-                             else self._cell_id_for(curve))
+        self._leg_cell_id = (
+            f"calibration_{self._cal_mode}_{datetime.now().strftime('%H%M%S')}"
+            if self._cur_calib else self._cell_id_for(curve))
         if scored:
             if Data_Logger is None:
                 self._pause("recorder unavailable (Data_Logger import failed)")
@@ -2016,6 +2053,7 @@ class RunExecutor(Node):
         res = self._start_exclusive_mover(PROC_CALIB)
         if res == "started":
             self._cal_seq += 1
+            self._cal_status = {}        # never judge a run by an older status
             self._cal_req = None
             self._cal_req_sent = False
             self._cal_req_last_t = 0.0
@@ -2198,6 +2236,8 @@ class RunExecutor(Node):
         curve = self._cur_curve
         scored = self._cur_scored
         info = {}
+        if self._cur_calib:
+            self._orch_kill(PROC_CALIB)     # open-loop mover down before the bag
         if self._recorder is not None:
             try:
                 info = self._recorder.stop(timeout_s=10.0)
@@ -2336,6 +2376,13 @@ class RunExecutor(Node):
             self._enter(Phase.REPLAN)
             return
         self._operator_alert("calibration", "info", "CALIBRATION OK", str(why))
+        if not any(not any(self._is_calib_leg(lg) for lg in st["legs"])
+                   for st in (self._stages or [])):
+            # Calibration-only batch with a lock (the day-1 re-plan never
+            # landed): plan the matrix now instead of finishing at 0/0.
+            self._cal_pin = dict((curve or {}).get("start_pose") or {})
+            self._enter(Phase.REPLAN)
+            return
         self._advance_curve()
 
     def _write_calib_sidecar(self, curve, bag_info, record):
@@ -2674,6 +2721,7 @@ class RunExecutor(Node):
         self._pause_reason = reason
         self.get_logger().warn(f"PAUSE: {reason}")
         _notify_discord(f"RUN PAUSED: {reason}", title="H-inf run_executor")
+        self._safe_state()      # movers down FIRST; the recorder stop can take 5 s
         if self._recorder is not None:
             try:
                 self._recorder.stop(timeout_s=5.0)
@@ -2687,6 +2735,7 @@ class RunExecutor(Node):
     def _abort(self, reason):
         self.get_logger().warn(f"ABORT: {reason}")
         _notify_discord(f"RUN ABORTED: {reason}", title="H-inf run_executor")
+        self._safe_state()      # movers down FIRST; the recorder stop can take 5 s
         if self._recorder is not None:
             try:
                 self._recorder.stop(timeout_s=5.0)

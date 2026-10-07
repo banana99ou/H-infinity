@@ -1655,7 +1655,10 @@ def stages_to_legs(stages, venue, spacing_m=0.3):
             R = (rec.get("params") or {}).get("R")
             name = f"{e['id']}_{rec.get('type')}"
             if R is not None:
-                name += "_R" + str(R).replace(".", "p")
+                # JS ('' + R) formatting, as the WebUI names it: 1.0 -> "1"
+                r = float(R)
+                rs = str(int(r)) if r.is_integer() else repr(r)
+                name += "_R" + rs.replace(".", "p")
             legs.append({"id": f"leg_{i + 1}", "curves": [
                 {"name": f"repo_to_{e['id']}", "kind": "reposition",
                  "waypoints_wgs84": wps,

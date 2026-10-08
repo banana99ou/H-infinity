@@ -1163,15 +1163,14 @@ def plan_stages(venue, doc, counts, footprint_r=0.30, track_margin=0.30,
     remaining = remaining_geometries(doc, counts, key_fn=key_fn)
     if not remaining:
         if stages:
-            notes.append(
-                "no matrix cells to place yet" if (doc or {}).get("_radius_auto")
-                and not ((doc or {}).get("matrix") or {}).get("radius_m")
-                else "matrix complete — no remaining (family, R) cells")
-            if (doc or {}).get("_radius_auto") and not (
-                    (doc or {}).get("matrix") or {}).get("radius_m"):
-                notes.append("matrix radii come from the calibration: the "
-                             "executor plans the matrix itself once the "
-                             "figure-8 has locked them")
+            waiting = bool((doc or {}).get("_calib_gated")) and not (
+                (doc or {}).get("matrix") or {}).get("radius_m")
+            notes.append("no matrix cells to place yet" if waiting
+                         else "matrix complete — no remaining (family, R) cells")
+            if waiting:
+                notes.append("the matrix waits for the calibration: the "
+                             "executor plans it itself once the figure-8 has "
+                             "locked R_min")
             return {"ok": True, "stages": stages, "unfittable": [],
                     "req_clearance_m": req, "notes": notes}
         return {"ok": True, "stages": [], "unfittable": [],

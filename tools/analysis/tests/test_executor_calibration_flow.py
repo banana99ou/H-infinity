@@ -11,7 +11,10 @@ the planner, the manifest, the lock math and the files on disk are real.
 Scenario A (first session, no lock): Auto-plan returns the calibration-only
 plan -> Start -> approach + full figure-8 -> lock written -> matrix re-planned
 and persisted by the executor -> transit into stage 2 -> scored legs carry the
-lock epoch -> the first pass moves on after ONE rep of each cell.
+lock epoch -> the first pass moves on after ONE rep of each cell. Run twice:
+with the DEPLOYED experiment.yaml (the 2026-10-08 bridge set: the old fixed
+radii gated by calibration.required, an old stock-driver leg planted in the
+first cell) and with the shelved radius_m: auto campaign.
 Scenario B (lock exists, check stale): a sanity figure-8 whose R moved pauses
 the batch; Start retries; a good one continues into the matrix.
 
@@ -20,6 +23,7 @@ Invariant checked on EVERY tick: at most one cmd_vel_raw mover alive (C6).
 Run:  python3 -m pytest -q tools/analysis/tests/test_executor_calibration_flow.py
 """
 import json
+import math
 import os
 import shutil
 import sys
@@ -172,7 +176,52 @@ class World:
         assert n <= 1, f"C6 violated: {self.alive}"
 
 
-def _setup(tmp, lock=None, last_check_age_h=None, calib_r=0.60):
+_YAML = os.path.join(_REPO, "scenarios", "experiment.yaml")
+
+# The shelved 320-run campaign (2026-10-08 night): auto radii, left + right
+# step/slalom, 2 m straights, no calibration.required.
+_AUTO_PATCH = {
+    "matrix": {"radius_m": "auto",
+               "path_family": ["step", "step_m", "slalom", "slalom_m"]},
+    "calibration": {"required": False},
+    "plan": {"step": {"L1": 2.0, "L2": 2.0, "theta_deg": 90.0}},
+}
+
+
+def _yaml_variant(tmp, patch):
+    """The deployed experiment.yaml with top-level sections patched."""
+    import yaml
+    with open(_YAML) as f:
+        d = yaml.safe_load(f)
+    for k, v in patch.items():
+        if isinstance(v, dict):
+            d.setdefault(k, {}).update(v)
+        else:
+            d[k] = v
+    path = os.path.join(tmp, "experiment_variant.yaml")
+    with open(path, "w") as f:
+        yaml.safe_dump(d, f)
+    return path
+
+
+def _plant_old_leg(bag_root, run_id, controller, v, R, family="step"):
+    """A passing stock-driver leg as the June-October runs left it: same
+    venue run_id and cell, no matrix_epoch."""
+    bag = os.path.join(bag_root, f"26_1006_1200_{run_id}_old_{family}_R{R}_{controller}_v{v}")
+    os.makedirs(bag)
+    with open(os.path.join(bag, "metadata.yaml"), "w") as f:
+        f.write("rosbag2_bagfile_information: {}\n")
+    Data_Logger.write_sidecar(bag, {
+        "run_id": run_id, "cell_id": "old", "leg": "leg_1",
+        "cell_params": {"controller": controller, "v_const": v,
+                        "radius_m": R, "path_family": family, "rep": 0},
+        "classification": {"pass": True, "reached_end": True},
+        "venue": {"venue_id": run_id}})
+    return bag
+
+
+def _setup(tmp, lock=None, last_check_age_h=None, calib_r=0.60,
+           yaml_path=None, before_plan=None):
     fake_ros.BUS.__init__()
     venue_src = os.path.join(_REPO, "tools", "analysis", "tests",
                              "venue_fixtures", "active.json")
@@ -191,9 +240,11 @@ def _setup(tmp, lock=None, last_check_age_h=None, calib_r=0.60):
                 "ok": True, "epoch": lock["epoch"],
                 "stamp_utc": (datetime.now(timezone.utc)
                               - timedelta(hours=last_check_age_h)).isoformat()})
+    if before_plan is not None:
+        before_plan(bag_root, str(venue.get("name") or "run"))
     fake_ros.Node.OVERRIDES = {"run_executor_node": {
         "active_venue_file": active, "bag_root": bag_root,
-        "experiment_yaml": os.path.join(_REPO, "scenarios", "experiment.yaml"),
+        "experiment_yaml": yaml_path or _YAML,
         "inter_curve_dwell_s": 0.0, "orchestrator_settle_s": 0.0,
         "rtk_fix_wait_s": 2.0, "odom_settle_s": 5.0,
     }}
@@ -234,15 +285,23 @@ def _alerts():
     return [json.loads(m.data) for m in fake_ros.BUS.sent["/operator/alert"]]
 
 
-def test_first_session_calibrates_locks_replans_and_runs_the_matrix():
+def _first_session(yaml_path, n_matrix, radii_for, plant_old=False):
     # Fails if: the first plan is not calibration-only; Start does not drive
-    # the approach and the FULL figure-8; no lock / wrong radii; the executor
-    # does not persist a calibration + 8-stage batch; it does not transit into
-    # stage 2; scored legs lack the lock epoch; the first pass does not move
-    # on after one rep of each of the stage's 4 cells; or C6 is ever broken.
+    # the approach and the FULL figure-8; no lock; the executor does not
+    # persist calibration + n_matrix stages with the expected radii; it does
+    # not transit into stage 2; scored legs lack the lock epoch; the first
+    # pass does not move on after one rep of each of the stage's 4 cells
+    # (a planted old leg that got credited would leave 3); or C6 is broken.
     tmp = tempfile.mkdtemp(prefix="hinf_flow_")
     try:
-        node, world, plan, active, bag_root = _setup(tmp)
+        planted = []
+        hook = None
+        if plant_old:
+            def hook(bag_root, run_id):
+                planted.append((run_id, _plant_old_leg(
+                    bag_root, run_id, "lpv-hinf", 1.0, 1.0)))
+        node, world, plan, active, bag_root = _setup(
+            tmp, yaml_path=yaml_path, before_plan=hook)
         assert [s["name"] for s in plan["stages"]] == ["calibration"]
         node._on_go(fake_ros.String(data=""))
         assert node.phase.value == "preflight", node.phase
@@ -260,8 +319,10 @@ def test_first_session_calibrates_locks_replans_and_runs_the_matrix():
         with open(active) as f:
             act = json.load(f)
         names = [s["name"] for s in act["plan_stages"]]
-        assert names[0] == "calibration" and len(names) == 17, names   # + 16 (L+R)
+        assert names[0] == "calibration" and len(names) == 1 + n_matrix, names
         assert act["auto_replan"]["epoch"] == lock["epoch"]
+        assert act["auto_replan"]["radius_m"] == radii_for(lock)
+        assert node._matrix_doc["matrix"]["radius_m"] == radii_for(lock)
         assert any(g.get("waypoints") and len(g["waypoints"]) > 2
                    for g in world.gotos[1:2]), "no transit goto after the re-plan"
         assert node._stage_name() == "stage_2"
@@ -272,9 +333,13 @@ def test_first_session_calibrates_locks_replans_and_runs_the_matrix():
         side = []
         for dp, _dn, fn in os.walk(bag_root):
             side += [os.path.join(dp, x) for x in fn if x.endswith(".sidecar.json")]
-        scored = [json.load(open(x)) for x in side if "calibration" not in x]
+        scored = [json.load(open(x)) for x in side
+                  if "calibration" not in x and "_old_" not in x]
         assert len(scored) == 4
         assert all(s["matrix_epoch"] == lock["epoch"] for s in scored)
+        assert all(s["matrix_lock"]["radius_m"] == radii_for(lock)
+                   and s["matrix_lock"]["delta_max_rad"] == lock["delta_max_rad"]
+                   for s in scored)
         assert all(s["classification"]["pass"] for s in scored), \
             [s["classification"] for s in scored]
         cells = {(s["cell_params"]["controller"], s["cell_params"]["v_const"])
@@ -285,9 +350,47 @@ def test_first_session_calibrates_locks_replans_and_runs_the_matrix():
         with open(cal.checks_path(bag_root)) as f:
             checks = [json.loads(l) for l in f]
         assert checks[-1]["ok"] and checks[-1]["epoch"] == lock["epoch"]
-        titles = [a["title"] for a in _alerts()]
+        alerts = _alerts()
+        titles = [a["title"] for a in alerts]
         assert "R_min LOCKED" in titles and "MATRIX PLANNED" in titles, titles
+        locked = [a for a in alerts if a["title"] == "R_min LOCKED"][-1]
+        assert str(radii_for(lock)) in locked["detail"], locked["detail"]
         assert world.max_alive_movers == 1
+        if planted:
+            # The planted leg is valid credit for an UNGATED fixed matrix (so
+            # the 4-recipe check above could fail) and none for the gated one.
+            run_id, _bag = planted[0]
+            key = node._cell_key_for("step", 1.0, "lpv-hinf", 1.0)
+            gated_doc = node._matrix_doc
+            assert node._counts_for(run_id).get(key) == 1      # this session's leg
+            node._matrix_doc = dict(gated_doc, _calib_gated=False)
+            assert node._counts_for(run_id).get(key) == 2      # + the old leg
+            node._matrix_doc = gated_doc
+        return world
+    finally:
+        shutil.rmtree(tmp)
+
+
+def test_first_session_bridge_set_calibrates_then_runs_the_old_paths():
+    # The DEPLOYED yaml: fixed old radii gated by calibration.required. Also
+    # fails if the stage-2 recipes are not the old dataset's step exactly
+    # (left, 90 deg, 1 m straights, R 1.0).
+    world = _first_session(None, 4, lambda lock: [1.0, 0.7, 0.5, 0.4],
+                           plant_old=True)
+    for r in world.recipes:
+        assert r["type"] == "step", r
+        p = r["params"]
+        assert (p["R"], p["L1"], p["L2"]) == (1.0, 1.0, 1.0), p
+        assert abs(p["theta_arc"] - math.pi / 2) < 1e-9, p
+        assert p["direction"] == 1, p                          # left turn
+
+
+def test_first_session_auto_matrix_calibrates_locks_replans():
+    # The shelved auto campaign: radii from the lock, left + right x 2 families.
+    tmp = tempfile.mkdtemp(prefix="hinf_yaml_")
+    try:
+        _first_session(_yaml_variant(tmp, _AUTO_PATCH), 16,
+                       lambda lock: lock["radius_m"])
     finally:
         shutil.rmtree(tmp)
 
@@ -302,7 +405,7 @@ def test_sanity_failure_pauses_and_retry_continues():
         node, world, plan, active, bag_root = _setup(
             tmp, lock=lock, last_check_age_h=20.0, calib_r=1.05)
         names = [s["name"] for s in plan["stages"]]
-        assert names[0] == "calibration" and len(names) == 17, names   # + 16 (L+R)
+        assert names[0] == "calibration" and len(names) == 1 + 4, names  # bridge set
         assert plan["stages"][0]["experiments"][0]["recipe"]["params"]["mode"] == "sanity"
         node._on_go(fake_ros.String(data=""))
         ok = _run(node, world, lambda: node.phase.value == "paused")
@@ -369,13 +472,16 @@ def test_start_refusals_are_loud():
         shutil.rmtree(tmp)
 
 
-def test_fixed_radius_matrix_has_no_calibration():
-    # Fails if a legacy fixed radius list (no 'auto') still schedules a
-    # figure-8 (and would write the one-time lock on its first session).
+def test_only_an_ungated_fixed_radius_list_skips_calibration():
+    # Fails if a legacy fixed radius list (no 'auto', no calibration.required)
+    # still schedules a figure-8 (and would write the one-time lock on its
+    # first session), or if the gated fixed list does NOT ask for the full one.
     tmp = tempfile.mkdtemp(prefix="hinf_flow_")
     try:
         node, world, plan, active, bag_root = _setup(tmp)
-        node._matrix_doc = dict(node._matrix_doc, _radius_auto=False,
+        assert node._matrix_doc["_calib_gated"] and not node._matrix_doc["_radius_auto"]
+        assert node._calibration_mode_due() == "full"
+        node._matrix_doc = dict(node._matrix_doc, _calib_gated=False,
                                 _matrix_lock=None)
         assert node._calibration_mode_due() is None
     finally:

@@ -386,7 +386,8 @@ class RunExecutor(Node):
         self._cur_recipe = {}
         self._matrix_doc = {}    # raw experiment.yaml (planner input)
         # Steering calibration (2026-10-08). _matrix_doc carries the lock the
-        # radii came from (manifest.load_experiment resolves radius_m: auto).
+        # matrix is gated on (manifest.load_experiment resolves radius_m: auto
+        # and fixed lists with calibration.required).
         self._cal_cfg = dict(calibration.DEFAULTS) if calibration else {}
         self._cal_done_session = False   # a figure-8 passed since this Start
         self._cur_calib = False          # the current recipe is the figure-8
@@ -901,13 +902,13 @@ class RunExecutor(Node):
         except Exception as exc:
             self.get_logger().warn(f"manifest scan failed: {exc}")
             return counts
-        auto, epoch = self._epoch_filter()
+        gated, epoch = self._epoch_filter()
         for r in rows:
             if r.get("sidecar_pass") is not True:
                 continue
             if str(r.get("run_id")) != str(run_id):
                 continue          # other venue/batch — must not mark us done
-            if auto and (epoch is None or r.get("matrix_epoch") != epoch):
+            if gated and (epoch is None or r.get("matrix_epoch") != epoch):
                 continue          # another lock's matrix (e.g. stock-driver legs)
             # Bag-level re-gate: pre-2026-06-12 sidecars say pass on
             # recorder-broken bags; those cells must be refilled, not skipped.
@@ -953,9 +954,9 @@ class RunExecutor(Node):
             return None
         per_cell = {k: 0 for k in expected}
         failed = 0
-        auto, epoch = self._epoch_filter()
+        gated, epoch = self._epoch_filter()
         for r in rows:
-            if auto and (epoch is None or r.get("matrix_epoch") != epoch):
+            if gated and (epoch is None or r.get("matrix_epoch") != epoch):
                 continue
             k = manifest.cell_key({
                 "controller": r.get("controller"), "v_const": r.get("v_const"),
@@ -1085,8 +1086,8 @@ class RunExecutor(Node):
     def _calibration_mode_due(self):
         """'full' (no matrix lock yet) | 'sanity' (lock exists, no passing
         figure-8 within recheck_after_h) | None."""
-        if calibration is None or not (self._matrix_doc or {}).get("_radius_auto"):
-            return None       # fixed radius list (legacy): no calibration stage
+        if calibration is None or not (self._matrix_doc or {}).get("_calib_gated"):
+            return None       # ungated fixed radius list (legacy): no figure-8
         lock = (self._matrix_doc or {}).get("_matrix_lock")
         last = None
         if lock is not None:
@@ -1121,10 +1122,11 @@ class RunExecutor(Node):
         return n
 
     def _geometry_in_matrix(self, fam, R):
-        """With radius_m: auto only (family, R) of the current lock are
-        swept; fixed matrices keep the legacy behaviour (any authored R)."""
+        """A gated matrix (radius_m: auto, or calibration.required) sweeps
+        only its own (family, R) cells; ungated fixed matrices keep the
+        legacy behaviour (any authored R)."""
         doc = self._matrix_doc or {}
-        if not doc.get("_radius_auto"):
+        if not doc.get("_calib_gated"):
             return True
         m = doc.get("matrix") or {}
         by_fam = m.get("radius_m_by_family") or {}
@@ -1137,11 +1139,12 @@ class RunExecutor(Node):
             round(float(x), 6) for x in by_fam.get(str(fam), m.get("radius_m") or [])}
 
     def _epoch_filter(self):
-        """(radius_auto, epoch): with radius_m: auto only legs recorded under
-        the current calibration lock count (stock-driver legs and any other
-        lock's legs never credit this matrix)."""
+        """(gated, epoch): with a gated matrix (radius_m: auto, or a fixed
+        list with calibration.required) only legs recorded under the current
+        calibration lock count (stock-driver legs and any other lock's legs
+        never credit this matrix)."""
         doc = self._matrix_doc or {}
-        return bool(doc.get("_radius_auto")), doc.get("_matrix_epoch")
+        return bool(doc.get("_calib_gated")), doc.get("_matrix_epoch")
 
     def _all_leg_lists(self):
         """Every stage's legs (global progress scope); [current] when the
@@ -1391,21 +1394,21 @@ class RunExecutor(Node):
         has_calib = any(self._is_calib_leg(lg) for st in (self._stages or [])
                         for lg in st["legs"]) or any(
                             self._is_calib_leg(lg) for lg in (self._legs or []))
-        auto, _epoch = self._epoch_filter()
+        gated, _epoch = self._epoch_filter()
         radii = ((self._matrix_doc or {}).get("matrix") or {}).get("radius_m") or []
-        if auto and not radii and not has_calib:
+        if gated and not radii and not has_calib:
             self._refuse("no steering calibration yet and this batch has no "
                          "figure-8 — press Auto-plan, Send, Start (the plan now "
                          "starts with the calibration)")
             return
-        if auto and radii and not has_calib and self._calibration_mode_due():
+        if gated and radii and not has_calib and self._calibration_mode_due():
             self._operator_alert(
                 "calibration", "warn", "SANITY CHECK SKIPPED",
                 "a steering sanity figure-8 is due but this batch has none — "
                 "Auto-plan, Send, Start to include it (running without it).")
         matrix_stages = [st for st in (self._stages or [])
                          if not any(self._is_calib_leg(lg) for lg in st["legs"])]
-        if (auto and radii and has_calib and not matrix_stages
+        if (gated and radii and has_calib and not matrix_stages
                 and not self._calibration_pending()):
             # The lock exists but the batch is still calibration-only (the
             # post-lock re-plan was interrupted): re-plan after preflight.
@@ -2331,7 +2334,8 @@ class RunExecutor(Node):
                         verdict, new_lock = True, lock
                         record["epoch"] = lock["epoch"]
                         why = (f"locked R_min {lock['R_min_m']:.2f} m -> "
-                               f"radii {lock['radius_m']}")
+                               "radii "
+                               f"{calibration.matrix_radii(self._matrix_doc, lock)}")
                     except FileExistsError:
                         # Someone locked meanwhile: judge this run against it.
                         existing = calibration.load_lock(path)
@@ -2369,7 +2373,8 @@ class RunExecutor(Node):
             self._operator_alert(
                 "calibration", "info", "R_min LOCKED",
                 f"R_min {new_lock['R_min_m']:.2f} m at {new_lock['lock_speed']:g} "
-                f"m/s -> matrix R = {new_lock['radius_m']} (epoch "
+                f"m/s -> matrix R = "
+                f"{calibration.matrix_radii(self._matrix_doc, new_lock)} (epoch "
                 f"{new_lock['epoch']}){warn}. Planning the matrix now "
                 "(~1-2 min, the robot stays still).")
             self._cal_pin = dict((curve or {}).get("start_pose") or {})
@@ -2491,7 +2496,7 @@ class RunExecutor(Node):
                       dict(self._completed_counts), dict(self._cal_pin or {})),
                 daemon=True)
             self._replan_thread.start()
-            self.get_logger().info("re-plan started (matrix radii from the new lock).")
+            self.get_logger().info("re-plan started (matrix under the new lock).")
             self._publish_status(message="planning the matrix from the new lock")
             return
         if self._replan_thread is not None and self._replan_thread.is_alive():
@@ -2689,13 +2694,18 @@ class RunExecutor(Node):
                 "at_end": self._driver_cfg,
                 "expected": dict(self._driver_expect),
             }
-            # Calibration lock the matrix radii came from (2026-10-08). Progress
+            # Calibration lock the matrix is gated on (2026-10-08). Progress
             # credits only legs of the current epoch (manifest.build_rows).
+            # radius_m = the radii this matrix sweeps (the lock's own for
+            # auto, the authored list for calibration.required).
             lock = (self._matrix_doc or {}).get("_matrix_lock") or {}
             sidecar["matrix_epoch"] = (self._matrix_doc or {}).get("_matrix_epoch")
             sidecar["matrix_lock"] = ({"epoch": lock.get("epoch"),
                                        "R_min_m": lock.get("R_min_m"),
-                                       "radius_m": lock.get("radius_m")}
+                                       "delta_max_rad": lock.get("delta_max_rad"),
+                                       "radius_m": calibration.matrix_radii(
+                                           self._matrix_doc, lock)
+                                       if calibration else lock.get("radius_m")}
                                       if lock else None)
             Data_Logger.write_sidecar(self._leg_bag_path, sidecar)
             return bool(classification["pass"])

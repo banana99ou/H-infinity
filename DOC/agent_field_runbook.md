@@ -35,7 +35,7 @@ fix this copy. Live status lives in `ToDo.md`.
 >   the E-STOP at hand; after the first few legs pull the bags
 >   (`tools/sync/sync.sh pull`) so the new odometry can be checked against RTK.
 
-> **Steering calibration + auto matrix (2026-10-08) — read before the session.**
+> **Steering calibration + bridge set (2026-10-08) — read before the session.**
 > The operator procedure is unchanged: **Auto-plan → Send → Start** in the
 > battle station. What is new happens inside that one Start:
 > - **First session ever (no lock yet):** the plan has ONE stage, `calibration`.
@@ -43,21 +43,23 @@ fix this copy. Live status lives in `ToDo.md`.
 >   **open-loop figure-8 at full steering lock**: a full left and a full right
 >   circle at 0.5 m/s, then again at 1.0 m/s (~30 s, circles ~1.2 m across at up
 >   to 1 m/s — keep people ≥ 3 m clear). Cards, in order: `CALIBRATION (FULL)` →
->   `R_min LOCKED` (the measured R_min and the matrix radii) → `MATRIX PLANNED`
->   (the robot plans the whole matrix itself, ~1–2 min standing still) → it drives
->   on into stage 2 unattended. **Getting the R_min number is the session's #1
+>   `R_min LOCKED` (the measured R_min and the matrix radii `[1.0, 0.7, 0.5, 0.4]`)
+>   → `MATRIX PLANNED` (the robot plans the 4 matrix stages itself, under a minute
+>   standing still) → it drives on into stage 2 unattended. **Getting the R_min number is the session's #1
 >   goal** — if anything blocks it, report to the human right away.
 > - **Later sessions:** the plan starts with a short `sanity` figure-8 at 1.0 m/s
 >   (only if the last passing one is > 4 h old); it pauses if R_min moved > 15 %.
-> - **Right turns + 2 m straights (2026-10-08):** every geometry now also runs as
->   its mirror image (`step_m`, `slalom_m`, right turns) — 16 matrix stages; each
->   family/direction gets 5 reps (5 left + 5 right = 10 per cell, 320 runs total).
->   Straights before/after the turns are 2 m (were 1 m).
-> - **First pass:** the batch drives ONE rep of every cell, both directions (all
->   16 stages, 64 legs) before filling any cell to 5, so a short day still ends
->   balanced.
-> - **Progress restarts at 0/320**: only legs recorded under the lock's `epoch`
->   count (the old stock-driver legs never do). That is expected.
+> - **Bridge set (2026-10-08, the advisor's follow-up plan):** the matrix is the
+>   OLD dataset's exact step paths (left turn, R 1.0/0.7/0.5/0.4 m, 1 m straights)
+>   at 0.5 and 1.0 m/s, both controllers, 5 reps → 16 cells, **80 runs, then DONE
+>   on its own**. R 0.5 and 0.4 are tighter than the steering limit: the robot
+>   swinging wide of the curve there is expected, not a fault — let it run. (The
+>   320-run plan with right turns and 2 m straights is shelved.)
+> - **First pass:** the batch drives ONE rep of each of the 16 cells (4 stages)
+>   before filling any cell to 5, so a short day still ends balanced.
+> - **Progress starts at 0/80**: only legs recorded under the lock's `epoch`
+>   count (the old stock-driver legs at these same cells never do). That is
+>   expected.
 > - **`CALIBRATION FAILED` card:** read the reason, press Start once to retry (the
 >   robot goes back to the pin and redoes the figure-8). Second failure → stop and
 >   send the human the card text + `tail -40 /tmp/limo_orchestrator/run_executor.log`
@@ -68,8 +70,9 @@ fix this copy. Live status lives in `ToDo.md`.
 >   figure-8":** the browser sent an old plan — Auto-plan again, Send, Start.
 >   Preflight waiting on "the orchestrator has no 'calib' PROC": the stack predates
 >   the deploy — ask the human to restart `limo-battle` (no movers running).
-> - **Never delete or edit `Experiment Data/calibration/matrix_lock.json`** — it
->   defines the matrix; a new lock starts a new matrix and orphans the data.
+> - **Never delete or edit `Experiment Data/calibration/matrix_lock.json`** — its
+>   epoch defines which legs count; a new lock starts a new matrix and orphans the
+>   data.
 >   Results: `matrix_lock.json`, `checks.jsonl` (every figure-8) and the
 >   calibration bags, all under `Experiment Data/calibration/`.
 > - Use the current battle station (`git pull`): an older page still works but

@@ -7,7 +7,8 @@ matrix itself and builds the active.json legs in Python (stages_to_legs) — the
 job the WebUI's lbBuiltLegs does on Send. These tests pin:
 
 * the lock math (radii from R_min, bounds, worst side, refuse to overwrite);
-* manifest.load_experiment resolving ``radius_m: auto`` from a lock;
+* manifest.load_experiment resolving ``radius_m: auto`` from a lock, and
+  gating the deployed fixed bridge radii (``calibration.required``) on it;
 * the planner's calibration stage on the LIVE rooftop capture (fits, approach
   loop joinable from any heading, re-seat at the driven pin is identical);
 * stages_to_legs == the REAL WebUI JS assembly (node), so the executor's
@@ -172,17 +173,41 @@ def test_lock_persistence_and_mode_due():
         shutil.rmtree(tmp)
 
 
+def _yaml_variant(tmp, patch):
+    """The deployed experiment.yaml with top-level sections patched."""
+    import yaml
+    with open(_YAML) as f:
+        d = yaml.safe_load(f)
+    for k, v in patch.items():
+        if isinstance(v, dict):
+            d.setdefault(k, {}).update(v)
+        else:
+            d[k] = v
+    path = os.path.join(tmp, "experiment_variant.yaml")
+    with open(path, "w") as f:
+        yaml.safe_dump(d, f)
+    return path
+
+
+_FAMS4 = ["step", "step_m", "slalom", "slalom_m"]
+
+
 def test_manifest_resolves_auto_radius():
     # Fails if 'auto' is not resolved from the lock, if no-lock does not give
     # an empty matrix, or the epoch is not exposed for the credit filter.
     tmp = tempfile.mkdtemp(prefix="hinf_cal_")
     try:
-        exp, reps, doc = manifest.load_experiment(_YAML, bag_root=tmp)
+        y = _yaml_variant(tmp, {"matrix": {"radius_m": "auto",
+                                           "path_family": _FAMS4},
+                                "calibration": {"required": False}})
+        root = os.path.join(tmp, "bags")
+        exp, reps, doc = manifest.load_experiment(y, bag_root=root)
         assert doc["matrix"]["radius_m"] == [] and exp == set()
-        assert doc["_radius_auto"] and doc["_matrix_epoch"] is None
+        assert doc["_radius_auto"] and doc["_calib_gated"]
+        assert doc["_matrix_epoch"] is None
         lock, _e = cal.compute_lock(_result(0.62, 0.6), cal.config(doc))
-        cal.write_lock(cal.lock_path(tmp), lock)
-        exp, reps, doc = manifest.load_experiment(_YAML, bag_root=tmp)
+        cal.write_lock(cal.lock_path(root), lock)
+        exp, reps, doc = manifest.load_experiment(y, bag_root=root)
         assert doc["matrix"]["radius_m"] == [1.95, 1.35, 0.95, 0.75]
         assert doc["_matrix_epoch"] == lock["epoch"]
         # 2 controllers x 2 speeds x 4 families (step, step_m, slalom,
@@ -193,17 +218,90 @@ def test_manifest_resolves_auto_radius():
         shutil.rmtree(tmp)
 
 
+def test_manifest_gates_the_deployed_bridge_radii():
+    # The deployed yaml (2026-10-08 bridge set). Fails if the fixed radii are
+    # planned before the lock exists (the first plan must be the figure-8
+    # only), if the lock replaces them with its own auto radii, if the epoch
+    # is not exposed, if the cell count is not 2 x 2 x 4 x 1 = 16 at 5 reps,
+    # or if dropping calibration.required does not restore the ungated
+    # legacy list (so the gate is the flag, not an accident).
+    tmp = tempfile.mkdtemp(prefix="hinf_cal_")
+    try:
+        exp, reps, doc = manifest.load_experiment(_YAML, bag_root=tmp)
+        assert doc["matrix"]["radius_m"] == [] and exp == set()
+        assert doc["_calib_gated"] and not doc["_radius_auto"]
+        assert doc["_matrix_epoch"] is None
+        lock, _e = cal.compute_lock(_result(0.55, 0.56), cal.config(doc))
+        cal.write_lock(cal.lock_path(tmp), lock)
+        exp, reps, doc = manifest.load_experiment(_YAML, bag_root=tmp)
+        assert doc["matrix"]["radius_m"] == [1.0, 0.7, 0.5, 0.4]
+        assert lock["radius_m"] != doc["matrix"]["radius_m"]
+        assert cal.matrix_radii(doc, lock) == [1.0, 0.7, 0.5, 0.4]
+        assert doc["_matrix_epoch"] == lock["epoch"]
+        assert len(exp) == 16 and reps == 5
+        assert {c[2] for c in exp} == {"step"}
+        assert ep.PLAN_DEFAULTS["step"]["L1"] == 1.0
+        assert doc["plan"]["step"] == {"L1": 1.0, "L2": 1.0, "theta_deg": 90.0}
+        y = _yaml_variant(tmp, {"calibration": {"required": False}})
+        exp, reps, doc = manifest.load_experiment(y, bag_root=tmp)
+        assert doc["matrix"]["radius_m"] == [1.0, 0.7, 0.5, 0.4]
+        assert not doc["_calib_gated"] and doc["_matrix_epoch"] is None
+    finally:
+        shutil.rmtree(tmp)
+
+
 # ----------------------------------------------------------------------
 # Planner
 # ----------------------------------------------------------------------
 
-def _doc(radii):
+def _doc(radii, families=None):
+    """Planner input as the executor resolves it. The families default to
+    left + mirrored right step/slalom (planner capability), not the
+    deployed yaml's list."""
     import yaml
     with open(_YAML) as f:
         d = yaml.safe_load(f)
     d["matrix"]["radius_m"] = list(radii)
+    d["matrix"]["path_family"] = list(families or _FAMS4)
     d["_radius_auto"] = True
+    d["_calib_gated"] = True
     return d
+
+
+def test_bridge_plan_fits_the_live_rooftop():
+    # Fails if the deployed bridge set (after the lock) does not lay out as
+    # calibration + one clean A/B stage per old radius inside the venue, or
+    # its recipes are not the old dataset's step (left, 90 deg, 1 m, 1 m).
+    venue = _venue()
+    tmp = tempfile.mkdtemp(prefix="hinf_cal_")
+    try:
+        _e, _r, doc0 = manifest.load_experiment(_YAML, bag_root=tmp)
+        lock, _e = cal.compute_lock(_result(0.55, 0.56), cal.config(doc0))
+        cal.write_lock(cal.lock_path(tmp), lock)
+        _e, _r, doc = manifest.load_experiment(_YAML, bag_root=tmp)
+    finally:
+        shutil.rmtree(tmp)
+    p0 = ep.plan_stages(venue, doc0, {}, key_fn=manifest.cell_key,
+                        calibration={"mode": "full"})
+    assert [s["name"] for s in p0["stages"]] == ["calibration"], p0["notes"]
+    pin = p0["stages"][0]["experiments"][0]["start"]
+    plan = ep.plan_stages(venue, doc, {}, key_fn=manifest.cell_key,
+                          calibration={"mode": "full", "pin": pin})
+    assert plan["ok"] and not plan.get("unfittable"), plan["notes"]
+    st = plan["stages"]
+    assert [s["name"] for s in st] == ["calibration"] + [f"stage_{i}" for i in range(2, 6)]
+    assert [g["R"] for s in st[1:] for g in s["geometries"]] == [1.0, 0.7, 0.5, 0.4]
+    for s in st[1:]:
+        assert not s.get("needs_fix") and len(s["experiments"]) == 2, s["name"]
+        for e in s["experiments"]:
+            r = e["recipe"]
+            assert r["type"] == "step"
+            assert (r["params"]["L1"], r["params"]["L2"]) == (1.0, 1.0)
+            assert abs(r["params"]["theta_arc"] - math.pi / 2) < 1e-9
+            assert r["params"]["direction"] == 1                 # left
+    for sl in ep.stages_to_legs(st, venue):
+        ok, rep = venue_geom.check_legs_containment(sl["legs"], venue, 0.30, 0.30)
+        assert ok, (sl["name"], rep)
 
 
 def test_calibration_only_plan_fits_and_is_joinable():

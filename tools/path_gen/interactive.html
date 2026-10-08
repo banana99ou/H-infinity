@@ -4460,8 +4460,17 @@ document.querySelectorAll('#panel details[id]').forEach((d) => {
 // battle station changes in a way the operator should know about; the overlay
 // then shows once per browser. Versions compare as strings: YYYY.MM.DD[-n].
 // ============================================================
-const BATTLE_VERSION = '2026.10.08';
+const BATTLE_VERSION = '2026.10.08-2';
 const CHANGELOG = [
+  {
+    version: '2026.10.08-2',
+    items: [
+      '이번 실험은 마무리용 짧은 세트다. 사용법은 그대로다: Auto-plan → Send → Start. 첫 단계는 그대로 조향 보정 8자 주행이고, 그다음 기존 데이터셋과 똑같은 경로(왼쪽 step, 반경 1.0, 0.7, 0.5, 0.4 m, 곡선 앞뒤 직선 1 m)를 고친 조향으로 다시 돈다.',
+      '총 80회다(반경 4개 × 제어기 2개 × 속도 2개 × 5회). 진행률은 0/80에서 시작하고, 80회를 채우면 DONE으로 스스로 끝난다. 첫 바퀴는 16개 셀을 1회씩 먼저 돈다.',
+      '"R_min LOCKED" 카드에는 측정한 최소 회전 반경과 이번 반경 [1.0, 0.7, 0.5, 0.4]가 뜬다. 반경 0.5 m와 0.4 m는 조향 한계보다 급한 곡선이라 로봇이 곡선 바깥으로 벌어지는 것이 정상이다. 멈추지 않는다.',
+      '오른쪽 회전 경로와 2 m 직선은 이번 세트에서 빠졌다(기능은 남아 있다).',
+    ],
+  },
   {
     version: '2026.10.08',
     items: [

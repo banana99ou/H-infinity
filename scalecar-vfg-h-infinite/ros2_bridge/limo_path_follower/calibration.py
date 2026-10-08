@@ -15,6 +15,11 @@ laptop analysis tools share ONE definition. Field design 2026-10-08:
 * The lock's ``epoch`` tags every scored leg recorded under it; progress counts
   only legs of the current epoch (stock-driver legs and any future re-lock can
   never be credited to the wrong matrix).
+* A FIXED radius list can be gated the same way (``calibration.required:
+  true``, 2026-10-08 bridge set): the figure-8 still runs first and locks
+  R_min + the epoch, the matrix keeps the authored radii, and only legs of
+  that epoch count. Without it a fixed list is legacy: no figure-8, no epoch,
+  and stock-driver legs at the same (controller, v, family, R) credit it.
 
 Files (all under the bag root, i.e. run artifacts, NUC -> laptop):
   <bag_root>/calibration/matrix_lock.json   the one-time lock
@@ -30,6 +35,8 @@ RECIPE_TYPE = "calib_fig8"
 # experiment.yaml `calibration:` defaults (deep-merged).
 DEFAULTS = {
     "enabled": True,
+    "required": False,          # gate a FIXED radius list on the lock too
+                                # (radius_m: auto is always gated)
     "full_speeds": [0.5, 1.0],
     "sanity_speeds": [1.0],
     "lock_speed": 1.0,          # the speed whose worst side sets the lock
@@ -322,23 +329,56 @@ def mode_due(cfg, lock, last_pass, now_utc=None):
     return "sanity" if age_h >= float(cfg["recheck_after_h"]) else None
 
 
+def is_auto(doc):
+    m = (doc or {}).get("matrix") or {}
+    return str(m.get("radius_m", "")).strip().lower() == "auto"
+
+
+def is_gated(doc):
+    """True when the matrix waits for the calibration lock and credits only
+    legs of its epoch: ``radius_m: auto``, or a fixed list with
+    ``calibration.required: true``."""
+    return is_auto(doc) or bool(config(doc).get("required"))
+
+
 def resolve_matrix(doc, lock):
-    """Return a COPY of the experiment doc with ``matrix.radius_m: auto``
-    replaced by the locked radii ([] when there is no lock yet) and
-    ``_matrix_epoch`` set (None without a lock). Fixed radius lists pass
-    through unchanged (epoch None: legacy behaviour)."""
+    """Return a COPY of the experiment doc with the matrix radii resolved:
+
+    * ``radius_m: auto`` -> the locked radii;
+    * a fixed list with ``calibration.required`` -> the authored list;
+
+    both ``[]`` while there is no lock yet (the first plan is the figure-8
+    only), with ``_matrix_epoch`` = the lock epoch (None without a lock) and
+    ``_calib_gated`` True. Other fixed lists pass through unchanged (epoch
+    None, not gated: legacy behaviour)."""
     import copy
     out = copy.deepcopy(doc or {})
     m = out.setdefault("matrix", {})
-    if str(m.get("radius_m", "")).strip().lower() == "auto":
-        if lock is not None:
-            m["radius_m"] = [float(r) for r in lock["radius_m"]]
-            out["_matrix_epoch"] = lock["epoch"]
-        else:
-            m["radius_m"] = []
-            out["_matrix_epoch"] = None
-        out["_radius_auto"] = True
-    else:
+    auto = is_auto(out)
+    gated = is_gated(out)
+    out["_radius_auto"] = auto
+    out["_calib_gated"] = gated
+    if not gated:
         out["_matrix_epoch"] = None
-        out["_radius_auto"] = False
+        return out
+    if not auto:
+        out["_radius_fixed"] = [float(r) for r in (m.get("radius_m") or [])]
+    if lock is not None:
+        m["radius_m"] = ([float(r) for r in lock["radius_m"]] if auto
+                         else list(out["_radius_fixed"]))
+        out["_matrix_epoch"] = lock["epoch"]
+    else:
+        m["radius_m"] = []
+        out["_matrix_epoch"] = None
     return out
+
+
+def matrix_radii(doc, lock):
+    """The radii the matrix sweeps once ``lock`` is in force (for cards).
+    ``doc`` is a RESOLVED doc (resolve_matrix output)."""
+    if (doc or {}).get("_radius_auto"):
+        return [float(r) for r in (lock or {}).get("radius_m") or []]
+    fixed = (doc or {}).get("_radius_fixed")
+    if fixed is None:
+        fixed = ((doc or {}).get("matrix") or {}).get("radius_m") or []
+    return [float(r) for r in fixed]

@@ -286,14 +286,18 @@ def load_experiment(path, bag_root=None):
     ``matrix.radius_m: auto`` (2026-10-08) takes the radii from the one-time
     calibration lock (``<bag_root>/calibration/matrix_lock.json``; bag_root
     defaults to the repo's ``Experiment Data``). No lock yet -> no radii (the
-    first session's calibration creates it). The returned doc carries the
-    resolved list plus ``_matrix_epoch`` (the lock epoch, None for a fixed
-    list) and ``_matrix_lock``.
+    first session's calibration creates it). A fixed list with
+    ``calibration.required: true`` is gated the same way: no radii until the
+    lock exists, then the authored list. The returned doc carries the
+    resolved list plus ``_matrix_epoch`` (the lock epoch; None without a lock
+    or for an ungated fixed list), ``_calib_gated`` and ``_matrix_lock``.
     """
     with open(path, "r", encoding="utf-8") as f:
         doc = yaml.safe_load(f)
     matrix = (doc or {}).get("matrix", {}) or {}
-    if str(matrix.get("radius_m", "")).strip().lower() == "auto":
+    auto = str(matrix.get("radius_m", "")).strip().lower() == "auto"
+    required = bool(((doc or {}).get("calibration") or {}).get("required"))
+    if auto or required:
         cal = _calibration_module()
         root = bag_root or os.path.join(
             os.path.dirname(os.path.dirname(os.path.abspath(path))),
@@ -304,6 +308,7 @@ def load_experiment(path, bag_root=None):
     else:
         doc.setdefault("_matrix_epoch", None)
         doc.setdefault("_radius_auto", False)
+        doc.setdefault("_calib_gated", False)
     matrix = doc.get("matrix", {}) or {}
     controllers = matrix.get("controller", [])
     speeds = matrix.get("v_const", [])

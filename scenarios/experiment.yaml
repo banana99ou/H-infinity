@@ -26,20 +26,29 @@ venue: scenarios/venues/rooftop.json
 # = 320 runs. Start SMALL on the robot (one controller, one radius, N=1) and
 # widen once a full cell verifies end-to-end.
 matrix:
-  # auto (2026-10-08): the radii come from the one-time steering calibration
-  # lock (calibration: below; <bag_root>/calibration/matrix_lock.json). The
-  # first session's figure-8 measures R_min at 1.0 m/s and locks
-  # R_i = 1 / (fraction_i x margin / R_min), rounded to 0.05 m. Only legs
-  # recorded under that lock's epoch count. Was [1.0, 0.7, 0.5, 0.4] — every
-  # leg of which ran on the stock driver at ~0.45x steering (SPEC.md §7.8).
-  radius_m: auto
+  # BRIDGE SET (2026-10-08, after the advisor's follow-up plan
+  # DOC/followup_research_intro_2026_10_08.pdf): the paper is drafted on the
+  # 220 stock-driver runs (delta_max 0.19 rad, gain 0.4, R_min 1.03 m). This
+  # set re-runs THOSE commanded paths on the patched driver (direct steering,
+  # ~0.35 rad) — same step paths, speeds and controllers, only the actuator
+  # parameters change — so T1/T2 can be checked at a second parameter point.
+  # Under the new limit the same four radii cross the saturation boundary
+  # (steering needed / limit): 1.0 -> 56 %, 0.7 -> 80 %, 0.5 -> 109 %,
+  # 0.4 -> 132 % (old: 104-244 %, all at or past the limit).
+  # Gated on the calibration lock (calibration.required below): the figure-8
+  # runs first and only legs recorded under its epoch count — the old legs at
+  # these exact cells (venue 'rooftop', 10-17 per cell) must not credit them.
+  # 2 controllers x 2 speeds x 4 R x 1 family x 5 = 80 runs, then DONE.
+  # Was (shelved, 2026-10-08 night): radius_m: auto (fractions of the locked
+  # usable curvature), path_family [step, step_m, slalom, slalom_m], 2 m
+  # straights = 320 runs. To restore: radius_m: auto, those families, the
+  # 2 m plan.step/plan.slalom below, and drop calibration.required.
+  radius_m: [1.0, 0.7, 0.5, 0.4]
   controller: [lpv-hinf, pid]
   v_const: [1.0, 0.5]
-  # step_m / slalom_m (2026-10-08, operator): the RIGHT-turn mirror of step /
-  # slalom (mirror_path.py; the vendor's direction=-1 step has a cusp). Their
-  # own families so each direction gets exactly `repetitions` runs; analysis
-  # pools step+step_m (slalom+slalom_m) into one cell = 2 x 5 = 10 runs.
-  path_family: [step, step_m, slalom, slalom_m]
+  # Left step only: the old dataset has no right turns (step_m / slalom_m,
+  # mirror_path.py, stay available) and its only slalom cell is R 1.0.
+  path_family: [step]
   # ARCHIVED 2026-10-06 — wiggle families (wiggle_sine / _chirp / _square,
   # limo_path_follower/wiggle_path.py) are out of the matrix; may later replace
   # the single-turn (step) family. Code, tests and the battle-station Leg batch
@@ -49,8 +58,7 @@ matrix:
   #   wiggle_chirp: [2.0, 1.5, 1.2]
   #   wiggle_square: [2.0, 1.5, 1.2]
 
-# Per family AND direction: 5 left + 5 right = 10 per pooled cell; the matrix
-# total stays 2 controllers x 2 speeds x 4 R x 4 families x 5 = 320 runs.
+# Per cell. Bridge set: 16 cells x 5 = 80 runs.
 repetitions: 5
 
 # Steering calibration (limo_path_follower/calibration.py, calib_node).
@@ -61,6 +69,10 @@ repetitions: 5
 # than sanity_tol. Defaults in calibration.DEFAULTS.
 calibration:
   enabled: true
+  # required: the FIXED radius list above is gated like 'auto' — the first
+  # session's figure-8 locks R_min + the epoch (the radii stay as authored),
+  # and progress counts only legs recorded under that epoch.
+  required: true
   margin: 0.8                     # steady-state curvature <= 80% of full lock
   curvature_fractions: [0.4, 0.57, 0.8, 1.0]
   round_m: 0.05
@@ -75,14 +87,14 @@ plan:
   # with the wiggle archive.
   # first_pass_reps (2026-10-08): sweep EVERY stage to this many passing runs
   # per cell before filling any cell to `repetitions` (one balanced pass of
-  # all 32 cells first; doubles as the end-to-end shakedown).
+  # all 16 cells first; doubles as the end-to-end shakedown).
   first_pass_reps: 1
-  # Straights 2026-10-08 (operator: 2 m): 2 s at 1 m/s before the turn, so
-  # the start transient (LPV settles in ~0.6-0.8 s) is over when the step
-  # hits, and 2 s after it for the recovery. Fit-checked on the live rooftop:
-  # worst spare +0.62 m (5 m left +0.09 m). Was 1 m (PLAN_DEFAULTS).
-  step: {L1: 2.0, L2: 2.0, theta_deg: 90.0}
-  slalom: {n_arcs: 2, theta_deg: 90.0, L_mid: 0.5, L1: 2.0, L_end: 2.0}
+  # Straights: 1 m = the old dataset's step exactly (every stock-driver step
+  # sidecar: L1 1, L2 1, 90 deg, left), so the bridge set differs from it
+  # only in the actuator. The shelved 320-run plan used 2 m (2026-10-08
+  # night, operator; rooftop fit worst spare +0.62 m).
+  step: {L1: 1.0, L2: 1.0, theta_deg: 90.0}
+  slalom: {n_arcs: 2, theta_deg: 90.0, L_mid: 0.5, L1: 1.0, L_end: 1.0}
   glue:
     # Glue (reposition) speed, 2026-10-08: 0.2 -> 0.4 m/s (the executor's
     # reposition_speed_mps caps it; live-settable, see

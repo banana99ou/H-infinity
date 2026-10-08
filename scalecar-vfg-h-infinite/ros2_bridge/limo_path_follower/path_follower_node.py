@@ -43,6 +43,10 @@ try:
     from limo_path_follower.wiggle_path import WIGGLE_TYPES, wiggle_from_recipe
 except ImportError:  # pragma: no cover - in-source runs
     from wiggle_path import WIGGLE_TYPES, wiggle_from_recipe
+try:
+    from limo_path_follower.mirror_path import MirroredPath, MIRROR_TYPES
+except ImportError:  # pragma: no cover - in-source runs
+    from mirror_path import MirroredPath, MIRROR_TYPES
 
 
 def _yaw_from_quaternion(q):
@@ -343,6 +347,11 @@ class PathFollowerNode(Node):
         params = d.get('params', {}) or {}
         if not isinstance(params, dict):
             raise ValueError("recipe 'params' must be a JSON object")
+        if ptype in MIRROR_TYPES:
+            # Right turn = the left recipe reflected across its start heading
+            # (mirror_path.py); the vendor's direction=-1 step has a cusp.
+            return MirroredPath(self.build_path_from_recipe(
+                dict(d, type=ptype[:-2])))
 
         def _f(key, default):
             return float(params.get(key, default))

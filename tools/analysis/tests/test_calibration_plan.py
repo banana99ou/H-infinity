@@ -185,7 +185,9 @@ def test_manifest_resolves_auto_radius():
         exp, reps, doc = manifest.load_experiment(_YAML, bag_root=tmp)
         assert doc["matrix"]["radius_m"] == [1.95, 1.35, 0.95, 0.75]
         assert doc["_matrix_epoch"] == lock["epoch"]
-        assert len(exp) == 2 * 2 * 2 * 4 and reps == 10
+        # 2 controllers x 2 speeds x 4 families (step, step_m, slalom,
+        # slalom_m) x 4 R; 5 reps per family/direction (2026-10-08)
+        assert len(exp) == 2 * 2 * 4 * 4 and reps == 5
         assert ("pid", 1.0, "step", 0.75) in exp
     finally:
         shutil.rmtree(tmp)
@@ -246,7 +248,8 @@ def test_replan_reseats_calibration_and_glues_into_matrix():
     plan = ep.plan_stages(venue, _doc([1.95, 0.75]), {},
                           calibration={"mode": "full", "pin": pin})
     names = [s["name"] for s in plan["stages"]]
-    assert names[0] == "calibration" and len(names) == 1 + 2 * 2, names
+    # 4 families (left + mirrored right) x 2 radii
+    assert names[0] == "calibration" and len(names) == 1 + 4 * 2, names
     assert plan["stages"][0]["experiments"][0]["start"] == pin
     eg = plan["stages"][1].get("entry_glue")
     assert eg and eg["from_stage"] == "calibration"

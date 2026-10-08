@@ -260,7 +260,7 @@ def test_first_session_calibrates_locks_replans_and_runs_the_matrix():
         with open(active) as f:
             act = json.load(f)
         names = [s["name"] for s in act["plan_stages"]]
-        assert names[0] == "calibration" and len(names) == 9, names
+        assert names[0] == "calibration" and len(names) == 17, names   # + 16 (L+R)
         assert act["auto_replan"]["epoch"] == lock["epoch"]
         assert any(g.get("waypoints") and len(g["waypoints"]) > 2
                    for g in world.gotos[1:2]), "no transit goto after the re-plan"
@@ -302,7 +302,7 @@ def test_sanity_failure_pauses_and_retry_continues():
         node, world, plan, active, bag_root = _setup(
             tmp, lock=lock, last_check_age_h=20.0, calib_r=1.05)
         names = [s["name"] for s in plan["stages"]]
-        assert names[0] == "calibration" and len(names) == 9, names
+        assert names[0] == "calibration" and len(names) == 17, names   # + 16 (L+R)
         assert plan["stages"][0]["experiments"][0]["recipe"]["params"]["mode"] == "sanity"
         node._on_go(fake_ros.String(data=""))
         ok = _run(node, world, lambda: node.phase.value == "paused")

@@ -235,6 +235,11 @@ def remaining_geometries(doc, counts, key_fn=None):
 
 
 def _recipe_for(fam, R, cfg, direction=1):
+    # Mirrored right turns (mirror_path.py, 2026-10-08): the left recipe with
+    # type "<fam>_m"; its own matrix family so directions stay balanced.
+    if fam in ("step_m", "slalom_m"):
+        base = _recipe_for(fam[:-2], R, cfg, direction=1)
+        return None if base is None else dict(base, type=fam)
     if fam == "step":
         s = cfg["step"]
         return {"type": "step",

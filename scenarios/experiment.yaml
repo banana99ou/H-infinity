@@ -35,7 +35,11 @@ matrix:
   radius_m: auto
   controller: [lpv-hinf, pid]
   v_const: [1.0, 0.5]
-  path_family: [step, slalom]
+  # step_m / slalom_m (2026-10-08, operator): the RIGHT-turn mirror of step /
+  # slalom (mirror_path.py; the vendor's direction=-1 step has a cusp). Their
+  # own families so each direction gets exactly `repetitions` runs; analysis
+  # pools step+step_m (slalom+slalom_m) into one cell = 2 x 5 = 10 runs.
+  path_family: [step, step_m, slalom, slalom_m]
   # ARCHIVED 2026-10-06 — wiggle families (wiggle_sine / _chirp / _square,
   # limo_path_follower/wiggle_path.py) are out of the matrix; may later replace
   # the single-turn (step) family. Code, tests and the battle-station Leg batch
@@ -45,7 +49,9 @@ matrix:
   #   wiggle_chirp: [2.0, 1.5, 1.2]
   #   wiggle_square: [2.0, 1.5, 1.2]
 
-repetitions: 10
+# Per family AND direction: 5 left + 5 right = 10 per pooled cell; the matrix
+# total stays 2 controllers x 2 speeds x 4 R x 4 families x 5 = 320 runs.
+repetitions: 5
 
 # Steering calibration (limo_path_follower/calibration.py, calib_node).
 # Every session starts with an open-loop figure-8 at full lock. No lock yet:
@@ -71,6 +77,12 @@ plan:
   # per cell before filling any cell to `repetitions` (one balanced pass of
   # all 32 cells first; doubles as the end-to-end shakedown).
   first_pass_reps: 1
+  # Straights 2026-10-08 (operator: 2 m): 2 s at 1 m/s before the turn, so
+  # the start transient (LPV settles in ~0.6-0.8 s) is over when the step
+  # hits, and 2 s after it for the recovery. Fit-checked on the live rooftop:
+  # worst spare +0.62 m (5 m left +0.09 m). Was 1 m (PLAN_DEFAULTS).
+  step: {L1: 2.0, L2: 2.0, theta_deg: 90.0}
+  slalom: {n_arcs: 2, theta_deg: 90.0, L_mid: 0.5, L1: 2.0, L_end: 2.0}
   glue:
     # Glue (reposition) speed, 2026-10-08: 0.2 -> 0.4 m/s (the executor's
     # reposition_speed_mps caps it; live-settable, see

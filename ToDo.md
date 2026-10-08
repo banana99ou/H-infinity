@@ -34,9 +34,14 @@ Working checklist for getting the professor-provided H-infinity stack from
   already gives ~1.2 m/s (motor saturation). Stock-data saturation check: R ≤ 0.7
   arcs saturated for both controllers; R 1.0 partly; stock data cannot test the
   SPEC §0 claim. (Morning report, 2026-10-08.)
-- **Open:** mirrored right turns (fit-checked: fits the live rooftop at 1/2/5 m
-  lead-ins as separate stages) and the lead-in length (2 m vs 5 m, operator call)
-  are NOT built yet.
+- **Right turns + 2 m straights (operator, 2026-10-08 morning):** `step_m` /
+  `slalom_m` = the left recipe reflected across its start heading
+  (`mirror_path.py`; the vendor direction=-1 step has a cusp), their own matrix
+  families with `repetitions: 5` → 5 left + 5 right = 10 per pooled cell, still
+  320 runs; analysis must pool step+step_m / slalom+slalom_m. Straights 2 m
+  (`plan.step` / `plan.slalom`). `test_mirror_path.py`: the real vendor closed
+  loop (both controllers) tracks step_m as the exact mirror of step. First pass =
+  64 legs (every cell, both directions).
 
 **2026-10-07 (evening) — patched driver v2 deployed (`15cefbe`): direct steering
 + fixed odometry are the defaults; full code audit done.**

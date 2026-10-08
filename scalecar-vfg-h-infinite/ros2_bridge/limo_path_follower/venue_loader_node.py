@@ -57,6 +57,8 @@ _REPO_ROOT = next(
 VALID_KINDS = ("reposition", "recipe")
 VALID_CONTROLLERS = ("lpv-hinf", "lpv_hinf", "lpv", "hinf", "pid-ff", "pid_ff", "pid")
 VALID_RECIPE_TYPES = ("step", "slalom", "uturn",
+                      # mirrored right turns (mirror_path.py, 2026-10-08)
+                      "step_m", "slalom_m",
                       "wiggle_sine", "wiggle_chirp", "wiggle_square",
                       # steering calibration figure-8 (calibration.py,
                       # driven open-loop by calib_node, 2026-10-08)

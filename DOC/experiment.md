@@ -150,9 +150,9 @@ Calibration procedure (one-time per venue, redo after any layout change):
 |---|---|
 | **controller** | `lpv-hinf`, `pid-ff` |
 | **v_const** | **1.0 m/s** (primary); **0.5 m/s** (sim-comparable sanity point) |
-| **path family** | **step-curvature** (paper primary), **slalom** (paper §5). *(wiggle_sine / wiggle_chirp / wiggle_square were added 2026-10-02 and **archived 2026-10-06** — see below.)* |
+| **path family** | **step-curvature** (paper primary), **slalom** (paper §5) — each also as its **mirrored right turn** (`step_m`, `slalom_m`, 2026-10-08), 5 reps per direction, pooled 10 per cell in analysis; 2 m straights. *(wiggle_sine / wiggle_chirp / wiggle_square were added 2026-10-02 and **archived 2026-10-06** — see below.)* |
 | **R** | **auto** (2026-10-08): four radii locked ONCE from the first session's calibration figure-8 — R_i = 1/(f_i × 0.8 / R_min), f = 0.4 / 0.57 / 0.8 / 1.0 (the tightest cell uses 80% of the measured full-lock curvature). E.g. R_min 0.62 m → {1.95, 1.35, 0.95, 0.75} m. Was {1.0, 0.7, 0.5, 0.4} (stock driver; see the caveat below). |
-| **N** | **10** repetitions per cell |
+| **N** | **10** repetitions per cell (5 left + 5 right; `repetitions: 5` per family/direction in `experiment.yaml`) |
 
 Total: 2 families × 4 R × 2 controllers × 2 v = 32 cells × N = 10 = **320 recorded
 headline runs** (turnarounds/glue are not counted). At the measured ~72 s wall

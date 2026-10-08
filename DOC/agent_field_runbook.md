@@ -49,8 +49,13 @@ fix this copy. Live status lives in `ToDo.md`.
 >   goal** — if anything blocks it, report to the human right away.
 > - **Later sessions:** the plan starts with a short `sanity` figure-8 at 1.0 m/s
 >   (only if the last passing one is > 4 h old); it pauses if R_min moved > 15 %.
-> - **First pass:** the batch drives ONE rep of every cell (all 8 stages) before
->   filling any cell to 10, so a short day still ends balanced.
+> - **Right turns + 2 m straights (2026-10-08):** every geometry now also runs as
+>   its mirror image (`step_m`, `slalom_m`, right turns) — 16 matrix stages; each
+>   family/direction gets 5 reps (5 left + 5 right = 10 per cell, 320 runs total).
+>   Straights before/after the turns are 2 m (were 1 m).
+> - **First pass:** the batch drives ONE rep of every cell, both directions (all
+>   16 stages, 64 legs) before filling any cell to 5, so a short day still ends
+>   balanced.
 > - **Progress restarts at 0/320**: only legs recorded under the lock's `epoch`
 >   count (the old stock-driver legs never do). That is expected.
 > - **`CALIBRATION FAILED` card:** read the reason, press Start once to retry (the

@@ -108,6 +108,14 @@ def recipe_path(recipe):
                               theta_arc=_f("theta_arc", math.pi / 2),
                               L1=_f("L1", 5.0), L_mid=_f("L_mid", 2.0),
                               n_arcs=_i("n_arcs", 6), L_end=_f("L_end", 25.0))
+        if ptype in ("step_m", "slalom_m"):
+            # Mirrored right turn (mirror_path.py): the left path reflected.
+            try:
+                from limo_path_follower.mirror_path import MirroredPath
+            except ImportError:
+                from mirror_path import MirroredPath
+            base = recipe_path(dict(recipe, type=ptype[:-2]))
+            return None if base is None else MirroredPath(base)
         if ptype == "calib_fig8":
             # Steering calibration (calibration.py): the planned figure-8
             # footprint at its radius bound. Driven open-loop by calib_node,
